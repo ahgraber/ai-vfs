@@ -1,15 +1,9 @@
-# Observability Specification
+# Observability — Delta Spec
 
-> Generated from design document analysis on 2026-04-04
-> Source files: docs/specs/2026-04-04-ai-vfs-design.md (Section 6)
+> Change: `phase1-core`
+> Date: 2026-04-04
 
-## Purpose
-
-Runtime observability via OpenTelemetry and a durable audit log.
-OTel spans cover all VFS operations with attributes for path, namespace, principal, version, and blob size.
-The audit log records state changes in the metadata store with OTel trace ID correlation.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: OTelSpansOnAllOperations
 
@@ -105,10 +99,3 @@ and execution traces.
 - **GIVEN** no active OTel trace context
 - **WHEN** a write operation creates an audit event
 - **THEN** the audit event's trace_id field is None
-
-## Technical Notes
-
-- **Implementation**: src/aifs/observability/tracing.py, src/aifs/observability/audit.py
-- **Dependencies**: storage (MetadataStore for audit event persistence)
-- **OTel SDK**: Only opentelemetry-api is a dependency (instrumentation only).
-  The consumer configures an OTel SDK exporter.

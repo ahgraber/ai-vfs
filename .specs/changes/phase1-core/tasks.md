@@ -3,6 +3,9 @@
 > **Implementation note:** Use `superpowers:test-driven-development` skill when implementing.
 > Each task follows Red → Green → Commit.
 > Run tests with: `uv run pytest tests/` (all) or `uv run pytest -n auto tests/unit/` (parallel unit tests).
+>
+> **Spec refs** resolve to this change's delta specs at `.specs/changes/phase1-core/specs/<capability>/spec.md`.
+> Baseline is empty until this bootstrap change is synced.
 
 ---
 
@@ -39,9 +42,6 @@
 
 
   class NotFoundError(VFSError): ...
-
-
-  class ResourceLimitError(VFSError): ...  # max_operations exceeded
   ```
 
 - [ ] Implement `src/vfs/models.py` — Pydantic `BaseModel` for all entities:
@@ -154,7 +154,8 @@
   methods from design doc section 3.1 (put_file, get_file, delete_file, list_dir,
   put_version, get_version, list_versions, check_permission, set_permission,
   append_audit_event, update_search_meta, set_name, resolve_name,
-  list_reclaimable_versions, delete_versions)
+  list_reclaimable_versions, delete_versions) plus a `transaction()` async context
+  manager for atomic multi-step operations (D14: used by move)
 
 - [ ] Implement `src/vfs/protocols/search.py`:
 
@@ -516,6 +517,8 @@
   - `test_no_span_when_disabled`: `otel_enabled=False` → instrumentation function body
     not entered (no OTel calls)
   - `test_metrics_counter_incremented`: `op_counter.add` called with operation label
+  - `test_metrics_duration_histogram_recorded`: `op_histogram.record` called with duration
+  - `test_metrics_blob_size_histogram_recorded`: `blob_histogram.record` called with byte count
   - `test_no_error_when_otel_not_configured`: run with no SDK configured → no exceptions
 
 - [ ] Run tests — confirm they fail
@@ -756,6 +759,76 @@
 
 ---
 
+### Task 17b: VFS.copy and VFS.move
+
+**Files:**
+
+- Modify: `src/vfs/vfs.py`
+- Modify: `src/vfs/protocols/metadata.py` (add `transaction()` to SQLiteMetadataStore)
+- Modify: `src/vfs/stores/sqlite_metadata.py`
+- Modify: `tests/integration/test_vfs_file_operations.py`
+
+**Spec refs:** `file-operations/CopyFile`, `file-operations/MoveFile`,
+`storage/MetadataTransactions`, `observability/AuditLogStateChanges`
+
+- [ ] Add integration tests for copy:
+
+  - `test_copy_to_new_path`: copy /src/a.py → /dst/a.py; dst exists at v1 with same content_hash; src unchanged
+  - `test_copy_to_existing_path`: dst already exists → new version written at dst
+  - `test_copy_nonexistent_source`: source missing → `NotFoundError`
+  - `test_copy_no_blob_duplication`: after copy, blob store has only one blob for the shared hash
+  - `test_copy_permission_denied`: principal lacks read on src or write on dst → `PermissionDeniedError`
+  - `test_copy_creates_audit_event`: audit event with `operation="copy"` persisted
+
+- [ ] Add integration tests for move:
+
+  - `test_move_to_new_path`: move /src/a.py → /dst/a.py; dst at v1 with same content_hash; src is tombstoned
+  - `test_move_to_existing_path`: dst already exists → overwritten; src tombstoned
+  - `test_move_nonexistent_source`: source missing → `NotFoundError`
+  - `test_move_atomicity`: if dst creation fails, src is NOT tombstoned (transaction rollback)
+  - `test_move_permission_denied`: principal lacks delete on src or write on dst → `PermissionDeniedError`
+  - `test_move_creates_audit_event`: audit events for both tombstone and create
+
+- [ ] Run tests — confirm they fail
+
+- [ ] Implement `SQLiteMetadataStore.transaction()` async context manager:
+
+  ```python
+  @asynccontextmanager
+  async def transaction(self):
+      async with self._conn.execute("BEGIN"):
+          try:
+              yield
+              await self._conn.execute("COMMIT")
+          except Exception:
+              await self._conn.execute("ROLLBACK")
+              raise
+  ```
+
+- [ ] Implement `VFS.copy` (D13):
+
+  1. `check_permission(principal_id, namespace_id, src, "read")`
+  2. `check_permission(principal_id, namespace_id, dst, "write")`
+  3. `src_version = meta_store.get_version(namespace_id, src)`
+  4. `meta_store.put_version(VersionMeta(content_hash=src_version.content_hash, size=src_version.size, ...), expected_version=...)` at dst
+  5. `audit_copy(...)`
+
+- [ ] Implement `VFS.move` (D14):
+
+  1. `check_permission(principal_id, namespace_id, src, "read")`
+  2. `check_permission(principal_id, namespace_id, src, "delete")`
+  3. `check_permission(principal_id, namespace_id, dst, "write")`
+  4. Within `meta_store.transaction()`:
+     - Create tombstone on src
+     - Create new file/version at dst with src's content_hash
+  5. `audit_move(...)`
+
+- [ ] Run tests — confirm they pass
+
+- [ ] Commit: `feat(vfs): add VFS.copy and VFS.move with atomic move transaction`
+
+---
+
 ### Task 18: VFS.versions and VFS.rollback
 
 **Files:**
@@ -828,7 +901,7 @@
 - Create: `tests/unit/test_gc.py`
 
 **Spec refs:** `versioning/VersionGarbageCollection`, `versioning/RetentionPolicy`,
-`observability/AuditLogStateChanges` (GC audited)
+`storage/BlobEnumeration`, `observability/AuditLogStateChanges` (GC audited)
 
 - [ ] Write `tests/unit/test_gc.py`:
 
@@ -891,8 +964,9 @@
 - [ ] Add integration tests:
   - `test_run_gc_reclaims_excess_versions`: write 3 versions, `max_recent=1` → run_gc
     → only 1 version in history
-  - `test_reindex_backfills_search_meta`: write file, add bloom provider,
-    reindex → `search_meta.bloom` populated
+  - `test_reindex_backfills_search_meta`: write file, register a mock provider
+    that returns `{"test_key": "value"}` from `index()`, call reindex →
+    `search_meta.test_key` populated
 - [ ] Run tests — confirm they fail
 - [ ] Implement `VFS.run_gc(namespace_id=None)` (delegates to `GarbageCollector.run`)
   and `VFS.reindex(namespace_id, provider_name, scope="/")`:
@@ -911,7 +985,9 @@
 - Create: `src/vfs/__init__.py`
 - Create: `tests/integration/test_vfs_access_control.py`
 
-**Spec refs:** `access-control/PermissionGranting`, `access-control/NamespaceBoundary`, `storage/ProcessIdentification`
+**Spec refs:** `access-control/PermissionGranting`, `access-control/NamespaceBoundary`,
+`access-control/HumanFriendlyNames`, `access-control/OperationGranularity`,
+`storage/ProcessIdentification`
 
 - [ ] Write `tests/integration/test_vfs_access_control.py`:
 
@@ -920,8 +996,12 @@
   - `test_cross_namespace_denied`: principal in namespace A cannot access namespace B
   - `test_admin_grants_subtree`: admin on `/workspace/` grants write on `/workspace/docs/`
     to principal B; B can write there; B cannot write to `/config.yaml`
-  - `test_name_resolution`: create namespace with display name; `vfs.resolve_name(...)` →
-    ULID returned
+  - `test_name_resolution_namespace_ulid`: create namespace with display name;
+    `vfs.resolve_name("namespace", "my-workspace")` → ULID returned
+  - `test_name_resolution_principal_uuid4`: create principal with display name;
+    `vfs.resolve_name("principal", "agent-bob")` → UUID4 returned
+  - `test_execute_permission_storable`: grant {execute} on /workspace/ to a principal;
+    query permissions → execute is in the stored operations set
 
 - [ ] Run tests — confirm they fail
 

@@ -1,16 +1,9 @@
-# Search Specification
+# Search — Delta Spec
 
-> Generated from design document analysis on 2026-04-04
-> Source files: docs/specs/2026-04-04-ai-vfs-design.md (Sections 7, 3.3, 3.5)
+> Change: `phase1-core`
+> Date: 2026-04-04
 
-## Purpose
-
-Pluggable search over file paths and content.
-Built-in support for glob, find, and regex grep.
-Extensible via SearchProvider protocol for bloom filter acceleration and semantic search.
-Search metadata stored per-version as extensible payload in the metadata store.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: GlobSearch
 
@@ -61,28 +54,22 @@ returning matching paths with context (matched line and line number).
 The system SHALL support multiple concurrent search providers, each declaring its capabilities (glob, find, regex, fulltext, semantic).
 The VFS SHALL dispatch search requests to the provider with the matching capability.
 
-#### Scenario: ProviderDispatch
-
-- **GIVEN** a default provider (glob, find, regex) and a bloom provider (regex)
-- **WHEN** a regex search is requested
-- **THEN** the bloom provider is used (more specific acceleration)
-
-#### Scenario: FallbackToDefault
+#### Scenario: SingleProviderDispatch
 
 - **GIVEN** only the default provider is active
 - **WHEN** a regex search is requested
 - **THEN** the default provider performs brute-force read-and-match
 
+#### Scenario: UnknownCapabilityRejected
+
+- **GIVEN** no provider declares the SEMANTIC capability
+- **WHEN** a principal requests a semantic search
+- **THEN** an error is raised indicating no provider supports the requested search type
+
 ### Requirement: SearchIndexing
 
 The system SHALL call each active search provider's index method during write.
 The provider returns search artifacts (e.g., bloom hashes, embedding vectors) stored in the version's search_meta field.
-
-#### Scenario: IndexOnWrite
-
-- **GIVEN** a bloom search provider is active
-- **WHEN** a file is written
-- **THEN** bloom filter hashes are computed and stored in search_meta.bloom
 
 #### Scenario: DefaultProviderNoIndex
 
@@ -92,29 +79,11 @@ The provider returns search artifacts (e.g., bloom hashes, embedding vectors) st
 
 ### Requirement: SearchMetadataExtensible
 
-The system SHALL store search artifacts per-version in an extensible dict field (JSONB in SQL, nested document in NoSQL).
+The system SHALL store search artifacts per-version in an extensible dict field (JSON text in SQLite).
 The core schema SHALL NOT prescribe the contents — each provider writes its own keys.
 
-#### Scenario: MultipleProviderArtifacts
+#### Scenario: EmptySearchMetaByDefault
 
-- **GIVEN** bloom and semantic providers are both active
+- **GIVEN** only the default provider is active
 - **WHEN** a file is written
-- **THEN** search_meta contains both {"bloom": ..., "vector": ...}
-
-### Requirement: CoarseFineFilerPattern
-
-The system SHOULD implement grep optimization using a coarse-filter/fine-filter
-pattern: the search index (e.g., bloom filter) identifies candidate files,
-then content verification confirms matches.
-
-#### Scenario: BloomAcceleratedGrep
-
-- **GIVEN** 1000 files in scope, bloom filter indicates 5 candidates
-- **WHEN** a regex search is performed
-- **THEN** only the 5 candidate files have their content read and verified
-
-## Technical Notes
-
-- **Implementation**: src/aifs/search/default.py, src/aifs/protocols/search.py
-- **Dependencies**: file-operations (read for content grep), storage (MetadataStore for search_meta)
-- **Shell ops layer**: Translates bash command signatures (grep, find, glob) into VFS search operations
+- **THEN** search_meta is an empty dict `{}`

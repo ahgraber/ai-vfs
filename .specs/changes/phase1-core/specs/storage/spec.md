@@ -1,17 +1,9 @@
-# Storage Specification
+# Storage — Delta Spec
 
-> Generated from design document analysis on 2026-04-04
-> Source files: docs/specs/2026-04-04-ai-vfs-design.md (Sections 3, 9, 11, 12)
+> Change: `phase1-core`
+> Date: 2026-04-04
 
-## Purpose
-
-Pluggable storage protocols for metadata and blob content.
-MetadataStore handles files, versions, permissions, audit events, names, and search metadata.
-BlobStore handles immutable content-addressed blobs.
-Adapters are resolved from URI schemes at construction.
-A caching layer wraps remote blob stores.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: MetadataStoreProtocol
 
@@ -24,18 +16,6 @@ All adapters SHALL implement this protocol.
 - **WHEN** the VFS is initialized
 - **THEN** a SQLiteMetadataStore is instantiated and tables are created
 
-#### Scenario: PostgresAdapter
-
-- **GIVEN** metadata_store_uri="postgresql://localhost/aifs"
-- **WHEN** the VFS is initialized
-- **THEN** a PostgresMetadataStore is instantiated
-
-#### Scenario: MongoAdapter
-
-- **GIVEN** metadata_store_uri="mongodb://localhost/aifs"
-- **WHEN** the VFS is initialized
-- **THEN** a MongoMetadataStore is instantiated
-
 ### Requirement: BlobStoreProtocol
 
 The system SHALL define a BlobStore protocol with put, get, delete, exists
@@ -47,12 +27,6 @@ for streaming (initially raising NotImplementedError).
 - **GIVEN** blob_store_uri="file:///./aifs_blobs/"
 - **WHEN** the VFS is initialized
 - **THEN** a LocalBlobStore is instantiated with the specified base path
-
-#### Scenario: S3Adapter
-
-- **GIVEN** blob_store_uri="s3://my-bucket/aifs"
-- **WHEN** the VFS is initialized
-- **THEN** an S3BlobStore is instantiated
 
 ### Requirement: BlobIdempotentPut
 
@@ -81,7 +55,9 @@ flat directories.
 
 The system SHALL provide an optional diskcache-backed caching layer for blob stores.
 Cache is keyed by content hash.
-Cache SHALL be enabled by default for remote stores (S3, Azure) and disabled for local FS.
+Cache SHALL be disabled by default for local FS.
+When `blob_cache_enabled` is explicitly set to `True`, the cache wraps any blob store.
+When `None` (auto), cache is disabled for `file:///` URIs; Phase 2 will auto-enable for remote schemes.
 
 #### Scenario: CacheHit
 
@@ -112,11 +88,33 @@ Initial adapters MAY raise NotImplementedError for these methods.
 - **WHEN** put_stream is called
 - **THEN** NotImplementedError is raised
 
+### Requirement: BlobEnumeration
+
+The BlobStore protocol SHALL include a method to enumerate all stored content hashes,
+enabling garbage collection to identify orphaned blobs with zero version references.
+
+#### Scenario: EnumerateAllBlobs
+
+- **GIVEN** blobs with hashes "aaa...", "bbb...", "ccc..." exist in the store
+- **WHEN** the blob store is enumerated
+- **THEN** all three hashes are returned
+
+### Requirement: MetadataTransactions
+
+The MetadataStore protocol SHALL include an optional `transaction()` async context manager for atomic multi-step operations.
+SQLite implements this via `BEGIN`/`COMMIT`/`ROLLBACK`.
+Stores that do not support transactions MAY implement `transaction()` as a no-op context manager with a documentation note.
+
+#### Scenario: TransactionRollbackOnError
+
+- **GIVEN** a transaction is active
+- **WHEN** an exception occurs during the transaction
+- **THEN** all operations within the transaction are rolled back
+
 ### Requirement: MetadataCASSemantics
 
 The MetadataStore SHALL implement compare-and-swap semantics for version mutations.
 SQL adapters SHALL use `WHERE version_number = ?` returning zero rows on mismatch.
-NoSQL adapters SHALL use atomic find-and-update with version matching.
 
 #### Scenario: CASConflictDetected
 
@@ -141,9 +139,9 @@ variable support (AIFS\_ prefix) and sensible local defaults.
 
 #### Scenario: EnvironmentOverride
 
-- **GIVEN** AIFS_METADATA_STORE_URI is set to "postgresql://..."
+- **GIVEN** AIFS_BLOB_STORE_URI is set to "file:///tmp/custom_blobs/"
 - **WHEN** VFSConfig is constructed without arguments
-- **THEN** the Postgres URI is used
+- **THEN** the custom blob path is used
 
 #### Scenario: SensibleDefaults
 
@@ -160,10 +158,3 @@ The system SHALL set a descriptive process title using setproctitle when running
 - **GIVEN** ai-vfs GC is running as a background process
 - **WHEN** the process list is inspected
 - **THEN** the process title contains "ai-vfs:"
-
-## Technical Notes
-
-- **Implementation**: src/aifs/protocols/ (protocol definitions), src/aifs/stores/ (adapters), src/aifs/config.py
-- **Dependencies**: none (storage is the foundational layer)
-- **Initial adapters**: SQLite (aiosqlite), local FS (aiofiles), diskcache.
-  Postgres (asyncpg), Mongo (motor), S3 (aiobotocore) are optional dependencies.

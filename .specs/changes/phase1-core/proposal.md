@@ -4,12 +4,13 @@
 
 ## Intent
 
-Implement the foundational ai-vfs library — domain models, protocols, storage adapters,
+Bootstrap the foundational ai-vfs library — domain models, protocols, storage adapters,
 search provider, observability, and VFS orchestrator — delivering a working local
 development deployment profile: SQLite metadata + local FS blobs + default search.
 
-This is the baseline implementation against which all 7 capability specs (file-operations, versioning, access-control, storage, observability, search, storage) were derived.
-No spec changes are required — this change purely implements the existing baseline specs, minus execution providers (Phase 3).
+This is a bootstrap change: no code exists yet, so all 6 capability specs (file-operations, versioning, access-control, storage, observability, search) are carried as ADDED delta specs within this change.
+The baseline is intentionally empty until this change is synced.
+The execution spec (Phase 3) is not included — it will be introduced by a future change when execution providers are implemented.
 
 ## Scope
 
@@ -30,8 +31,9 @@ No spec changes are required — this change purely implements the existing base
 - **OTel helpers**: span creation with VFS attributes, child spans, metrics;
   all no-ops when `otel_enabled=False`
 - **Audit log**: append-only `AuditEvent` persistence with OTel `trace_id` correlation
-- **`VFS` orchestrator**: `read`, `write`, `delete`, `stat`, `list`, `versions`,
-  `rollback`, `search`; permission enforcement and invisible pruning on all operations
+- **`VFS` orchestrator**: `read`, `write`, `delete`, `copy`, `move`, `stat`, `list`,
+  `versions`, `rollback`, `search`; permission enforcement and invisible pruning on
+  all operations
 - **`GarbageCollector`**: version GC (retention policy) + blob GC (orphan detection)
 - **Public API**: `VFS` class with URI-based store resolution at construction,
   `initialize()` / `close()` lifecycle
@@ -58,9 +60,11 @@ Bottom-up, dependency-ordered:
 05. `SQLiteMetadataStore`
 06. `DefaultSearchProvider`
 07. OTel helpers + audit log
-08. `VFS` orchestrator (per-operation, built on top of the layer below)
-09. `GarbageCollector`
-10. Public API (`__init__.py`, URI resolution, lifecycle)
+08. `VFS` orchestrator — CRUD operations (read, write, delete, stat, list)
+09. `VFS` orchestrator — copy, move (compose from CRUD primitives)
+10. `VFS` orchestrator — versions, rollback, search
+11. `GarbageCollector`
+12. Public API (`__init__.py`, URI resolution, lifecycle)
 
 Each component is implemented test-first.
 Integration tests exercise the full stack (VFS → SQLite + LocalFS) to verify cross-layer behavior.

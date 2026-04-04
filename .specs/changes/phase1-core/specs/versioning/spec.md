@@ -1,15 +1,9 @@
-# Versioning Specification
+# Versioning — Delta Spec
 
-> Generated from design document analysis on 2026-04-04
-> Source files: docs/specs/2026-04-04-ai-vfs-design.md (Sections 2, 4, 10)
+> Change: `phase1-core`
+> Date: 2026-04-04
 
-## Purpose
-
-Per-file immutable version history with rollback and Time Machine-style retention.
-Versions are append-only; rollback creates new versions pointing to old content hashes.
-Garbage collection reclaims expired versions and unreferenced blobs.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: ImmutableVersionHistory
 
@@ -95,19 +89,8 @@ references across all namespaces.
 The system SHALL provide a reindex operation that backfills search metadata
 for files written before a search provider was activated.
 
-#### Scenario: LazyBackfill
-
-- **GIVEN** a file exists without bloom search metadata
-- **WHEN** a bloom search provider encounters the file during search
-- **THEN** the provider reads content, computes the index, and writes search_meta back
-
 #### Scenario: BatchReindex
 
-- **GIVEN** a bloom search provider is newly activated
+- **GIVEN** a new search provider is activated
 - **WHEN** a principal calls reindex for a namespace and scope
-- **THEN** all files in scope have their search_meta updated with bloom artifacts
-
-## Technical Notes
-
-- **Implementation**: src/aifs/gc.py (garbage collection), src/aifs/vfs.py (rollback, versions, reindex)
-- **Dependencies**: storage (MetadataStore for version queries, BlobStore for blob GC)
+- **THEN** all files in scope have their search_meta updated with the provider's artifacts

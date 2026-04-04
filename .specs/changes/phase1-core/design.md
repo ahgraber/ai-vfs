@@ -228,19 +228,18 @@ Only delete when `SELECT 1 FROM versions WHERE content_hash = ?` returns no rows
 ### D10: `VFS` stores resolver is a simple URI-prefix dispatch
 
 ```python
+# Phase 1: only SQLite + local FS
 _METADATA_SCHEMES = {
     "sqlite:///": SQLiteMetadataStore,
-    "postgresql://": PostgresMetadataStore,  # raises ImportError if asyncpg not installed
-    "mongodb://": MongoMetadataStore,
 }
 _BLOB_SCHEMES = {
     "file:///": LocalFSBlobStore,
-    "s3://": S3BlobStore,
 }
+# Phase 2 will register: postgresql://, mongodb://, s3://
 ```
 
 Resolution is a linear prefix scan at `VFS.__init__` time.
-Unknown URIs raise `ValueError` with a clear message.
+Unknown URIs raise `ValueError` with a clear message listing supported schemes.
 
 ---
 
@@ -285,6 +284,50 @@ The names table stores all identifiers as `TEXT` — no schema distinction neede
 
 ---
 
+### D13: Copy requires no blob duplication
+
+Copy reads the source file's current `VersionMeta` to obtain `content_hash` and `size`, then writes a new file at the destination with the same content hash.
+Because blobs are content-addressed, no data is copied — the destination's version record simply references the existing blob.
+
+```python
+async def copy(self, ns, src, dst, principal_id):
+    # 1. check read on src, write on dst
+    # 2. get source version meta
+    src_version = await self._meta.get_version(ns, src)
+    # 3. put_version at dst with src's content_hash (no blob read/write)
+    new_version = VersionMeta(
+        content_hash=src_version.content_hash,
+        size=src_version.size,
+        ...
+    )
+    await self._meta.put_version(new_version, expected_version=None)  # or CAS if dst exists
+```
+
+If the destination already exists, this behaves like a write (new version created).
+
+---
+
+### D14: Move is tombstone + create in a single SQLite transaction
+
+Move is logically: delete source + copy to destination.
+For atomicity, both operations are wrapped in a single `aiosqlite` transaction so that a failure leaves neither a partial destination nor an unintended tombstone.
+
+```python
+async def move(self, ns, src, dst, principal_id):
+    # 1. check read+delete on src, write on dst
+    # 2. get source version meta
+    async with self._meta.transaction():
+        # 3. create tombstone on source
+        # 4. create new file/version at destination with source's content_hash
+    # 5. audit both operations
+```
+
+The `MetadataStore` protocol gains an optional `transaction()` context manager.
+SQLite implements it via `aiosqlite`'s `execute("BEGIN")` / `commit()`.
+Stores that don't support transactions (future NoSQL) fall back to best-effort sequential operations with a note in their adapter documentation.
+
+---
+
 ### D11: `setproctitle` is called at process entry points only
 
 Two call sites:
@@ -307,7 +350,7 @@ src/vfs/
 │                              RetentionPolicy, Principal, Namespace, Name,
 │                              SearchResult, SearchType
 ├── errors.py                ← ConflictError, PermissionDeniedError,
-│                              NotFoundError, ResourceLimitError
+│                              NotFoundError
 ├── protocols/
 │   ├── __init__.py
 │   ├── metadata.py          ← MetadataStore Protocol
@@ -348,9 +391,10 @@ tests/
 
 ## Risks
 
-| Risk                                                     | Mitigation                                                                                                          |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| SQLite WAL mode contention under concurrent async writes | Use `aiosqlite` connection per coroutine; WAL mode enabled at initialize time (`PRAGMA journal_mode=WAL`)           |
-| GC deletes a blob still referenced in a concurrent write | Blob GC checks reference count at delete time; content-addressed puts are idempotent so a re-write after GC is safe |
-| `diskcache` blocking I/O on the asyncio event loop       | `CachedBlobStore` wraps `diskcache` calls in `asyncio.to_thread`                                                    |
-| Large test suite slowness from real SQLite/FS            | Unit tests use `:memory:` SQLite and `tmp_path`; integration tests use `tmp_path` with cleanup                      |
+| Risk                                                     | Mitigation                                                                                                            |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| SQLite WAL mode contention under concurrent async writes | Use `aiosqlite` connection per coroutine; WAL mode enabled at initialize time (`PRAGMA journal_mode=WAL`)             |
+| GC deletes a blob still referenced in a concurrent write | Blob GC checks reference count at delete time; content-addressed puts are idempotent so a re-write after GC is safe   |
+| `diskcache` blocking I/O on the asyncio event loop       | `CachedBlobStore` wraps `diskcache` calls in `asyncio.to_thread`                                                      |
+| Large test suite slowness from real SQLite/FS            | Unit tests use `:memory:` SQLite and `tmp_path`; integration tests use `tmp_path` with cleanup                        |
+| Move partial failure leaves inconsistent state           | Tombstone + create wrapped in a single SQLite transaction (D14); future NoSQL adapters document best-effort semantics |
