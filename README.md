@@ -63,3 +63,56 @@ The VFS enforces permissions, manages versioning, and emits OpenTelemetry traces
 - [yjs/yjs: Shared data types for building collaborative software](https://github.com/yjs/yjs)
 - [prosemirror/prosemirror-collab: Collaborative editing for ProseMirror - code.haverbeke.berlin](https://code.haverbeke.berlin/prosemirror/prosemirror-collab)
 - [Lies I was Told About Collaborative Editing, Part 2: Why we don't use Yjs / Moment devlog](https://www.moment.dev/blog/lies-i-was-told-pt-2)
+
+## Documentation
+
+For user-facing docs and API reference, this project uses MkDocs + Material + mkdocstrings.
+
+Install docs dependencies:
+
+```bash
+uv sync --group docs
+```
+
+Run a local docs server:
+
+```bash
+uv run --group docs mkdocs serve
+```
+
+Build static docs:
+
+```bash
+uv run --group docs mkdocs build
+```
+
+Build output is written to `site/`.
+
+For self-hosted Docat packaging and upload handoff, see `docs/docat-handoff.md`.
+
+## Contributing
+
+Contributions and fixes are welcome.
+Please open issues or pull requests with clear descriptions and tests where appropriate.
+
+### Releasing
+
+This project uses [uv-ship](https://github.com/floRaths/uv-ship) to manage releases.
+Install it as a uv tool:
+
+```bash
+uv tool install uv-ship
+```
+
+To cut a release:
+
+```bash
+# do a dry run first!
+uv-ship --dry-run next <major | minor | patch>
+
+# if everything looks good, ship it
+uv-ship next <major | minor | patch>
+```
+
+This bumps the version in `pyproject.toml`, updates `CHANGELOG`, commits, tags, and pushes.
+See `[tool.uv-ship]` in `pyproject.toml` for configuration.

@@ -32,6 +32,11 @@ dependencies = [
 # not exposed to user-facing install api
 # e.g., cannot do `uv add aifs[dev]`
 dev = [ "uv-ship>=0.3.0" ]
+docs = [
+    "mkdocs>=1.6.1,<2",
+    "mkdocs-material>=9.6.0",
+    "mkdocstrings[python]>=0.29.0",
+]
 lint = [
     "complexipy>=3.0.0",
     "ruff>=0.12.0",
