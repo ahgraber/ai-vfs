@@ -74,9 +74,63 @@ For multi-step tasks, state a brief plan defining the step task and associated v
 
 ## Defaults
 
+- Review available skills for relevance before writing code.
+- If intermediate, user-aligned work is needed before final output, surface in .\_scratch/.
+- If worktrees are warranted use a local .worktrees/ directory.
 - Use descriptive, consistent naming conventions.
 - Write docstrings or comments for public contracts and non-obvious behavior.
 - Use type annotations where the language supports them.
 - Use structured logging where the project uses logging.
 - Run lint/format/test through project tooling when available; do not hand-format code.
 - Write tests for public behavior and regressions, not implementation details.
+
+## Technology & Data Handling Requirements
+
+- Python code runs in the uv-managed environment; dependencies are pinned via uv/lockfiles (pyproject.toml + uv.lock) and honored by Nix devshells — no ad-hoc global installs.
+- Default runtime targets CPU-only execution; GPU use requires an explicit cost and ops justification.
+- Storage of raw inputs and derived artifacts must permit replay; blob/object storage locations are recorded alongside metadata.
+- Secret management: Secrets/keys MUST NOT be committed.
+  Store them in a gitignored `.env` file (or a secret manager) and access them via environment variables at runtime.
+- Process identification: Every Python process MUST set a descriptive process title using `setproctitle` so hosts running multiple Python processes can distinguish them.
+
+## Workflow & Quality Gates
+
+- Use Spec-Driven Development and Test-Driven Development.
+- Any change to data schemas, embedding parameters, or retrieval scoring requires a migration/test plan and version bump of the affected artifact.
+- Code review checks for reproducibility (pinned deps, seeded operations), privacy adherence, and observability hooks (structured logs + metrics).
+- Techstack/tooling choices for external services or internal frameworks MUST reference an ADR in `docs/decision-record/` or be manually overridden with references to other documents.
+- Significant architectural decisions MUST have an ADR.
+
+## Governance Practices
+
+- Semantic Versioning is REQUIRED (MAJOR.MINOR.PATCH).
+- Conventional Commits are REQUIRED for commit messages and/or PR titles.
+- Keep a Changelog is REQUIRED; maintain `CHANGELOG.md` following <https://keepachangelog.com>.
+- After the first MINOR release, all changes affecting data/schema/contracts MUST include a migration plan and a deprecation schedule.
+
+## Testing
+
+- Run tests via `uv run pytest tests/`.
+- For parallel execution, use `pytest-xdist`: `uv run pytest -n auto -m "not integration_lifecycle" tests/`.
+- Tests marked `integration_lifecycle` (subprocess lifecycle with `pytest-isolate`) are incompatible with xdist; run them separately: `uv run pytest -m integration_lifecycle tests/`.
+- Do not use `pytest-run-parallel` — it is a thread-safety stress tester (runs the same test N times in N threads), not a test suite parallelizer.
+
+### Resource leak detection with pyleak
+
+Use [pyleak](https://github.com/deepankarm/pyleak) to guard against leaked asyncio tasks and threads.
+When writing tests for code that spawns concurrent work, wrap the act phase with the appropriate pyleak context manager:
+
+- `no_task_leaks(action="raise")` — for code using `asyncio.create_task`, `asyncio.gather`, `asyncio.to_thread`, or `TaskGroup`.
+- `no_thread_leaks(action="raise")` — for code using `ThreadPoolExecutor`, `threading.Thread`, or `subprocess.Popen` lifecycle management.
+
+Existing examples: `test_fetcher.py`, `test_async_utils.py`, `test_limiters.py`, `test_health_checks.py`, `test_worker_shutdown.py`.
+
+## Sandbox Limitations
+
+- You may add files but must ask the user to commit (hint: give them a commit message) so they can use their signing key.
+  Commit format: `type(scope): summary` (e.g., `feat(zsh): …`, `fix(vscode): …`).
+  Scope should reflect directories or logical surfaces.
+- The sandbox cannot run `uv sync` or read `.env` / `.env.example` (permission errors).
+- `tests/conversion/conftest.py` imports `aizk.conversion.db` → `pydantic_settings`, which may fail with `ModuleNotFoundError: No module named 'pydantic_settings.sources.providers.secrets'` if sandbox permissions are too strict.
+- **Delegate test runs to the user** when any of the above errors occur.
+  Describe the exact command to run (e.g., `uv run pytest tests/...`).

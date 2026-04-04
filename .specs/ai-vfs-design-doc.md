@@ -1,0 +1,814 @@
+# ai-vfs: Virtual Filesystem for AI Agents
+
+**Date:** 2026-04-04 **Status:** Draft **Authors:** ahgraber + Claude
+
+---
+
+## 1. Overview
+
+ai-vfs is a Python library providing virtual filesystem semantics for AI agents.
+It separates file content (stored in S3-compatible blob storage) from file metadata (stored in a pluggable database), with per-file versioning, path-based permissions, pluggable search, and sandboxed code execution.
+
+### Goals
+
+- **Library-first SDK** embeddable in any Python agent framework
+- **Pluggable storage**: S3-compatible blobs + SQL or NoSQL metadata adapters
+- **Per-file versioning** with undo/rollback and Time Machine-style retention
+- **Path-based access control** with invisible pruning (default-deny)
+- **Sandboxed execution** via pluggable providers ([Bashkit](https://github.com/everruns/bashkit), [Monty](https://github.com/pydantic/monty) initially)
+- **Self-hostable** with sensible local defaults (SQLite + local filesystem)
+
+### Non-Goals (for this spec)
+
+- Unified agent namespace (tools-as-files, memory-as-files) — consumer-layer concern
+- Service/API wrapper — future work on top of the library
+- CRDT-based collaborative editing — future horizon
+- Git-like branching/merging of workspaces
+
+### Key Design Decisions
+
+| Decision           | Choice                                                                     | Rationale                                                                                                           |
+| ------------------ | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Architecture       | Custom VFS with [fsspec](https://github.com/fsspec/filesystem_spec) bridge | Clean domain model; versions, permissions, content-addressing are first-class rather than bolted onto fsspec        |
+| Content addressing | [BLAKE3](https://github.com/BLAKE3-team/BLAKE3)                            | Cryptographically secure, ~2x faster than SHA-256, deduplication for free                                           |
+| Concurrency        | Optimistic (CAS via version stamps)                                        | No locks, no coordination layer; borrowed from [turbopuffer's S3 pattern](https://turbopuffer.com/blog/turbopuffer) |
+| Identifiers        | ULIDs                                                                      | Globally unique, time-sortable, human-readable in logs                                                              |
+| Metadata adapter   | Abstract protocol (~10 methods)                                            | Supports SQL (SQLite, Postgres) and NoSQL (Mongo, Cosmos) without ORM coupling                                      |
+| Execution          | Pluggable provider protocol                                                | Start with Bashkit + Monty; expand to Eryx, E2B without core changes                                                |
+| Config             | pydantic-settings                                                          | Validated, environment-aware, typed configuration                                                                   |
+
+---
+
+## 2. Core Domain Model
+
+### 2.1 Entities
+
+**Namespace** — an isolated workspace.
+All paths are relative to a namespace.
+The isolation boundary for permissions.
+Maps to a prefix in blob storage and a partition key in the metadata store.
+
+```text
+Namespace:
+  id: ULID
+  display_name: str               # human-friendly, looked up via names table
+  created_at: datetime
+  created_by: ULID                # principal
+  retention_policy: RetentionPolicy | None   # override global default
+```
+
+**File** — a path within a namespace pointing to versioned content.
+
+```text
+File:
+  namespace_id: ULID
+  path: str                       # e.g., "/workspace/main.py"
+  current_version_id: ULID
+  current_version_number: int
+  created_at: datetime
+  updated_at: datetime
+  is_deleted: bool                # true if current version is a tombstone
+```
+
+**Version** — an immutable snapshot of a file at a point in time.
+
+```text
+Version:
+  id: ULID
+  file_path: str
+  namespace_id: ULID
+  version_number: int             # per-file monotonic counter (human-facing)
+  content_hash: str               # BLAKE3 → blob store key
+  size: int                       # bytes
+  created_at: datetime
+  created_by: ULID                # principal
+  is_tombstone: bool              # true for deletes
+  search_meta: dict               # extensible search artifacts (bloom hashes, vectors, etc.)
+  parent_version_id: ULID | None  # for rollbacks, points to the version this was rolled back from
+```
+
+**Principal** — an identity (agent, user, service) that accesses the VFS.
+
+```text
+Principal:
+  id: ULID
+  display_name: str
+  principal_type: str             # "agent", "user", "service"
+  created_at: datetime
+```
+
+**Names table** — maps ULIDs to human-friendly display names for all entity types.
+
+```text
+Name:
+  entity_type: str                # "namespace", "principal", "permission"
+  entity_id: ULID
+  display_name: str
+```
+
+### 2.2 Operations
+
+| Operation  | Input                          | Output                         | Storage access             |
+| ---------- | ------------------------------ | ------------------------------ | -------------------------- |
+| `stat`     | path                           | file metadata (no content)     | metadata only              |
+| `read`     | path, version_number?          | bytes                          | metadata + blob            |
+| `write`    | path, bytes, expected_version? | version ID + version_number    | blob put + metadata insert |
+| `delete`   | path                           | tombstone version ID           | metadata only              |
+| `list`     | path prefix, recursive?        | list of file metadata          | metadata only              |
+| `search`   | query, scope, search_type      | matching paths + context lines | metadata + optional blob   |
+| `versions` | path, limit?, before?          | version history                | metadata only              |
+| `rollback` | path, target_version_number    | new version ID                 | metadata (+ blob ref)      |
+
+**Design principles:**
+
+- **Lazy content**: `list`, `stat`, `versions` never touch the blob store.
+- **Delete is a tombstone**: Creates a special version marker.
+  Old versions remain accessible.
+  GC reclaims them per retention policy.
+- **Rollback creates a new version**: Rolling back to version 3 creates version N+1 whose `content_hash` points to version 3's blob.
+  History is append-only; no version is ever mutated.
+- **Optimistic concurrency**: `write` accepts an optional `expected_version`.
+  If provided, the write fails with a conflict error if the current version doesn't match.
+  Callers retry.
+  If omitted, last-writer-wins (both versions are preserved).
+
+---
+
+## 3. Layer Architecture
+
+```text
++---------------------------------------------+
+|  Consumer Layer                              |
+|  (agent frameworks, CLI, fsspec bridge)      |
+|  Uses: VFS public API                        |
++---------------------------------------------+
+|  VFS Layer                                   |
+|  Orchestrates metadata + blob + search       |
+|  Enforces: permissions, versioning,          |
+|            concurrency, retention            |
+|  Emits: OTel spans + audit log entries       |
++------+--------+-----------+------------------+
+| Meta | Blob   | Search    | Execution        |
+| Store| Store  | Provider  | Provider         |
+| Proto| Proto  | Protocol  | Protocol         |
++------+--------+-----------+------------------+
+|SQLite| S3     | Glob/Grep | Bashkit          |
+|Postgr| MinIO  | Bloom     | Monty            |
+|Mongo | Azure  | Semantic  | Eryx             |
+|      | LocalFS| (plugin)  | (plugin)         |
++------+--------+-----------+------------------+
+```
+
+Between the Execution Provider and the VFS Layer sits the **Shell Operations Layer** —
+thin wrappers that translate standard bash command signatures into VFS operations:
+
+```text
+Execution Provider (bashkit / Monty)
+    |
+    |  sandbox calls: grep("-r", "pattern", "/workspace/")
+    v
+Shell Operations Layer
+    |  translates to: vfs.search(query="pattern", scope="/workspace/", type=regex)
+    v
+VFS Layer
+```
+
+### 3.1 Metadata Store Protocol
+
+```python
+class MetadataStore(Protocol):
+    # File operations
+    async def put_file(self, namespace_id: ULID, path: str, file: FileMeta) -> None: ...
+    async def get_file(self, namespace_id: ULID, path: str) -> FileMeta | None: ...
+    async def delete_file(self, namespace_id: ULID, path: str) -> None: ...
+    async def list_dir(self, namespace_id: ULID, path_prefix: str, recursive: bool = False) -> list[FileMeta]: ...
+
+    # Version operations (all mutations use CAS via expected_version)
+    async def put_version(self, version: VersionMeta, expected_version: int | None = None) -> None: ...
+    async def get_version(
+        self, namespace_id: ULID, path: str, version_number: int | None = None
+    ) -> VersionMeta | None: ...
+    async def list_versions(
+        self, namespace_id: ULID, path: str, limit: int = 50, before: ULID | None = None
+    ) -> list[VersionMeta]: ...
+
+    # Permissions
+    async def check_permission(self, principal_id: ULID, namespace_id: ULID, path: str, operation: str) -> bool: ...
+    async def set_permission(self, permission: Permission) -> None: ...
+
+    # Audit
+    async def append_audit_event(self, event: AuditEvent) -> None: ...
+
+    # Search metadata
+    async def update_search_meta(self, namespace_id: ULID, path: str, version_id: ULID, search_meta: dict) -> None: ...
+
+    # Names
+    async def set_name(self, entity_type: str, entity_id: ULID, display_name: str) -> None: ...
+    async def resolve_name(self, entity_type: str, display_name: str) -> ULID | None: ...
+
+    # GC (namespace_id=None means scan all namespaces)
+    async def list_reclaimable_versions(
+        self, policy: RetentionPolicy, namespace_id: ULID | None = None
+    ) -> list[VersionMeta]: ...
+    async def delete_versions(self, version_ids: list[ULID]) -> None: ...
+```
+
+All mutations that depend on current state accept an `expected_version` parameter.
+Implementation handles CAS semantics:
+
+- SQL: `UPDATE ... WHERE version_number = ?` (raises `ConflictError` on 0 rows affected)
+- Mongo: `find_one_and_update` with version match
+- S3-CAS: conditional PUT with `If-Match`
+
+### 3.2 Blob Store Protocol
+
+```python
+class BlobStore(Protocol):
+    # Whole-object operations (initial implementation)
+    async def put(self, content_hash: str, data: bytes) -> None: ...
+    async def get(self, content_hash: str) -> bytes: ...
+    async def delete(self, content_hash: str) -> None: ...
+    async def exists(self, content_hash: str) -> bool: ...
+
+    # Streaming operations (for large files; initially raise NotImplementedError)
+    async def put_stream(self, content_hash: str, stream: AsyncIterator[bytes]) -> None: ...
+    async def get_stream(self, content_hash: str) -> AsyncIterator[bytes]: ...
+```
+
+Blobs are immutable and content-addressed.
+`put` is idempotent — if the hash already exists, it's a no-op.
+`delete` is called only by GC.
+The blob store has no concept of files, paths, or versions.
+
+**Caching:** The VFS wraps the blob store in an optional [`diskcache`](https://github.com/grantjenks/python-diskcache)-backed caching layer.
+Enabled by default for remote blob stores (S3, Azure), disabled for local FS.
+Cache is keyed by content hash — immutable blobs make invalidation trivial (never needed).
+Cache eviction is LRU with a configurable max size.
+
+### 3.3 Search Provider Protocol
+
+```python
+class SearchProvider(Protocol):
+    async def index(self, path: str, content: bytes, metadata: FileMeta) -> dict: ...
+    async def search(self, query: str, scope: str, search_type: SearchType) -> list[SearchResult]: ...
+    def capabilities(self) -> set[SearchType]: ...
+```
+
+`SearchType` is an enum: `glob`, `find`, `regex`, `fulltext`, `semantic`.
+
+Multiple providers can be active simultaneously.
+The VFS dispatches a search to the provider that declares the matching capability.
+If multiple providers match, the VFS uses the most specific (e.g., bloom-accelerated regex over brute-force regex).
+
+`index()` is called synchronously during `write`.
+Returns a dict of search artifacts to store in the version's `search_meta` field.
+For the default provider (glob/find only), this is a no-op.
+
+**Dependency note:** Search providers do not access the metadata or blob stores directly.
+The VFS orchestrator queries `search_meta` from metadata, fetches blob content as needed, and passes both to the provider.
+Providers are pure functions over content and metadata — they have no storage dependencies.
+
+### 3.4 Execution Provider Protocol
+
+```python
+class ExecutionProvider(Protocol):
+    async def execute(
+        self,
+        code: str,
+        fs_ops: FsOperations,
+        timeout: float | None = None,
+        resource_limits: ResourceLimits | None = None,
+    ) -> ExecutionResult: ...
+
+    def capabilities(self) -> ExecutionCapabilities: ...
+    async def reset(self) -> None: ...
+```
+
+`FsOperations` — the bridge between sandbox and VFS:
+
+```python
+@dataclass
+class FsOperations:
+    # Core VFS operations (injected as sandbox callables)
+    read: Callable[[str], bytes]
+    write: Callable[[str, bytes], str]
+    list: Callable[[str, bool], list[dict]]
+    stat: Callable[[str], dict]
+    delete: Callable[[str], None]
+
+    # Shell operation wrappers
+    grep: Callable[..., list[dict]]
+    find: Callable[..., list[str]]
+    glob: Callable[[str], list[str]]
+    head: Callable[[str, int], bytes]
+    tail: Callable[[str, int], bytes]
+```
+
+The VFS layer constructs `FsOperations` with permission-scoped callbacks bound to the calling principal and namespace.
+The sandbox can only reach what the principal is allowed to access.
+
+```python
+@dataclass
+class ResourceLimits:
+    timeout_seconds: float = 30.0
+    max_memory_bytes: int | None = None
+    max_operations: int = 1000  # cap on VFS callbacks per execution
+```
+
+`max_operations` is VFS-level rate limiting.
+The execution provider enforces its own internal limits (Bashkit command count, Monty fuel, Eryx WASM fuel).
+
+### 3.5 Shell Operations Layer
+
+Wrappers that translate standard bash command signatures into VFS operations.
+These are injected into the sandbox as the external functions the agent calls.
+
+| Wrapper                       | Bash equivalent                     | VFS dispatch                                              |
+| ----------------------------- | ----------------------------------- | --------------------------------------------------------- |
+| `grep(flags, pattern, paths)` | `grep -r "pattern" /path/`          | search provider (bloom/regex) or fallback to read + match |
+| `find(path, predicates)`      | `find /path -name "*.py" -size +1k` | metadata store queries                                    |
+| `glob(pattern)`               | `ls /path/*.py`                     | path-pattern match against metadata                       |
+| `cat(path)`                   | `cat /path/file`                    | `vfs.read(path)`                                          |
+| `ls(flags, path)`             | `ls -la /path/`                     | `vfs.list(path)` with formatting                          |
+| `head(path, n)`               | `head -n 10 /path/file`             | `vfs.read(path)` + slice                                  |
+| `tail(path, n)`               | `tail -n 10 /path/file`             | `vfs.read(path)` + slice                                  |
+
+The shell ops layer enables the [Mintlify/ChromaFS](https://www.mintlify.com/blog/how-we-built-a-virtual-filesystem-for-our-assistant) optimization pattern:
+`grep` hits the search index first as a coarse filter, then verifies matches
+against actual content as a fine filter.
+
+---
+
+## 4. Versioning & Retention
+
+### 4.1 Version Model
+
+Every `write` produces a new `Version` record.
+Versions are immutable and append-only.
+
+- `version_number`: per-file monotonic integer (human-facing: "rollback to version 3")
+- `id` (ULID): globally unique, time-sortable (internal)
+- `content_hash` (BLAKE3): key into the blob store
+
+Multiple versions can share the same `content_hash` (deduplication).
+A rollback from version 7 to version 3 creates version 8 with `content_hash` equal to version 3's hash — no blob copy, just a new metadata row.
+
+### 4.2 Retention Policy (Time Machine Model)
+
+Configurable per-namespace, with global defaults:
+
+```python
+@dataclass
+class RetentionPolicy:
+    max_recent_versions: int = 50  # keep the N most recent
+    tiers: list[RetentionTier] = field(
+        default_factory=lambda: [
+            RetentionTier(max_age=timedelta(hours=24), keep_every=None),  # all
+            RetentionTier(max_age=timedelta(days=7), keep_every=timedelta(hours=1)),
+            RetentionTier(max_age=timedelta(days=30), keep_every=timedelta(days=1)),
+            RetentionTier(max_age=timedelta(days=365), keep_every=timedelta(weeks=1)),
+        ]
+    )
+    keep_first_version: bool = True  # always keep version 1
+    keep_current_version: bool = True  # always keep the latest
+```
+
+Tiers are evaluated in order.
+A version is reclaimable if it falls within a tier's age range and there's a newer version within that tier's `keep_every` interval.
+
+### 4.3 Garbage Collection
+
+GC runs as a background process (scheduled or manual), two phases:
+
+1. **Version GC**: Apply retention policy per file.
+   Mark expired versions as reclaimable.
+   Delete version metadata rows.
+2. **Blob GC**: Find `content_hash` values with zero remaining references across all namespaces and all versions.
+   Delete from blob store.
+
+Blob GC must be conservative — a content hash may be referenced by versions in different namespaces (content-addressed = shared).
+Only delete when global reference count = 0.
+
+GC is safe to skip indefinitely.
+The system accumulates versions and blobs until GC runs.
+No correctness dependency on GC.
+
+---
+
+## 5. Permissions
+
+### 5.1 Model
+
+```text
+Permission:
+  id: ULID
+  principal_id: ULID
+  namespace_id: ULID
+  path_prefix: str              # default "/" = entire namespace
+  operations: set[str]          # {"read", "write", "delete", "execute", "admin"}
+```
+
+### 5.2 Enforcement Rules
+
+- **Default-deny**: A principal with no matching permission is denied.
+- **Most-specific-first**: `/workspace/drafts/` overrides `/workspace/`.
+- **Invisible pruning**: `list` and `stat` exclude paths the principal cannot read.
+  The agent cannot reference or discover unauthorized paths.
+- **Namespace isolation**: Cross-namespace access requires an explicit permission entry.
+  The VFS never leaks metadata across namespace boundaries — even `search` is scoped.
+- **Admin**: Grants permission management on that subtree.
+
+### 5.3 Future RBAC Expansion
+
+The schema supports expansion without migration:
+
+- Add a `role` field to permissions (`owner`, `editor`, `viewer`, custom)
+- Roles map to operation sets: `viewer = {read}`, `editor = {read, write}`, `owner = {read, write, delete, admin}`
+- `principal_id` can reference a group for team-level permissions
+
+---
+
+## 6. Observability & Audit
+
+### 6.1 OpenTelemetry Instrumentation
+
+Every VFS operation is a span:
+
+```text
+Span: vfs.write
+  Attributes:
+    vfs.namespace_id: "01JQX..."
+    vfs.path: "/workspace/main.py"
+    vfs.principal_id: "01JQX..."
+    vfs.version_number: 4
+    vfs.content_hash: "b3_a1b2c3..."
+    vfs.blob_size_bytes: 1234
+  Children:
+    metadata.get_file (duration: 2ms)
+    blob.put (duration: 45ms)
+    search.index (duration: 12ms)
+    metadata.put_version (duration: 3ms)
+    audit.append (duration: 1ms)
+```
+
+Metrics:
+
+- `vfs.operation.count` (by operation, namespace)
+- `vfs.operation.duration` (histogram, by operation)
+- `vfs.blob.size` (histogram)
+- `vfs.search.candidates` (histogram — coarse filter results before verification)
+
+The agent framework's traces can parent-link to VFS spans via standard OTel context propagation.
+
+### 6.2 Audit Log
+
+Stored in the metadata DB.
+Append-only.
+
+```text
+AuditEvent:
+  event_id: ULID
+  timestamp: datetime
+  namespace_id: ULID
+  principal_id: ULID
+  operation: str              # "write", "delete", "rollback", "permission_change", "gc_run"
+  path: str | None
+  version_id: ULID | None
+  detail: dict                # operation-specific: old/new content_hash, permission diff, etc.
+  trace_id: str | None        # OTel trace ID for correlation
+```
+
+**What gets audited:**
+
+- All writes, deletes, rollbacks (state changes)
+- Permission changes
+- GC runs (which versions/blobs were reclaimed)
+
+**What does not get audited** (OTel spans only):
+
+- Reads — too noisy for the audit log
+
+**Correlation:** Audit events carry the OTel `trace_id` so you can jump from
+"this file was modified at 3pm" to the full execution trace.
+
+---
+
+## 7. Search
+
+### 7.1 Built-in Search (Default Provider)
+
+Handles path-based operations with no indexing overhead:
+
+- **Glob**: `*.py`, `workspace/**/*.md` — metadata-only path matching
+- **Find**: predicate-based metadata search (name patterns, size, mtime, type)
+- **Grep**: regex or literal match against file content — requires blob reads
+
+Grep without an acceleration provider falls back to: `list(scope, recursive)` then `read` + match per file.
+Correct but O(n) in file count.
+
+### 7.2 Bloom Filter Provider (Plugin)
+
+- **On `index`**: Computes bloom filter hashes (xxhash-based) for file content.
+  Stores in `search_meta.bloom`.
+- **On `search(regex)`**: Tests bloom filters across files in scope.
+  Returns candidate set (coarse filter).
+  VFS verifies candidates with content match (fine filter).
+- Reduces grep from O(n) blob reads to O(k) where k \<< n.
+
+Potential integration with [ahgraber/bloom-search](https://github.com/ahgraber/bloom-search) or
+a [Cursor-style bloom extension](https://cursor.com/blog/fast-regex-search) for regex-capable indexing.
+
+### 7.3 Semantic Search Provider (Future Plugin)
+
+- **On `index`**: Computes embedding vector.
+  Stores in `search_meta.vector`.
+- **On `search(semantic)`**: Vector similarity query against stored embeddings.
+- Backend options: pgvector (Postgres), Atlas Search (Mongo), external vector DB.
+
+### 7.4 Search Dispatch
+
+```text
+search(query, scope, type)
+    |
+    v
+VFS: which providers declare this search_type?
+    |
+    +-- acceleration provider found
+    |       |
+    |       v
+    |   provider.search() --> candidate paths
+    |       |
+    |       v
+    |   VFS: read candidates, verify matches --> results
+    |
+    +-- no acceleration provider
+            |
+            v
+        fallback: list all files in scope, read + match
+```
+
+The agent doesn't know or care which path was taken.
+
+### 7.5 Search Metadata Storage
+
+Search artifacts are stored per-version in an extensible `search_meta` field (JSONB in SQL, nested document in NoSQL).
+The core schema does not prescribe the contents — each active SearchProvider writes its own keys.
+
+The metadata store adapter supports querying against `search_meta` subfields
+(e.g., bloom filter lookups, vector similarity).
+
+---
+
+## 8. Execution
+
+### 8.1 Tiered Model
+
+| Tier    | Provider                                               | Language      | Startup             | Security                            | Use case                       |
+| ------- | ------------------------------------------------------ | ------------- | ------------------- | ----------------------------------- | ------------------------------ |
+| Initial | [Bashkit](https://github.com/everruns/bashkit)         | Bash subset   | In-process          | Rust VM, no I/O by default          | File manipulation, scripting   |
+| Initial | [Monty](https://github.com/pydantic/monty)             | Python subset | In-process, ~3-15us | Rust VM, external functions only    | Data transforms, orchestration |
+| Future  | [Eryx](https://github.com/eryx-org/eryx)               | Full CPython  | ~16ms (AOT)         | WASM sandbox, all 6 vectors blocked | Complex Python, stdlib         |
+| Future  | [PyMiniRacer](https://github.com/bpcreech/PyMiniRacer) | JavaScript    | In-process          | V8 isolate                          | JS/TS execution                |
+| Future  | [E2B](https://e2b.dev)/sidecar                         | Any           | ~150ms              | Firecracker microVM                 | Pip packages, full OS          |
+
+### 8.2 Integration Pattern
+
+All execution providers use the **function-injection pattern**:
+
+1. VFS constructs `FsOperations` bound to the calling principal/namespace
+2. Shell ops layer wraps VFS operations in bash-familiar signatures
+3. Execution provider receives `FsOperations` as injectable callables
+4. Sandboxed code calls these functions — they route back through the VFS
+5. The sandbox never accesses storage directly
+
+```text
+Agent code: grep -r "TODO" /workspace/
+    |
+    v
+Bashkit sandbox --> shell_ops.grep("-r", "TODO", "/workspace/")
+    |
+    v
+VFS.search(query="TODO", scope="/workspace/", type=regex)
+    |
+    v
+BloomProvider.search() --> candidates --> VFS.read() + verify --> results
+```
+
+### 8.3 Resource Limits
+
+Enforced at two levels:
+
+- **VFS level**: `max_operations` caps the number of VFS callbacks per execution
+  (prevents unbounded read loops)
+- **Provider level**: Each provider enforces its own limits (Bashkit command count,
+  Monty fuel, Eryx WASM fuel, timeout)
+
+---
+
+## 9. Configuration
+
+### 9.1 pydantic-settings Config
+
+```python
+from pydantic_settings import BaseSettings
+
+
+class VFSConfig(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="AIFS_")
+
+    # Storage
+    metadata_store_uri: str = "sqlite:///./aifs.db"
+    blob_store_uri: str = "file:///./aifs_blobs/"
+
+    # Versioning & retention
+    retention_max_recent: int = 50
+    retention_tiers: list[dict] | None = None  # override default Time Machine tiers
+
+    # Observability
+    otel_enabled: bool = True
+    audit_log_enabled: bool = True
+
+    # Search providers (list of registered provider names)
+    search_providers: list[str] = ["default"]
+
+    # Execution providers (list of registered provider names)
+    execution_providers: list[str] = []
+
+    # Resource limits
+    default_timeout_seconds: float = 30.0
+    default_max_operations: int = 1000
+```
+
+### 9.2 URI-Based Store Resolution
+
+Store URIs are resolved to adapter implementations at construction:
+
+| URI scheme           | Adapter               |
+| -------------------- | --------------------- |
+| `sqlite:///path`     | SQLiteMetadataStore   |
+| `postgresql://...`   | PostgresMetadataStore |
+| `mongodb://...`      | MongoMetadataStore    |
+| `s3://bucket/prefix` | S3BlobStore           |
+| `file:///path`       | LocalFSBlobStore      |
+
+### 9.3 Constructor
+
+```python
+from ai_vfs import VFS
+
+# Minimal — SQLite + local filesystem, no plugins
+vfs = VFS()
+
+# Self-hosted — S3 + Postgres, bloom search, bashkit execution
+vfs = VFS(
+    metadata_store="postgresql://localhost/aifs",
+    blob_store="s3://my-bucket/aifs",
+    search_providers=["bloom"],
+    execution_providers=["bashkit"],
+)
+```
+
+### 9.4 Deployment Profiles
+
+| Profile     | Metadata | Blobs    | Search              | Execution              |
+| ----------- | -------- | -------- | ------------------- | ---------------------- |
+| Local dev   | SQLite   | Local FS | Default (glob/grep) | None                   |
+| Self-hosted | Postgres | MinIO/S3 | Bloom               | Bashkit + Monty        |
+| Production  | Postgres | S3       | Bloom + Semantic    | Bashkit + Monty + Eryx |
+
+### 9.5 Secrets
+
+All credentials (S3 keys, DB connection strings) via environment variables or `.env` file (gitignored).
+Never in config objects or committed files.
+
+### 9.6 Process Identification
+
+When running as a service or background GC process, ai-vfs sets `setproctitle("ai-vfs: <role>")` per project conventions.
+
+---
+
+## 10. Public API Surface
+
+```python
+from ai_vfs import VFS
+
+# Lifecycle
+vfs = VFS(config=VFSConfig(...))  # or VFS() for defaults
+await vfs.initialize()  # create tables, verify blob store access
+await vfs.close()  # cleanup connections
+
+# Namespace management
+ns = await vfs.create_namespace(display_name="my-workspace")
+await vfs.grant(principal_id, ns.id, path_prefix="/", operations={"read", "write"})
+
+# File operations (all scoped to a principal + namespace)
+meta = await vfs.stat(ns.id, "/main.py", principal=p)
+data = await vfs.read(ns.id, "/main.py", principal=p, version_number=3)
+ver = await vfs.write(ns.id, "/main.py", content, principal=p, expected_version=4)
+await vfs.delete(ns.id, "/main.py", principal=p)
+files = await vfs.list(ns.id, "/src/", principal=p, recursive=True)
+
+# Versioning
+history = await vfs.versions(ns.id, "/main.py", principal=p, limit=20)
+ver = await vfs.rollback(ns.id, "/main.py", target_version=3, principal=p)
+
+# Search
+results = await vfs.search("TODO", scope="/src/", namespace=ns.id, principal=p, search_type="regex")
+
+# Execution
+result = await vfs.execute(
+    code='grep -r "TODO" /workspace/',
+    namespace=ns.id,
+    principal=p,
+    provider="bashkit",
+)
+
+# GC (manual trigger; also runnable on a schedule)
+gc_result = await vfs.run_gc()
+
+# Reindex (backfill search metadata for a provider added after files were written)
+await vfs.reindex(namespace=ns.id, provider="bloom", scope="/src/")
+```
+
+---
+
+## 11. Dependencies (Initial)
+
+| Dependency          | Purpose                 | Notes                                |
+| ------------------- | ----------------------- | ------------------------------------ |
+| `blake3`            | Content hashing         | Rust-backed, PyPI                    |
+| `python-ulid`       | ID generation           | Pure Python                          |
+| `pydantic`          | Domain models           | Already in ecosystem                 |
+| `pydantic-settings` | Configuration           | Env-aware config                     |
+| `opentelemetry-api` | Tracing/metrics         | Instrumentation only (no SDK forced) |
+| `aiosqlite`         | SQLite metadata adapter | Async SQLite                         |
+| `aiofiles`          | Local FS blob adapter   | Async file I/O                       |
+| `diskcache`         | Blob caching layer      | LRU cache for remote blob stores     |
+
+**Optional (per deployment):**
+
+| Dependency             | Purpose                     |
+| ---------------------- | --------------------------- |
+| `asyncpg`              | Postgres metadata adapter   |
+| `motor`                | Mongo metadata adapter      |
+| `s3fs` / `aiobotocore` | S3 blob adapter             |
+| `bashkit-python`       | Bash execution provider     |
+| `pydantic-monty`       | Python execution provider   |
+| `fsspec`               | fsspec compatibility bridge |
+
+---
+
+## 12. Resolved Design Questions
+
+1. **fsspec bridge**: Deferred.
+   Not in initial scope.
+   The native VFS API is the primary interface; an fsspec `AbstractFileSystem` adapter can be added later as a compatibility convenience.
+
+2. **Streaming reads/writes**: Include provisions in the protocol.
+   The `BlobStore` protocol includes both `put(hash, bytes)` / `get(hash) → bytes` for simple cases and `put_stream(hash, AsyncIterator[bytes])` / `get_stream(hash) → AsyncIterator[bytes]` for large files.
+   The VFS `read`/`write` API exposes both `bytes` and streaming variants.
+   Implementation: start with `bytes`-only in initial adapters; streaming methods raise `NotImplementedError` until needed.
+
+3. **Blob store caching**: Built-in via `diskcache`.
+   The VFS includes an optional local cache layer (disabled by default for local-FS blobs, enabled by default for remote blob stores like S3).
+   Cache is keyed by content hash — immutable blobs make cache invalidation trivial (never needed).
+
+4. **Search metadata schema evolution**: Two mechanisms:
+
+   - **Lazy backfill**: When a search provider encounters a file without its `search_meta` entries during a search, it reads the content, computes the index, and writes the `search_meta` back.
+     Transparent to the caller.
+   - **Batch reindex**: `vfs.reindex(namespace, provider, scope)` as an explicit command for bulk backfill.
+     Runnable as a background job.
+
+5. **Execution provider lifecycle**: Stateless per-execution initially.
+   Each `execute()` call gets a fresh sandbox.
+   State persistence (snapshot/restore) is a future addition via two optional protocol methods (`async def snapshot() → bytes`, `async def restore(bytes)`) that existing stateless providers simply don't implement.
+   No VFS changes needed.
+
+---
+
+## Appendix: Prior Art & Influences
+
+| Project / Source                                                                                                                               | Influence on ai-vfs                                                                                                                                        |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Mintlify ChromaFS](https://www.mintlify.com/blog/how-we-built-a-virtual-filesystem-for-our-assistant)                                         | Virtual filesystem over DB, invisible access pruning, grep optimization via coarse+fine filter                                                             |
+| [Anthropic: Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)                                            | Progressive disclosure, filesystem-organized tool definitions, 98.7% token reduction                                                                       |
+| [Cloudflare: Code Mode](https://blog.cloudflare.com/code-mode/)                                                                                | Code execution > direct tool calling, V8 isolate sandboxing                                                                                                |
+| [AIGNE / CSIRO: Agentic File System Abstraction](https://arxiv.org/abs/2512.05470)                                                             | Persistent context repository, memory lifecycle (history/memory/scratchpad), implemented in [AIGNE framework](https://github.com/aigne-io/aigne-framework) |
+| [yarnnn: Agent OS is a Filesystem](https://www.yarnnn.com/blog/the-agent-operating-system-is-a-filesystem)                                     | Three storage domains, filesystem semantics + vector acceleration backend                                                                                  |
+| [AGFS](https://github.com/c4pt0r/agfs)                                                                                                         | Heterogeneous backends (Redis, S3, SQL, queues) under unified POSIX namespace, Plan 9 philosophy                                                           |
+| [Vercel just-bash](https://github.com/vercel-labs/just-bash) / [bash-tool benchmarks](https://vercel.com/blog/testing-if-bash-is-all-you-need) | IFileSystem interface, MountableFs, hybrid bash+SQL outperforms either alone                                                                               |
+| [Bashkit](https://github.com/everruns/bashkit)                                                                                                 | Rust virtual bash, FileSystem trait, MountableFs, [Python bindings](https://github.com/everruns/bashkit/blob/main/crates/bashkit-python/README.md)         |
+| [Pydantic Monty](https://github.com/pydantic/monty)                                                                                            | External function injection, snapshot/resume, sub-microsecond execution                                                                                    |
+| [Eryx](https://github.com/eryx-org/eryx)                                                                                                       | CPython 3.14 in WASM sandbox, sandbox pooling, TypedCallbacks                                                                                              |
+| [fsspec](https://github.com/fsspec/filesystem_spec)                                                                                            | Python ecosystem standard for filesystem abstraction                                                                                                       |
+| [turbopuffer](https://turbopuffer.com/blog/turbopuffer) ([Latent Space interview](https://www.latent.space/p/turbopuffer))                     | S3 conditional writes for coordination-free concurrency, optimistic CAS, metadata-as-JSON-files pattern                                                    |
+| [Fly.io Litestream VFS](https://fly.io/blog/litestream-writable-vfs/)                                                                          | Writable VFS over S3, hydration pattern, lazy content serving before full download                                                                         |
+| [Cursor: Fast Regex Search](https://cursor.com/blog/fast-regex-search)                                                                         | Bloom filters for regex-capable file content indexing                                                                                                      |
+| [Dead Neurons: Forget MCP, Bash Is All You Need](https://deadneurons.substack.com/p/forget-mcp-bash-is-all-you-need)                           | MCP converging on POSIX; OS as agent runtime; composition via pipes                                                                                        |
+| [HuggingFace smolagents](https://huggingface.co/blog/smolagents)                                                                               | Code agents > tool-calling agents; function-injection pattern                                                                                              |
+| [JuiceFS](https://github.com/juicedata/juicefs)                                                                                                | Metadata/data separation architecture (metadata in Redis/Postgres, data in S3)                                                                             |
+| [Filestash](https://github.com/mickael-kerjean/filestash)                                                                                      | 8 methods suffice to unify 20+ storage backends; MCP gateway                                                                                               |
+| [TigerFS](https://github.com/timescale/tigerfs)                                                                                                | Postgres-backed filesystem, ACID file writes, version history                                                                                              |
+| [Starlark (starlark-pyo3)](https://github.com/inducer/starlark-pyo3)                                                                           | Hermetic sandboxed execution by language design                                                                                                            |
+| [Yjs](https://github.com/yjs/yjs) / [ProseMirror collab](https://code.haverbeke.berlin/prosemirror/prosemirror-collab)                         | Future horizon: CRDT-based collaborative editing ([caveats](https://www.moment.dev/blog/lies-i-was-told-pt-2))                                             |

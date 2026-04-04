@@ -1,0 +1,173 @@
+# File Operations Specification
+
+> Generated from design document analysis on 2026-04-04
+> Source files: docs/specs/2026-04-04-ai-vfs-design.md (Sections 2, 3, 10)
+
+## Purpose
+
+Core CRUD operations on the virtual filesystem.
+Provides read, write, delete, stat, and list against namespaced paths, with content-addressed blob storage and lazy content resolution.
+
+## Requirements
+
+### Requirement: ContentAddressedStorage
+
+The system SHALL store file content in the blob store keyed by BLAKE3 hash
+of the content bytes, so that identical content is stored only once.
+
+#### Scenario: DeduplicatedWrite
+
+- **GIVEN** two files with identical content exist in different paths
+- **WHEN** both files are written to the VFS
+- **THEN** only one blob object exists in the blob store
+
+#### Scenario: DeterministicHash
+
+- **GIVEN** the same byte sequence is hashed twice
+- **WHEN** BLAKE3 content_hash is computed
+- **THEN** both invocations return the same 64-character lowercase hex string
+
+### Requirement: WriteCreatesVersion
+
+The system SHALL create a new immutable version record for every write operation,
+incrementing the per-file monotonic version number.
+
+#### Scenario: FirstWrite
+
+- **GIVEN** a path that does not exist in the namespace
+- **WHEN** a principal writes content to that path
+- **THEN** a file record is created with version_number 1, and a version record is persisted with the content hash and size
+
+#### Scenario: SubsequentWrite
+
+- **GIVEN** a file at version N
+- **WHEN** a principal writes new content
+- **THEN** a new version N+1 is created; the file's current_version_id and current_version_number are updated
+
+### Requirement: ReadReturnsContent
+
+The system SHALL return the blob content for a file's current version by default,
+or for a specific version when version_number is provided.
+
+#### Scenario: ReadLatest
+
+- **GIVEN** a file with versions 1, 2, and 3
+- **WHEN** a principal reads the file without specifying a version
+- **THEN** the content of version 3 is returned
+
+#### Scenario: ReadSpecificVersion
+
+- **GIVEN** a file with versions 1, 2, and 3
+- **WHEN** a principal reads the file with version_number=1
+- **THEN** the content of version 1 is returned
+
+#### Scenario: ReadNonexistent
+
+- **GIVEN** a path that does not exist
+- **WHEN** a principal reads that path
+- **THEN** a FileNotFoundError is raised
+
+### Requirement: LazyContentResolution
+
+The system SHALL NOT fetch blob content for list, stat, or versions operations; only read SHALL access the blob store.
+
+#### Scenario: StatMetadataOnly
+
+- **GIVEN** a file exists
+- **WHEN** a principal calls stat
+- **THEN** file metadata (path, version number, size, timestamps) is returned without any blob store access
+
+#### Scenario: ListMetadataOnly
+
+- **GIVEN** multiple files exist under a path prefix
+- **WHEN** a principal calls list
+- **THEN** file metadata entries are returned without any blob store access
+
+### Requirement: DeleteCreatesTombstone
+
+The system SHALL mark a file as deleted by creating a tombstone version,
+preserving all prior versions for potential rollback.
+
+#### Scenario: DeleteFile
+
+- **GIVEN** a file at version N
+- **WHEN** a principal deletes the file
+- **THEN** a tombstone version N+1 is created, the file is marked is_deleted=True, and subsequent reads raise FileNotFoundError
+
+#### Scenario: DeletedFileVersionsAccessible
+
+- **GIVEN** a deleted file
+- **WHEN** a principal lists versions of that file
+- **THEN** all versions including the tombstone are returned
+
+### Requirement: ListDirectoryContents
+
+The system SHALL list files under a path prefix, with optional recursion.
+
+#### Scenario: NonRecursiveList
+
+- **GIVEN** files at /src/a.py, /src/b.py, and /src/sub/c.py
+- **WHEN** a principal lists /src/ non-recursively
+- **THEN** only /src/a.py and /src/b.py are returned
+
+#### Scenario: RecursiveList
+
+- **GIVEN** files at /src/a.py, /src/b.py, and /src/sub/c.py
+- **WHEN** a principal lists /src/ recursively
+- **THEN** all three files are returned
+
+#### Scenario: ListExcludesDeleted
+
+- **GIVEN** a deleted file and a live file under the same prefix
+- **WHEN** a principal lists that prefix
+- **THEN** only the live file appears
+
+### Requirement: OptimisticConcurrency
+
+The system SHALL support optimistic concurrency via an optional expected_version parameter on write.
+When provided, the write SHALL fail with ConflictError if the file's current version does not match.
+
+#### Scenario: ConcurrentWriteConflict
+
+- **GIVEN** a file at version 2
+- **WHEN** a principal writes with expected_version=1
+- **THEN** a ConflictError is raised with expected=1, actual=2
+
+#### Scenario: ConcurrentWriteSuccess
+
+- **GIVEN** a file at version 2
+- **WHEN** a principal writes with expected_version=2
+- **THEN** version 3 is created successfully
+
+#### Scenario: WriteWithoutExpectedVersion
+
+- **GIVEN** a file at any version
+- **WHEN** a principal writes without expected_version
+- **THEN** the write succeeds (last-writer-wins)
+
+### Requirement: NamespaceIsolation
+
+The system SHALL scope all file operations to a namespace.
+Files in one namespace SHALL NOT be visible or accessible from another namespace.
+
+#### Scenario: CrossNamespaceInvisible
+
+- **GIVEN** a file /data.txt in namespace A
+- **WHEN** a principal lists / in namespace B
+- **THEN** /data.txt does not appear
+
+### Requirement: ULIDIdentifiers
+
+The system SHALL use ULIDs as the primary identifier for all entities (namespaces, principals, versions, permissions).
+A per-file monotonic version_number integer SHALL serve as the human-facing version identifier.
+
+#### Scenario: VersionDualIdentifier
+
+- **GIVEN** a new version is created
+- **WHEN** the version record is inspected
+- **THEN** it has both a globally unique ULID id and a per-file version_number integer
+
+## Technical Notes
+
+- **Implementation**: src/aifs/vfs.py (orchestrator), src/aifs/models.py (domain models)
+- **Dependencies**: storage (MetadataStore, BlobStore protocols), access-control
