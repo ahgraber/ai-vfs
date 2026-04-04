@@ -5,7 +5,7 @@
 ## Context
 
 The baseline specs define all required behavior.
-The design document (`docs/specs/2026-04-04-ai-fs-design.md`) resolves all major architectural questions.
+The design document (`.specs/ai-vfs-design-doc.md`) resolves all major architectural questions.
 This document captures implementation-level decisions not covered in the spec.
 
 ## Decisions
