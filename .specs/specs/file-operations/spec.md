@@ -104,6 +104,8 @@ preserving all prior versions for potential rollback.
 
 The system SHALL list files under a path prefix, with optional recursion.
 
+> **Note:** Glob/pattern-based listing (e.g., `*.py` under `/src/`) is intentionally excluded here; it is expected to be handled by the search layer (`GlobSearch` in the search spec).
+
 #### Scenario: NonRecursiveList
 
 - **GIVEN** files at /src/a.py, /src/b.py, and /src/sub/c.py
@@ -121,6 +123,59 @@ The system SHALL list files under a path prefix, with optional recursion.
 - **GIVEN** a deleted file and a live file under the same prefix
 - **WHEN** a principal lists that prefix
 - **THEN** only the live file appears
+
+### Requirement: CopyFile
+
+The system SHALL copy a file to a new path within the same namespace, creating a new file record at version 1 pointing at the same blob.
+The source file is unchanged.
+Because blobs are content-addressed, no additional blob storage is consumed when the content is identical.
+
+#### Scenario: CopyToNewPath
+
+- **GIVEN** a file at /src/a.py with content hash H at version 3
+- **WHEN** a principal copies /src/a.py to /dst/a.py
+- **THEN** a new file record exists at /dst/a.py with version 1 and content hash H, and /src/a.py remains at version 3
+
+#### Scenario: CopyToExistingPath
+
+- **GIVEN** a file already exists at the destination path
+- **WHEN** a principal copies to that path
+- **THEN** the destination is overwritten (a new version is written), consistent with write semantics
+
+#### Scenario: CopyNonexistentSource
+
+- **GIVEN** the source path does not exist
+- **WHEN** a principal issues a copy
+- **THEN** a FileNotFoundError is raised and no destination record is created
+
+### Requirement: MoveFile
+
+The system SHALL move (rename) a file to a new path within the same namespace as an atomic operation: the source receives a tombstone and the destination is created at version 1 with the same content hash.
+Version history is not transferred; the destination begins a new version chain.
+
+#### Scenario: MoveToNewPath
+
+- **GIVEN** a file at /src/a.py at version 5
+- **WHEN** a principal moves /src/a.py to /dst/a.py
+- **THEN** /dst/a.py exists at version 1 with the same content hash, and /src/a.py has a tombstone (is_deleted=True)
+
+#### Scenario: MoveTombstoneAndCreateAreAtomic
+
+- **GIVEN** a move operation is in progress
+- **WHEN** any failure occurs mid-operation
+- **THEN** the system leaves neither a partial destination nor an unintended tombstone on the source
+
+#### Scenario: MoveToExistingPath
+
+- **GIVEN** a file already exists at the destination path
+- **WHEN** a principal moves to that path
+- **THEN** the destination is overwritten and the source receives a tombstone
+
+#### Scenario: MoveNonexistentSource
+
+- **GIVEN** the source path does not exist
+- **WHEN** a principal issues a move
+- **THEN** a FileNotFoundError is raised and no destination record is created
 
 ### Requirement: OptimisticConcurrency
 
