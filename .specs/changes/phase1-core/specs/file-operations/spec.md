@@ -60,7 +60,7 @@ or for a specific version when version_number is provided.
 
 - **GIVEN** a path that does not exist
 - **WHEN** a principal reads that path
-- **THEN** a FileNotFoundError is raised
+- **THEN** a NotFoundError is raised
 
 ### Requirement: LazyContentResolution
 
@@ -87,7 +87,7 @@ preserving all prior versions for potential rollback.
 
 - **GIVEN** a file at version N
 - **WHEN** a principal deletes the file
-- **THEN** a tombstone version N+1 is created, the file is marked is_deleted=True, and subsequent reads raise FileNotFoundError
+- **THEN** a tombstone version N+1 is created, the file is marked is_deleted=True, and subsequent reads raise NotFoundError
 
 #### Scenario: DeletedFileVersionsAccessible
 
@@ -141,7 +141,7 @@ Because blobs are content-addressed, no additional blob storage is consumed when
 
 - **GIVEN** the source path does not exist
 - **WHEN** a principal issues a copy
-- **THEN** a FileNotFoundError is raised and no destination record is created
+- **THEN** a NotFoundError is raised and no destination record is created
 
 ### Requirement: MoveFile
 
@@ -170,7 +170,7 @@ Version history is not transferred; the destination begins a new version chain.
 
 - **GIVEN** the source path does not exist
 - **WHEN** a principal issues a move
-- **THEN** a FileNotFoundError is raised and no destination record is created
+- **THEN** a NotFoundError is raised and no destination record is created
 
 ### Requirement: OptimisticConcurrency
 
