@@ -29,12 +29,12 @@ CREATE TABLE IF NOT EXISTS namespaces (
     id          TEXT PRIMARY KEY,        -- ULID
     display_name TEXT NOT NULL,
     created_at  TEXT NOT NULL,           -- ISO 8601
-    created_by  TEXT NOT NULL,           -- principal ULID
+    created_by  TEXT NOT NULL,           -- principal UUID4
     retention_policy TEXT                -- JSON or NULL
 );
 
 CREATE TABLE IF NOT EXISTS principals (
-    id          TEXT PRIMARY KEY,        -- ULID
+    id          TEXT PRIMARY KEY,        -- UUID4 (no embedded timestamp; prevents ordering inference)
     display_name TEXT NOT NULL,
     principal_type TEXT NOT NULL,        -- "agent" | "user" | "service"
     created_at  TEXT NOT NULL
@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 CREATE TABLE IF NOT EXISTS names (
     entity_type  TEXT NOT NULL,
-    entity_id    TEXT NOT NULL,          -- ULID
+    entity_id    TEXT NOT NULL,          -- ULID for file-system entities; UUID4 for principals
     display_name TEXT NOT NULL,
     PRIMARY KEY (entity_type, entity_id),
     UNIQUE (entity_type, display_name)
