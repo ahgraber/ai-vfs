@@ -32,7 +32,7 @@ It separates file content (stored in S3-compatible blob storage) from file metad
 | Architecture       | Custom VFS with [fsspec](https://github.com/fsspec/filesystem_spec) bridge | Clean domain model; versions, permissions, content-addressing are first-class rather than bolted onto fsspec        |
 | Content addressing | [BLAKE3](https://github.com/BLAKE3-team/BLAKE3)                            | Cryptographically secure, ~2x faster than SHA-256, deduplication for free                                           |
 | Concurrency        | Optimistic (CAS via version stamps)                                        | No locks, no coordination layer; borrowed from [turbopuffer's S3 pattern](https://turbopuffer.com/blog/turbopuffer) |
-| Identifiers        | ULIDs                                                                      | Globally unique, time-sortable, human-readable in logs                                                              |
+| Identifiers        | ULIDs (file/metadata entities) + UUID4 (person-related entities)           | ULID for temporal sortability in logs; UUID4 for principals to avoid leaking creation-time ordering                 |
 | Metadata adapter   | Abstract protocol (~10 methods)                                            | Supports SQL (SQLite, Postgres) and NoSQL (Mongo, Cosmos) without ORM coupling                                      |
 | Execution          | Pluggable provider protocol                                                | Start with Bashkit + Monty; expand to Eryx, E2B without core changes                                                |
 | Config             | pydantic-settings                                                          | Validated, environment-aware, typed configuration                                                                   |
@@ -91,18 +91,19 @@ Version:
 
 ```text
 Principal:
-  id: ULID
+  id: UUID4                       # fully random — no embedded timestamp; prevents
+                                  # inferring creation order of principals from IDs
   display_name: str
   principal_type: str             # "agent", "user", "service"
   created_at: datetime
 ```
 
-**Names table** — maps ULIDs to human-friendly display names for all entity types.
+**Names table** — maps identifiers to human-friendly display names for all entity types.
 
 ```text
 Name:
   entity_type: str                # "namespace", "principal", "permission"
-  entity_id: ULID
+  entity_id: str                  # ULID for file-system entities; UUID4 for principals
   display_name: str
 ```
 
@@ -200,7 +201,7 @@ class MetadataStore(Protocol):
     async def append_audit_event(self, event: AuditEvent) -> None: ...
 
     # Search metadata
-    async def update_search_meta(self, namespace_id: ULID, path: str, version_id: ULID, search_meta: dict) -> None: ...
+    async def update_search_meta(self, version_id: str, search_meta: dict) -> None: ...
 
     # Names
     async def set_name(self, entity_type: str, entity_id: ULID, display_name: str) -> None: ...

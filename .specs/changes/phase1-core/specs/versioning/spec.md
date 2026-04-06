@@ -8,8 +8,12 @@
 ### Requirement: ImmutableVersionHistory
 
 The system SHALL store every write as an immutable version record.
-No version record SHALL ever be mutated after creation.
+No version record's content fields (version_number, content_hash, size, created_at, created_by, is_tombstone, parent_version_id) SHALL ever be mutated after creation.
 Only GC MAY delete version records per the retention policy.
+
+> **Note:** `search_meta` is explicitly exempt from this immutability contract.
+> It is a mutable, provider-populated indexing field updated by `update_search_meta`
+> and the `SearchMetaReindex` operation below. All other fields are immutable.
 
 #### Scenario: VersionsNeverMutated
 
@@ -47,6 +51,11 @@ The system SHALL return version history newest-first with configurable limit and
 ### Requirement: RetentionPolicy
 
 The system SHALL support a configurable Time Machine-style retention policy per namespace, with global defaults.
+
+> **Phase 1 scope:** The Phase 1 GC implementation covers `max_recent_versions` and
+> `keep_first_version` only. The time-based retention tiers (24h / 7d / 30d) are modelled
+> in `RetentionPolicy.tiers` but are **not enforced by the GC in Phase 1**. Full tier
+> evaluation is deferred to a later phase.
 
 #### Scenario: DefaultRetention
 
