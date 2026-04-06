@@ -51,6 +51,7 @@ venv/
 # Extras
 *pytest*
 *cache*
+!*cache*.py
 
 # Distribution / packaging
 .Python
