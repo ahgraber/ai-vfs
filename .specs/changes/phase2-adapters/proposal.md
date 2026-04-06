@@ -61,10 +61,31 @@ error handling, and storage cost analysis.
 6. Extend URI resolver with new scheme mappings
 7. Integration tests for each adapter against real services (Docker Compose test fixtures)
 
+## Recommendations
+
+### SQL adapter implementation: SQLAlchemy Core + Alembic (not raw asyncpg, not SQLModel)
+
+**Recommendation:** Use `sqlalchemy.ext.asyncio` Core (query building only, no ORM) with `asyncpg` as the Postgres driver, and Alembic for schema migrations across both SQLite and Postgres.
+
+**Rationale:**
+
+- The project already has separate domain models in `vfs/models.py`; SQLModel would force either merging domain models with DB table definitions (coupling) or duplicating them.
+  Neither is acceptable.
+- Raw `asyncpg` for Postgres means two divergent implementations (SQLite via `aiosqlite`, Postgres via `asyncpg`) with separate schema DDL and row-mapping code.
+  SQLAlchemy Core provides a shared schema definition and named column access (`row.field` instead of `row[3]`), reducing duplication.
+- `CREATE TABLE IF NOT EXISTS` cannot handle future `ALTER TABLE` needs.
+  Alembic provides versioned migration scripts with upgrade/downgrade paths — necessary once the schema evolves post-first-release.
+- SQLAlchemy Core's async support (`sqlalchemy.ext.asyncio` + `asyncpg`) is mature and production-proven.
+
+**Boundaries:**
+
+- Use **Core only** — `Table`, `select()`, `insert()`, `Connection.execute()`.
+  No ORM session, no `relationship()`, no declarative base.
+- MongoDB stays a fully separate path (Motor directly).
+  The `MetadataStore` protocol is the unification layer; no cross-store framework is needed or appropriate.
+
 ## Open Questions
 
-- **Postgres connection pooling**: Use `asyncpg.Pool` directly or wrap with `sqlalchemy.ext.asyncio`?
-  Leaning toward raw `asyncpg` for simplicity.
 - **S3 prefix structure**: Keep `{hash[0:2]}/{hash[2:4]}/{hash}` prefix like local FS, or use flat keys?
   S3 handles flat namespaces efficiently, but prefixes aid manual inspection via AWS console.
 - **Embedding model for semantic search**: Which model/dimensions?
