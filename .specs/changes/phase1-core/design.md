@@ -184,12 +184,20 @@ async def put(self, content_hash: str, data: bytes) -> None:
 
 ---
 
-### D8: `DefaultSearchProvider` grep is brute-force list+read
+### D8: Search providers receive a `fetch_content` callback for lazy blob access
 
-Glob and find are metadata-only (no blob reads).
-Regex grep requires fetching blob content for every file in scope.
-No indexing or caching — this is the correct fallback behavior.
-The bloom provider (Phase 2) optimizes this; the default provider is intentionally simple.
+The `SearchProvider.search()` protocol accepts an optional `fetch_content: ContentFetcher` callback.
+The VFS creates a closure over namespace + blob store and passes it to the provider.
+Providers call it on demand to retrieve file content; metadata-only strategies (glob, find) ignore it.
+
+This design supports three content-access patterns:
+
+- **Brute-force** (DefaultSearchProvider regex): calls `fetch_content` for every candidate
+- **Prefiltered** (future bloom provider): runs bloom index first, calls `fetch_content` only for passing candidates
+- **Index-only** (future semantic provider): never calls `fetch_content`; queries its own precomputed index
+
+Glob and find remain metadata-only (no blob reads).
+The default provider's regex grep is intentionally brute-force — the bloom provider (Phase 2) optimizes this.
 
 ---
 

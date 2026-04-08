@@ -22,14 +22,14 @@
 **Spec refs:** `storage/PydanticSettingsConfig`, `file-operations/ULIDIdentifiers`,
 `versioning/ImmutableVersionHistory`, `access-control/OperationGranularity`
 
-- [ ] Write `tests/unit/test_models.py` — assert construction, field types, and
+- [x] Write `tests/unit/test_models.py` — assert construction, field types, and
   ULID round-trip for `FileMeta`, `VersionMeta`, `Permission`, `AuditEvent`,
   `RetentionPolicy`, `SearchResult`; assert `ConflictError`, `PermissionDeniedError`,
   `NotFoundError` are all subclasses of a base `VFSError`
 
-- [ ] Run tests — confirm they fail (`ModuleNotFoundError` or `ImportError`)
+- [x] Run tests — confirm they fail (`ModuleNotFoundError` or `ImportError`)
 
-- [ ] Implement `src/vfs/errors.py`:
+- [x] Implement `src/vfs/errors.py`:
 
   ```python
   class VFSError(Exception): ...
@@ -44,7 +44,7 @@
   class NotFoundError(VFSError): ...
   ```
 
-- [ ] Implement `src/vfs/models.py` — Pydantic `BaseModel` for all entities:
+- [x] Implement `src/vfs/models.py` — Pydantic `BaseModel` for all entities:
 
   - `SearchType`: `Enum` with `GLOB`, `FIND`, `REGEX`, `FULLTEXT`, `SEMANTIC`
   - `RetentionTier`: `max_age: timedelta`, `keep_every: timedelta | None`
@@ -71,9 +71,9 @@
   - ID generation rule (design D12): use `str(uuid.uuid4())` for person-related entities or any entity where leaking creation time (concrete or relative) could be exploitable; use `str(ULID())` for everything else.
     For current entities: `Principal.id` → UUID4, all others → ULID.
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add domain models and exceptions`
+- [x] Commit: `feat(vfs): add domain models and exceptions`
 
 ---
 
@@ -86,14 +86,14 @@
 
 **Spec refs:** `storage/PydanticSettingsConfig`, `storage/URIBasedStoreResolution`
 
-- [ ] Write `tests/unit/test_config.py` — assert defaults match spec
+- [x] Write `tests/unit/test_config.py` — assert defaults match spec
   (SQLite URI, local FS URI, `otel_enabled=True`, `audit_log_enabled=True`,
   `search_providers=["default"]`, `blob_cache_enabled=None`);
   assert `AIFS_METADATA_STORE_URI` env var overrides `metadata_store_uri`
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `src/vfs/config.py`:
+- [x] Implement `src/vfs/config.py`:
 
   ```python
   from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -117,9 +117,9 @@
       default_max_operations: int = 1000
   ```
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add VFSConfig with pydantic-settings`
+- [x] Commit: `feat(vfs): add VFSConfig with pydantic-settings`
 
 ---
 
@@ -134,7 +134,7 @@
 
 **Spec refs:** `storage/MetadataStoreProtocol`, `storage/BlobStoreProtocol`, `search/PluggableSearchProviders`
 
-- [ ] Implement `src/vfs/protocols/blob.py`:
+- [x] Implement `src/vfs/protocols/blob.py`:
 
   ```python
   from typing import AsyncIterator, Protocol, runtime_checkable
@@ -150,14 +150,14 @@
       async def get_stream(self, content_hash: str) -> AsyncIterator[bytes]: ...
   ```
 
-- [ ] Implement `src/vfs/protocols/metadata.py` — `MetadataStore(Protocol)` with all
+- [x] Implement `src/vfs/protocols/metadata.py` — `MetadataStore(Protocol)` with all
   methods from design doc section 3.1 (put_file, get_file, delete_file, list_dir,
   put_version, get_version, list_versions, check_permission, set_permission,
   append_audit_event, update_search_meta, set_name, resolve_name,
   list_reclaimable_versions, delete_versions) plus a `transaction()` async context
   manager for atomic multi-step operations (D14: used by move)
 
-- [ ] Implement `src/vfs/protocols/search.py`:
+- [x] Implement `src/vfs/protocols/search.py`:
 
   ```python
   from typing import Protocol, runtime_checkable
@@ -177,10 +177,10 @@
       def capabilities(self) -> set[SearchType]: ...
   ```
 
-- [ ] No tests needed for protocols (structural typing — tested via adapter conformance
+- [x] No tests needed for protocols (structural typing — tested via adapter conformance
   in later tasks); add `isinstance(impl, BlobStore)` checks in adapter tests
 
-- [ ] Commit: `feat(vfs): add MetadataStore, BlobStore, SearchProvider protocols`
+- [x] Commit: `feat(vfs): add MetadataStore, BlobStore, SearchProvider protocols`
 
 ---
 
@@ -197,7 +197,7 @@
 **Spec refs:** `storage/BlobStoreProtocol`, `storage/BlobIdempotentPut`,
 `storage/BlobPrefixDirectoryStructure`, `storage/StreamingProvisions`
 
-- [ ] Write `tests/unit/test_local_blob.py` using `pytest.mark.asyncio` and `tmp_path`:
+- [x] Write `tests/unit/test_local_blob.py` using `pytest.mark.asyncio` and `tmp_path`:
 
   - `test_put_and_get`: hash, put, get → bytes match
   - `test_put_idempotent`: put same hash twice → no error, content unchanged
@@ -208,9 +208,9 @@
   - `test_put_stream_raises`: `put_stream` raises `NotImplementedError`
   - `test_conforms_to_protocol`: `assert isinstance(store, BlobStore)`
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `src/vfs/stores/local_blob.py`:
+- [x] Implement `src/vfs/stores/local_blob.py`:
 
   ```python
   import aiofiles
@@ -254,9 +254,9 @@
           raise NotImplementedError
   ```
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add LocalFSBlobStore with prefix directory structure`
+- [x] Commit: `feat(vfs): add LocalFSBlobStore with prefix directory structure`
 
 ---
 
@@ -269,7 +269,7 @@
 
 **Spec refs:** `storage/BlobCaching`
 
-- [ ] Write `tests/unit/test_cached_blob.py`:
+- [x] Write `tests/unit/test_cached_blob.py`:
 
   - `test_cache_miss_fetches_from_inner`: get on cold cache → fetches from inner store
   - `test_cache_hit_skips_inner`: get after put → inner store's `get` not called
@@ -279,9 +279,9 @@
   - `test_diskcache_wraps_in_thread`: ensure `get` and `set` do not block event loop
     (verify with `asyncio.to_thread` pattern — check no sync calls on the loop)
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `src/vfs/stores/cached_blob.py`:
+- [x] Implement `src/vfs/stores/cached_blob.py`:
 
   ```python
   import asyncio
@@ -335,9 +335,9 @@
           self._cache.close()
   ```
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add CachedBlobStore with diskcache LRU`
+- [x] Commit: `feat(vfs): add CachedBlobStore with diskcache LRU`
 
 ---
 
@@ -350,17 +350,17 @@
 
 **Spec refs:** `storage/MetadataStoreProtocol`
 
-- [ ] Write `tests/unit/test_sqlite_metadata.py` — `test_initialize_creates_tables`:
+- [x] Write `tests/unit/test_sqlite_metadata.py` — `test_initialize_creates_tables`:
   open `:memory:` SQLite, call `initialize()`, assert all 7 tables exist
   via `SELECT name FROM sqlite_master WHERE type='table'`
-- [ ] Run tests — confirm they fail
-- [ ] Implement `SQLiteMetadataStore.__init__` and `initialize()` in
+- [x] Run tests — confirm they fail
+- [x] Implement `SQLiteMetadataStore.__init__` and `initialize()` in
   `src/vfs/stores/sqlite_metadata.py` — create all tables and indexes from D2
   (design doc); enable WAL mode: `PRAGMA journal_mode=WAL`
-- [ ] Add `conftest.py` fixture `sqlite_store` (async, yields initialized
+- [x] Add `conftest.py` fixture `sqlite_store` (async, yields initialized
   `SQLiteMetadataStore(":memory:")`) for reuse in subsequent tasks
-- [ ] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add SQLiteMetadataStore schema and initialization`
+- [x] Run tests — confirm they pass
+- [x] Commit: `feat(vfs): add SQLiteMetadataStore schema and initialization`
 
 ---
 
@@ -374,7 +374,7 @@
 **Spec refs:** `storage/MetadataCASSemantics`, `file-operations/WriteCreatesVersion`,
 `file-operations/OptimisticConcurrency`, `versioning/ImmutableVersionHistory`
 
-- [ ] Add tests:
+- [x] Add tests:
   - `test_put_and_get_file`: put then get → same `FileMeta`
   - `test_get_file_missing`: returns `None`
   - `test_list_dir_non_recursive`: create 3 files, list prefix `/src/` → 2 matching
@@ -385,8 +385,8 @@
   - `test_get_version_latest`: `version_number=None` → most recent
   - `test_get_version_by_number`: exact version number lookup
   - `test_list_versions`: returns ordered list, `before` cursor works
-- [ ] Run tests — confirm they fail
-- [ ] Implement `put_file`, `get_file`, `delete_file`, `list_dir`, `put_version`,
+- [x] Run tests — confirm they fail
+- [x] Implement `put_file`, `get_file`, `delete_file`, `list_dir`, `put_version`,
   `get_version`, `list_versions` in `SQLiteMetadataStore`:
   - `put_version` logic:
     1. `INSERT INTO versions (...)` unconditionally
@@ -394,8 +394,8 @@
     3. If `expected_version is not None`: `UPDATE files SET ... WHERE namespace_id=? AND path=? AND current_version_number=?`; if `rowcount == 0` raise `ConflictError`
   - `list_dir` uses `LIKE path_prefix || '%'`; non-recursive additionally filters
     out paths containing `/` after the prefix
-- [ ] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add SQLiteMetadataStore file/version CRUD with CAS`
+- [x] Run tests — confirm they pass
+- [x] Commit: `feat(vfs): add SQLiteMetadataStore file/version CRUD with CAS`
 
 ---
 
@@ -409,21 +409,21 @@
 **Spec refs:** `access-control/DefaultDeny`, `access-control/PathPrefixPermissions`,
 `access-control/OperationGranularity`
 
-- [ ] Add tests:
+- [x] Add tests:
   - `test_check_permission_no_rules`: returns `False` for principal with no entries
   - `test_check_permission_matching_prefix`: permission on `/` → returns `True` for `/any/path`
   - `test_check_permission_most_specific`: permission `read` on `/`, `write` on `/workspace/`;
     check `write` on `/workspace/file.txt` → `True`; check `write` on `/other/` → `False`
   - `test_set_and_get_permission`: round-trip via `set_permission` + `check_permission`
   - `test_namespace_isolation`: permission in ns A, check in ns B → `False`
-- [ ] Run tests — confirm they fail
-- [ ] Implement `check_permission` and `set_permission`:
+- [x] Run tests — confirm they fail
+- [x] Implement `check_permission` and `set_permission`:
   - `check_permission`: fetch all `Permission` rows for `(principal_id, namespace_id)`,
     sort by `len(path_prefix)` descending, return `True` if first matching entry
     contains `operation`, `False` otherwise
   - `set_permission`: `INSERT OR REPLACE INTO permissions (...)`
-- [ ] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add permission check with most-specific-prefix enforcement`
+- [x] Run tests — confirm they pass
+- [x] Commit: `feat(vfs): add permission check with most-specific-prefix enforcement`
 
 ---
 
@@ -437,7 +437,7 @@
 **Spec refs:** `observability/AuditLogAppendOnly`, `search/SearchMetadataExtensible`,
 `access-control/HumanFriendlyNames`, `versioning/VersionGarbageCollection`
 
-- [ ] Add tests:
+- [x] Add tests:
   - `test_append_audit_event`: event is persisted; second append adds a second row
   - `test_audit_not_updatable`: no `update_audit_event` method on the store (audit-only)
   - `test_update_search_meta`: put version, update `search_meta`, fetch version → meta matches
@@ -446,15 +446,15 @@
   - `test_list_reclaimable_versions`: create file with 3 versions, policy `max_recent=1`
     → 2 older versions returned
   - `test_delete_versions`: delete version IDs → not in `list_versions` afterward
-- [ ] Run tests — confirm they fail
-- [ ] Implement `append_audit_event`, `update_search_meta`, `set_name`, `resolve_name`,
+- [x] Run tests — confirm they fail
+- [x] Implement `append_audit_event`, `update_search_meta`, `set_name`, `resolve_name`,
   `list_reclaimable_versions`, `delete_versions`
   - `list_reclaimable_versions`: apply retention logic — keep the N most recent non-tombstone
     versions per file; return the rest as reclaimable; always keep version 1 and current
   - `delete_versions`: `DELETE FROM versions WHERE id IN (...)`
-- [ ] Add `test_conforms_to_protocol`: `assert isinstance(store, MetadataStore)`
-- [ ] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add audit, search meta, names, GC queries to SQLiteMetadataStore`
+- [x] Add `test_conforms_to_protocol`: `assert isinstance(store, MetadataStore)`
+- [x] Run tests — confirm they pass
+- [x] Commit: `feat(vfs): add audit, search meta, names, GC queries to SQLiteMetadataStore`
 
 ---
 
@@ -471,7 +471,7 @@
 **Spec refs:** `search/GlobSearch`, `search/FindSearch`, `search/RegexContentSearch`,
 `search/PluggableSearchProviders`, `search/SearchIndexing`
 
-- [ ] Write `tests/unit/test_default_search.py` (all tests pass file content via
+- [x] Write `tests/unit/test_default_search.py` (all tests pass file content via
   `candidates` list with pre-loaded `content` bytes — provider is a pure function):
   - `test_capabilities`: returns `{SearchType.GLOB, SearchType.FIND, SearchType.REGEX}`
   - `test_glob_non_recursive`: `search("*.py", "/src/", GLOB, candidates)` — only
@@ -483,8 +483,8 @@
   - `test_regex_no_match`: empty result list
   - `test_index_returns_empty_dict`: `index()` → `{}`
   - `test_conforms_to_protocol`: `assert isinstance(provider, SearchProvider)`
-- [ ] Run tests — confirm they fail
-- [ ] Implement `src/vfs/search/default.py`:
+- [x] Run tests — confirm they fail
+- [x] Implement `src/vfs/search/default.py`:
   - `capabilities()` returns `{SearchType.GLOB, SearchType.FIND, SearchType.REGEX}`
   - `index()` returns `{}`
   - `search(query, scope, search_type, candidates)`:
@@ -492,7 +492,7 @@
     - `FIND`: metadata predicates (name pattern, size comparison) against `candidates`
     - `REGEX`: `re.search(query, line)` on each line of decoded content;
       build `SearchResult(path, line_number, match_context)` per match
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 - [ ] Commit: `feat(vfs): add DefaultSearchProvider (glob, find, regex)`
 
 ---
@@ -510,7 +510,7 @@
 **Spec refs:** `observability/OTelSpansOnAllOperations`, `observability/OTelMetrics`,
 `observability/OTelContextPropagation`, `observability/NoOpWhenDisabled`
 
-- [ ] Write `tests/unit/test_observability.py`:
+- [x] Write `tests/unit/test_observability.py`:
 
   - `test_span_created_when_enabled`: `otel_enabled=True` → `tracer.start_as_current_span`
     is called (use `unittest.mock.patch` on `trace.get_tracer`)
@@ -521,9 +521,9 @@
   - `test_metrics_blob_size_histogram_recorded`: `blob_histogram.record` called with byte count
   - `test_no_error_when_otel_not_configured`: run with no SDK configured → no exceptions
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `src/vfs/observability/tracing.py`:
+- [x] Implement `src/vfs/observability/tracing.py`:
 
   ```python
   from opentelemetry import trace, metrics
@@ -543,7 +543,7 @@
     records `op_counter.add(1, ...)` and `op_histogram.record(duration_ms, ...)`
     only when `otel_enabled=True`
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): add OTel tracing helpers with no-op when disabled`
 
@@ -559,7 +559,7 @@
 **Spec refs:** `observability/AuditLogStateChanges`, `observability/AuditLogAppendOnly`,
 `observability/AuditOTelCorrelation`
 
-- [ ] Add tests:
+- [x] Add tests:
 
   - `test_audit_write_creates_event`: `audit_write(meta_store, ...)` → `append_audit_event`
     called with `operation="write"`
@@ -568,9 +568,9 @@
   - `test_no_trace_id_without_context`: no span → `trace_id=None`
   - `test_audit_disabled`: `audit_log_enabled=False` → `append_audit_event` not called
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `src/vfs/observability/audit.py`:
+- [x] Implement `src/vfs/observability/audit.py`:
 
   ```python
   from opentelemetry import trace as otel_trace
@@ -595,7 +595,7 @@
     `audit_permission_change(...)`, `audit_gc_run(...)` — each builds the appropriate
     `AuditEvent` and calls `audit()`
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): add audit log helper with OTel trace ID correlation`
 
@@ -613,22 +613,22 @@
 
 **Spec refs:** `storage/URIBasedStoreResolution`, `storage/ProcessIdentification`
 
-- [ ] Write `tests/unit/test_vfs_uri_resolution.py`:
+- [x] Write `tests/unit/test_vfs_uri_resolution.py`:
   - `test_sqlite_uri_resolves`: `VFS(config)` with `metadata_store_uri="sqlite:///..."` →
     `store` is instance of `SQLiteMetadataStore`
   - `test_file_uri_resolves`: `blob_store_uri="file:///..."` → `LocalFSBlobStore`
   - `test_cache_disabled_for_local_fs`: `blob_cache_enabled=None` + local URI → no cache wrap
   - `test_cache_enabled_for_unknown_scheme`: `blob_cache_enabled=True` → `CachedBlobStore` wrap
   - `test_unknown_uri_raises`: `metadata_store_uri="badscheme://..."` → `ValueError`
-- [ ] Add `tests/conftest.py` with `vfs_instance` fixture (tmp_path, SQLite, LocalFS)
-- [ ] Run tests — confirm they fail
-- [ ] Implement `src/vfs/vfs.py`:
+- [x] Add `tests/conftest.py` with `vfs_instance` fixture (tmp_path, SQLite, LocalFS)
+- [x] Run tests — confirm they fail
+- [x] Implement `src/vfs/vfs.py`:
   - `VFS.__init__(config: VFSConfig | None = None)`: resolve metadata store and blob store
     from URI; auto-enable cache for non-local blob stores when `blob_cache_enabled is None`
   - `VFS.initialize()`: call `meta_store.initialize()`, call `setproctitle("ai-vfs: service")`
     only if `set_proc_title=True` kwarg
   - `VFS.close()`: close connections
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 - [ ] Commit: `feat(vfs): add VFS class with URI resolution and lifecycle`
 
 ---
@@ -643,7 +643,7 @@
 **Spec refs:** `file-operations/LazyContentResolution`, `access-control/InvisiblePruning`,
 `access-control/DefaultDeny`, `file-operations/NamespaceIsolation`
 
-- [ ] Write integration tests using `vfs_instance` fixture:
+- [x] Write integration tests using `vfs_instance` fixture:
   - `test_stat_returns_metadata`: write a file, stat it → `FileMeta` returned, no blob access
   - `test_stat_not_found`: stat nonexistent path → `NotFoundError`
   - `test_stat_permission_denied`: principal has no permissions → `PermissionDeniedError`
@@ -651,13 +651,13 @@
   - `test_list_recursive`: list with `recursive=True` → all 4
   - `test_list_invisible_pruning`: 2 files, principal can read only 1 → only 1 returned
   - `test_list_namespace_isolation`: namespace A + namespace B; list in A → only A files
-- [ ] Run tests — confirm they fail
-- [ ] Implement `VFS.stat` and `VFS.list`:
+- [x] Run tests — confirm they fail
+- [x] Implement `VFS.stat` and `VFS.list`:
   - Both call `meta_store.check_permission(principal_id, namespace_id, path, "read")`
   - `stat`: returns `FileMeta` or raises `NotFoundError`
   - `list`: calls `meta_store.list_dir(...)` then filters results by permission;
     paths the principal cannot read are silently excluded (invisible pruning)
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 - [ ] Commit: `feat(vfs): add VFS.stat and VFS.list with invisible pruning`
 
 ---
@@ -673,7 +673,7 @@
 `file-operations/OptimisticConcurrency`, `observability/OTelSpansOnAllOperations`,
 `observability/AuditLogStateChanges`, `search/SearchIndexing`
 
-- [ ] Add integration tests:
+- [x] Add integration tests:
 
   - `test_write_returns_version_meta`: write → returns `VersionMeta`
   - `test_write_creates_new_version`: write twice → version numbers 1 and 2
@@ -684,9 +684,9 @@
   - `test_write_updates_search_meta`: search provider returns non-empty dict →
     stored in `version.search_meta`
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `VFS.write`:
+- [x] Implement `VFS.write`:
 
   ```text
   1. check_permission(principal_id, namespace_id, path, "write")
@@ -701,7 +701,7 @@
   10. return version
   ```
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): add VFS.write with content addressing, versioning, and audit`
 
@@ -717,19 +717,19 @@
 **Spec refs:** `file-operations/ReadReturnsContent`, `file-operations/LazyContentResolution`,
 `observability/AuditLogStateChanges` (reads NOT audited)
 
-- [ ] Add integration tests:
+- [x] Add integration tests:
   - `test_read_returns_content`: write then read → same bytes
   - `test_read_specific_version`: write twice; read version 1 → first content
   - `test_read_deleted_file`: read after delete → `NotFoundError`
   - `test_read_permission_denied`: read without permission → `PermissionDeniedError`
   - `test_read_not_audited`: read does not create audit event
-- [ ] Run tests — confirm they fail
-- [ ] Implement `VFS.read(namespace_id, path, principal_id, version_number=None)`:
+- [x] Run tests — confirm they fail
+- [x] Implement `VFS.read(namespace_id, path, principal_id, version_number=None)`:
   1. `check_permission(..., "read")`
   2. `meta = meta_store.get_version(namespace_id, path, version_number)`
   3. If `meta.is_tombstone` or `meta is None`: raise `NotFoundError`
   4. `return await blob_store.get(meta.content_hash)`
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 - [ ] Commit: `feat(vfs): add VFS.read with permission check and version selection`
 
 ---
@@ -743,18 +743,18 @@
 
 **Spec refs:** `file-operations/DeleteCreatesTombstone`, `observability/AuditLogStateChanges`
 
-- [ ] Add integration tests:
+- [x] Add integration tests:
   - `test_delete_creates_tombstone`: delete → `stat` returns `is_deleted=True`
   - `test_delete_old_versions_still_accessible`: read version 1 after delete → content returned
   - `test_delete_permission_denied`: principal lacks delete → `PermissionDeniedError`
   - `test_delete_creates_audit_event`: audit event with `operation="delete"` persisted
-- [ ] Run tests — confirm they fail
-- [ ] Implement `VFS.delete`:
+- [x] Run tests — confirm they fail
+- [x] Implement `VFS.delete`:
   1. `check_permission(..., "delete")`
   2. Create tombstone `VersionMeta(is_tombstone=True, content_hash="", size=0, ...)`
   3. `meta_store.put_version(tombstone)`
   4. `audit_delete(...)`
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 - [ ] Commit: `feat(vfs): add VFS.delete with tombstone versioning and audit`
 
 ---
@@ -771,7 +771,7 @@
 **Spec refs:** `file-operations/CopyFile`, `file-operations/MoveFile`,
 `storage/MetadataTransactions`, `observability/AuditLogStateChanges`
 
-- [ ] Add integration tests for copy:
+- [x] Add integration tests for copy:
 
   - `test_copy_to_new_path`: copy /src/a.py → /dst/a.py; dst exists at v1 with same content_hash; src unchanged
   - `test_copy_to_existing_path`: dst already exists → new version written at dst
@@ -780,7 +780,7 @@
   - `test_copy_permission_denied`: principal lacks read on src or write on dst → `PermissionDeniedError`
   - `test_copy_creates_audit_event`: audit event with `operation="copy"` persisted
 
-- [ ] Add integration tests for move:
+- [x] Add integration tests for move:
 
   - `test_move_to_new_path`: move /src/a.py → /dst/a.py; dst at v1 with same content_hash; src is tombstoned
   - `test_move_to_existing_path`: dst already exists → overwritten; src tombstoned
@@ -789,9 +789,9 @@
   - `test_move_permission_denied`: principal lacks delete on src or write on dst → `PermissionDeniedError`
   - `test_move_creates_audit_event`: audit events for both tombstone and create
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `SQLiteMetadataStore.transaction()` async context manager:
+- [x] Implement `SQLiteMetadataStore.transaction()` async context manager:
 
   ```python
   @asynccontextmanager
@@ -805,7 +805,7 @@
               raise
   ```
 
-- [ ] Implement `VFS.copy` (D13):
+- [x] Implement `VFS.copy` (D13):
 
   1. `check_permission(principal_id, namespace_id, src, "read")`
   2. `check_permission(principal_id, namespace_id, dst, "write")`
@@ -813,7 +813,7 @@
   4. `meta_store.put_version(VersionMeta(content_hash=src_version.content_hash, size=src_version.size, ...), expected_version=...)` at dst
   5. `audit_copy(...)`
 
-- [ ] Implement `VFS.move` (D14):
+- [x] Implement `VFS.move` (D14):
 
   1. `check_permission(principal_id, namespace_id, src, "read")`
   2. `check_permission(principal_id, namespace_id, src, "delete")`
@@ -823,7 +823,7 @@
      - Create new file/version at dst with src's content_hash
   5. `audit_move(...)`
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): add VFS.copy and VFS.move with atomic move transaction`
 
@@ -839,7 +839,7 @@
 **Spec refs:** `versioning/ImmutableVersionHistory`, `versioning/RollbackCreatesNewVersion`,
 `versioning/VersionHistoryQuery`, `observability/AuditLogStateChanges`
 
-- [ ] Write `tests/integration/test_vfs_versioning.py`:
+- [x] Write `tests/integration/test_vfs_versioning.py`:
   - `test_versions_returns_history`: write 3 times → 3 version entries, ordered newest-first
   - `test_versions_limit_and_before`: pagination cursor works
   - `test_rollback_creates_new_version`: write v1, v2; rollback to v1 → v3 with v1's content_hash
@@ -848,13 +848,13 @@
   - `test_rollback_creates_audit_event`: `operation="rollback"` in audit log
   - `test_rollback_permission_denied`: write-only permission → rollback allowed
     (rollback is a write); delete-only → rollback denied
-- [ ] Run tests — confirm they fail
-- [ ] Implement `VFS.versions` (calls `meta_store.list_versions`) and `VFS.rollback`:
+- [x] Run tests — confirm they fail
+- [x] Implement `VFS.versions` (calls `meta_store.list_versions`) and `VFS.rollback`:
   - `rollback`: get target version meta → create new `VersionMeta` with
     `content_hash=target.content_hash`, `size=target.size`,
     `parent_version_id=target.id` → `meta_store.put_version(new_version)` →
     audit; no blob copy needed (content-addressed dedup)
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 - [ ] Commit: `feat(vfs): add VFS.versions and VFS.rollback`
 
 ---
@@ -869,7 +869,7 @@
 **Spec refs:** `search/GlobSearch`, `search/FindSearch`, `search/RegexContentSearch`,
 `search/PluggableSearchProviders`, `access-control/InvisiblePruning`
 
-- [ ] Write `tests/integration/test_vfs_search.py`:
+- [x] Write `tests/integration/test_vfs_search.py`:
   - `test_glob_search`: 3 files; `search("*.py", scope="/src/", GLOB)` → only `.py` paths
   - `test_find_search`: `search("*.txt", scope="/", FIND)` → name-matched files
   - `test_regex_grep`: file containing `"# TODO"` on line 5;
@@ -878,15 +878,15 @@
     principal read-only on `/public/` → only `/public/` results returned
   - `test_search_provider_dispatch`: glob search dispatched to provider declaring `GLOB`
     capability; if multiple providers match, most capable used
-- [ ] Run tests — confirm they fail
-- [ ] Implement `VFS.search`:
+- [x] Run tests — confirm they fail
+- [x] Implement `VFS.search`:
   1. List all files in scope via `meta_store.list_dir(namespace_id, scope, recursive=True)`
   2. Filter to paths principal can read (invisible pruning)
   3. Find first provider that declares `search_type` in `capabilities()`
   4. For `REGEX`: fetch blob content for each candidate, pass to provider
   5. For `GLOB` / `FIND`: pass file metadata only (no blob reads)
   6. Return `list[SearchResult]`
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 - [ ] Commit: `feat(vfs): add VFS.search with provider dispatch and permission pruning`
 
 ---
@@ -903,7 +903,7 @@
 **Spec refs:** `versioning/VersionGarbageCollection`, `versioning/RetentionPolicy`,
 `storage/BlobEnumeration`, `observability/AuditLogStateChanges` (GC audited)
 
-- [ ] Write `tests/unit/test_gc.py`:
+- [x] Write `tests/unit/test_gc.py`:
 
   - `test_version_gc_respects_max_recent`: file with 5 versions, `max_recent=2` →
     3 older versions reclaimed
@@ -915,9 +915,9 @@
   - `test_gc_creates_audit_event`: `operation="gc_run"` with counts in `detail`
   - `test_gc_safe_to_skip`: no errors if GC never runs; no correctness dependency
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `src/vfs/gc.py`:
+- [x] Implement `src/vfs/gc.py`:
 
   ```python
   import setproctitle
@@ -946,7 +946,7 @@
 
   Add `GCResult` dataclass to `models.py`.
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): add GarbageCollector with version and blob GC`
 
@@ -961,19 +961,19 @@
 
 **Spec refs:** `versioning/VersionGarbageCollection`, `versioning/SearchMetaReindex`
 
-- [ ] Add integration tests:
+- [x] Add integration tests:
   - `test_run_gc_reclaims_excess_versions`: write 3 versions, `max_recent=1` → run_gc
     → only 1 version in history
   - `test_reindex_backfills_search_meta`: write file, register a mock provider
     that returns `{"test_key": "value"}` from `index()`, call reindex →
     `search_meta.test_key` populated
-- [ ] Run tests — confirm they fail
-- [ ] Implement `VFS.run_gc(namespace_id=None)` (delegates to `GarbageCollector.run`)
+- [x] Run tests — confirm they fail
+- [x] Implement `VFS.run_gc(namespace_id=None)` (delegates to `GarbageCollector.run`)
   and `VFS.reindex(namespace_id, provider_name, scope="/")`:
   - `reindex`: list all files in scope, for each fetch content, call
     `provider.index(path, content, meta)`, update `search_meta` via
     `meta_store.update_search_meta(...)`
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 - [ ] Commit: `feat(vfs): add VFS.run_gc and VFS.reindex`
 
 ---
@@ -989,7 +989,7 @@
 `access-control/HumanFriendlyNames`, `access-control/OperationGranularity`,
 `storage/ProcessIdentification`
 
-- [ ] Write `tests/integration/test_vfs_access_control.py`:
+- [x] Write `tests/integration/test_vfs_access_control.py`:
 
   - `test_grant_and_use_permission`: admin grants read+write to principal B;
     B can write and read
@@ -1003,9 +1003,9 @@
   - `test_execute_permission_storable`: grant {execute} on /workspace/ to a principal;
     query permissions → execute is in the stored operations set
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `src/vfs/__init__.py`:
+- [x] Implement `src/vfs/__init__.py`:
 
   ```python
   from vfs.vfs import VFS
@@ -1015,14 +1015,14 @@
   __all__ = ["VFS", "VFSConfig", "ConflictError", "PermissionDeniedError", "NotFoundError", "VFSError"]
   ```
 
-- [ ] Add `VFS.grant(principal_id, namespace_id, path_prefix, operations)` helper
+- [x] Add `VFS.grant(principal_id, namespace_id, path_prefix, operations)` helper
   (calls `meta_store.set_permission(Permission(...))`)
 
-- [ ] Add `VFS.create_namespace(display_name, created_by)` helper
+- [x] Add `VFS.create_namespace(display_name, created_by)` helper
 
-- [ ] Add `VFS.resolve_name(entity_type, display_name)` helper
+- [x] Add `VFS.resolve_name(entity_type, display_name)` helper
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): add public API, namespace helpers, permission grant`
 
@@ -1030,9 +1030,9 @@
 
 ## Final: Coverage check
 
-- [ ] Run full suite: `uv run pytest tests/`
-- [ ] Run coverage: `uv run pytest --cov=vfs --cov-report=term-missing tests/`
-- [ ] Verify all spec requirements from the 6 Phase 1 capabilities have at least one
+- [x] Run full suite: `uv run pytest tests/`
+- [x] Run coverage: `uv run pytest --cov=vfs --cov-report=term-missing tests/`
+- [x] Verify all spec requirements from the 6 Phase 1 capabilities have at least one
   passing test covering each scenario in: file-operations, versioning, access-control,
   storage, observability, search
 - [ ] Commit: `chore(vfs): phase1 complete — all tests passing`

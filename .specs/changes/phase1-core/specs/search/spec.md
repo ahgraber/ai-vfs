@@ -54,17 +54,21 @@ returning matching paths with context (matched line and line number).
 The system SHALL support multiple concurrent search providers, each declaring its capabilities (glob, find, regex, fulltext, semantic).
 The VFS SHALL dispatch search requests to the provider with the matching capability.
 
+Providers that need file content (e.g. regex grep, bloom-prefiltered search) SHALL receive a `fetch_content` callback from the VFS rather than pre-loaded content.
+The callback lazily fetches blob bytes for a given path, allowing providers to control which files they read and when.
+Metadata-only strategies (glob, find) ignore the callback entirely.
+
 #### Scenario: SingleProviderDispatch
 
 - **GIVEN** only the default provider is active
 - **WHEN** a regex search is requested
-- **THEN** the default provider performs brute-force read-and-match
+- **THEN** the default provider performs brute-force read-and-match via `fetch_content`
 
 #### Scenario: UnknownCapabilityRejected
 
 - **GIVEN** no provider declares the SEMANTIC capability
 - **WHEN** a principal requests a semantic search
-- **THEN** an error is raised indicating no provider supports the requested search type
+- **THEN** a `ValueError` is raised indicating no provider supports the requested search type
 
 ### Requirement: SearchIndexing
 
