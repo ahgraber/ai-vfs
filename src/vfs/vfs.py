@@ -1,0 +1,639 @@
+"""VFS orchestrator — the main entry point for file system operations."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import time
+
+import blake3
+from ulid import ULID
+
+from vfs.config import VFSConfig
+from vfs.errors import NotFoundError, PermissionDeniedError
+from vfs.models import (
+    FileMeta,
+    Namespace,
+    Permission,
+    Principal,
+    SearchResult,
+    SearchType,
+    VersionMeta,
+)
+from vfs.observability.audit import (
+    audit_copy,
+    audit_delete,
+    audit_move,
+    audit_rollback,
+    audit_write,
+)
+from vfs.observability.tracing import record_blob_size, record_op, vfs_span
+from vfs.search.default import DefaultSearchProvider
+from vfs.stores.cached_blob import CachedBlobStore
+from vfs.stores.local_blob import LocalFSBlobStore
+from vfs.stores.sqlite_metadata import SQLiteMetadataStore
+
+_METADATA_SCHEMES = {
+    "sqlite:///": SQLiteMetadataStore,
+}
+_BLOB_SCHEMES = {
+    "file:///": LocalFSBlobStore,
+}
+
+
+class VFS:
+    """Virtual file system orchestrator."""
+
+    def __init__(self, config: VFSConfig | None = None) -> None:
+        self._config = config or VFSConfig()
+        self._meta = self._resolve_metadata_store()
+        self._blob = self._resolve_blob_store()
+        self._search = DefaultSearchProvider()
+
+    def _resolve_metadata_store(self) -> SQLiteMetadataStore:
+        uri = self._config.metadata_store_uri
+        for scheme, cls in _METADATA_SCHEMES.items():
+            if uri.startswith(scheme):
+                path = uri[len(scheme) :]
+                return cls(path)
+        supported = ", ".join(_METADATA_SCHEMES.keys())
+        raise ValueError(f"Unsupported metadata URI {uri!r}. Supported: {supported}")
+
+    def _resolve_blob_store(self):
+        uri = self._config.blob_store_uri
+        for scheme, cls in _BLOB_SCHEMES.items():
+            if uri.startswith(scheme):
+                path = uri[len(scheme) :]
+                store = cls(path)
+                return self._maybe_wrap_cache(store, uri)
+        supported = ", ".join(_BLOB_SCHEMES.keys())
+        raise ValueError(f"Unsupported blob URI {uri!r}. Supported: {supported}")
+
+    def _maybe_wrap_cache(self, store, uri: str):
+        cache_enabled = self._config.blob_cache_enabled
+        if cache_enabled is None:
+            # Auto: disable for local FS
+            if uri.startswith("file:///"):
+                return store
+            cache_enabled = True
+        if not cache_enabled:
+            return store
+        import tempfile
+
+        cache_dir = self._config.blob_cache_dir or tempfile.mkdtemp(prefix="vfs-cache-")
+        return CachedBlobStore(store, cache_dir, self._config.blob_cache_max_size_mb)
+
+    async def initialize(self, *, set_proc_title: bool = False) -> None:
+        """Initialize storage backends and optionally set the process title."""
+        await self._meta.initialize()
+        if set_proc_title:
+            import setproctitle
+
+            setproctitle.setproctitle("ai-vfs: service")
+
+    async def close(self) -> None:
+        """Close storage connections."""
+        await self._meta.close()
+        if isinstance(self._blob, CachedBlobStore):
+            self._blob.close()
+
+    # --- Permission helper ---
+
+    async def _check_perm(self, principal_id: str, namespace_id: str, path: str, operation: str) -> None:
+        if not await self._meta.check_permission(principal_id, namespace_id, path, operation):
+            raise PermissionDeniedError(f"Principal {principal_id!r} lacks {operation!r} on {namespace_id}:{path}")
+
+    # --- stat / list ---
+
+    async def stat(self, namespace_id: str, path: str, *, principal_id: str) -> FileMeta:
+        """Return file metadata. Raises PermissionDeniedError or NotFoundError."""
+        t0 = time.monotonic()
+        with vfs_span(
+            "stat",
+            {"vfs.namespace": namespace_id, "vfs.path": path},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            await self._check_perm(principal_id, namespace_id, path, "read")
+            meta = await self._meta.get_file(namespace_id, path)
+            if meta is None:
+                raise NotFoundError(f"File not found: {namespace_id}:{path}")
+            record_op(
+                "stat",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+            return meta
+
+    async def list(
+        self,
+        namespace_id: str,
+        path_prefix: str,
+        *,
+        principal_id: str,
+        recursive: bool = False,
+    ) -> list[FileMeta]:
+        """List files under path_prefix, silently pruning entries the principal cannot read."""
+        t0 = time.monotonic()
+        with vfs_span(
+            "list",
+            {"vfs.namespace": namespace_id, "vfs.path": path_prefix},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            files = await self._meta.list_dir(namespace_id, path_prefix, recursive=recursive)
+            # Invisible pruning: filter out files the principal cannot read
+            result = []
+            for f in files:
+                if await self._meta.check_permission(principal_id, namespace_id, f.path, "read"):
+                    result.append(f)
+            record_op(
+                "list",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+            return result
+
+    # --- write ---
+
+    async def write(
+        self,
+        namespace_id: str,
+        path: str,
+        content: bytes,
+        *,
+        principal_id: str,
+        expected_version: int | None = None,
+    ) -> VersionMeta:
+        """Write content and create a new immutable version. Raises ConflictError on CAS mismatch."""
+        await self._check_perm(principal_id, namespace_id, path, "write")
+        t0 = time.monotonic()
+
+        with vfs_span(
+            "write",
+            {"vfs.namespace": namespace_id, "vfs.path": path},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            content_hash = blake3.blake3(content).hexdigest()
+            await self._blob.put(content_hash, content)
+            record_blob_size(len(content), otel_enabled=self._config.otel_enabled)
+
+            # Determine version number
+            existing = await self._meta.get_file(namespace_id, path)
+            version_number = 1 if existing is None else existing.current_version_number + 1
+
+            # Index for search
+            file_meta = existing or FileMeta(
+                namespace_id=namespace_id,
+                path=path,
+                current_version_id="",
+                current_version_number=0,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            search_meta = await self._search.index(path, content, file_meta)
+
+            now = datetime.now(timezone.utc)
+            version = VersionMeta(
+                id=str(ULID()),
+                file_path=path,
+                namespace_id=namespace_id,
+                version_number=version_number,
+                content_hash=content_hash,
+                size=len(content),
+                created_at=now,
+                created_by=principal_id,
+                search_meta=search_meta,
+            )
+
+            await self._meta.put_version(version, expected_version=expected_version)
+
+            await audit_write(
+                self._meta,
+                namespace_id=namespace_id,
+                principal_id=principal_id,
+                path=path,
+                version_id=version.id,
+                audit_log_enabled=self._config.audit_log_enabled,
+            )
+
+            duration_ms = (time.monotonic() - t0) * 1000
+            record_op(
+                "write",
+                duration_ms,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+
+        return version
+
+    # --- read ---
+
+    async def read(
+        self,
+        namespace_id: str,
+        path: str,
+        *,
+        principal_id: str,
+        version_number: int | None = None,
+    ) -> bytes:
+        """Return blob content for the current version, or a specific version if version_number is given."""
+        t0 = time.monotonic()
+        with vfs_span(
+            "read",
+            {"vfs.namespace": namespace_id, "vfs.path": path},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            await self._check_perm(principal_id, namespace_id, path, "read")
+            ver = await self._meta.get_version(namespace_id, path, version_number)
+            if ver is None or ver.is_tombstone:
+                raise NotFoundError(f"File not found: {namespace_id}:{path}")
+            data = await self._blob.get(ver.content_hash)
+            record_op(
+                "read",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+            return data
+
+    # --- delete ---
+
+    async def delete(self, namespace_id: str, path: str, *, principal_id: str) -> VersionMeta:
+        """Create a tombstone version marking the file deleted; preserves prior versions."""
+        t0 = time.monotonic()
+        with vfs_span(
+            "delete",
+            {"vfs.namespace": namespace_id, "vfs.path": path},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            await self._check_perm(principal_id, namespace_id, path, "delete")
+            existing = await self._meta.get_file(namespace_id, path)
+            if existing is None:
+                raise NotFoundError(f"File not found: {namespace_id}:{path}")
+
+            now = datetime.now(timezone.utc)
+            tombstone = VersionMeta(
+                id=str(ULID()),
+                file_path=path,
+                namespace_id=namespace_id,
+                version_number=existing.current_version_number + 1,
+                content_hash="",
+                size=0,
+                created_at=now,
+                created_by=principal_id,
+                is_tombstone=True,
+            )
+            await self._meta.put_version(tombstone)
+
+            await audit_delete(
+                self._meta,
+                namespace_id=namespace_id,
+                principal_id=principal_id,
+                path=path,
+                version_id=tombstone.id,
+                audit_log_enabled=self._config.audit_log_enabled,
+            )
+            record_op(
+                "delete",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+            return tombstone
+
+    # --- copy ---
+
+    async def copy(
+        self,
+        namespace_id: str,
+        src: str,
+        dst: str,
+        *,
+        principal_id: str,
+        expected_version: int | None = None,
+    ) -> VersionMeta:
+        """Copy src to dst within the same namespace, sharing the underlying blob."""
+        t0 = time.monotonic()
+        with vfs_span(
+            "copy",
+            {"vfs.namespace": namespace_id, "vfs.path": f"{src}->{dst}"},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            await self._check_perm(principal_id, namespace_id, src, "read")
+            await self._check_perm(principal_id, namespace_id, dst, "write")
+
+            src_version = await self._meta.get_version(namespace_id, src)
+            if src_version is None or src_version.is_tombstone:
+                raise NotFoundError(f"Source not found: {namespace_id}:{src}")
+
+            dst_file = await self._meta.get_file(namespace_id, dst)
+            dst_version_number = (dst_file.current_version_number + 1) if dst_file else 1
+
+            now = datetime.now(timezone.utc)
+            new_version = VersionMeta(
+                id=str(ULID()),
+                file_path=dst,
+                namespace_id=namespace_id,
+                version_number=dst_version_number,
+                content_hash=src_version.content_hash,
+                size=src_version.size,
+                created_at=now,
+                created_by=principal_id,
+            )
+            await self._meta.put_version(new_version, expected_version=expected_version)
+
+            await audit_copy(
+                self._meta,
+                namespace_id=namespace_id,
+                principal_id=principal_id,
+                src_path=src,
+                dst_path=dst,
+                version_id=new_version.id,
+                audit_log_enabled=self._config.audit_log_enabled,
+            )
+            record_op(
+                "copy",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+            return new_version
+
+    # --- move ---
+
+    async def move(
+        self,
+        namespace_id: str,
+        src: str,
+        dst: str,
+        *,
+        principal_id: str,
+    ) -> VersionMeta:
+        """Atomically tombstone src and create dst with the same content hash."""
+        t0 = time.monotonic()
+        with vfs_span(
+            "move",
+            {"vfs.namespace": namespace_id, "vfs.path": f"{src}->{dst}"},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            await self._check_perm(principal_id, namespace_id, src, "read")
+            await self._check_perm(principal_id, namespace_id, src, "delete")
+            await self._check_perm(principal_id, namespace_id, dst, "write")
+
+            src_version = await self._meta.get_version(namespace_id, src)
+            if src_version is None or src_version.is_tombstone:
+                raise NotFoundError(f"Source not found: {namespace_id}:{src}")
+
+            src_file = await self._meta.get_file(namespace_id, src)
+            dst_file = await self._meta.get_file(namespace_id, dst)
+            dst_version_number = (dst_file.current_version_number + 1) if dst_file else 1
+
+            now = datetime.now(timezone.utc)
+
+            async with self._meta.transaction():
+                # Tombstone source
+                tombstone = VersionMeta(
+                    id=str(ULID()),
+                    file_path=src,
+                    namespace_id=namespace_id,
+                    version_number=src_file.current_version_number + 1,
+                    content_hash="",
+                    size=0,
+                    created_at=now,
+                    created_by=principal_id,
+                    is_tombstone=True,
+                )
+                await self._meta.put_version(tombstone)
+
+                # Create at destination
+                new_version = VersionMeta(
+                    id=str(ULID()),
+                    file_path=dst,
+                    namespace_id=namespace_id,
+                    version_number=dst_version_number,
+                    content_hash=src_version.content_hash,
+                    size=src_version.size,
+                    created_at=now,
+                    created_by=principal_id,
+                )
+                await self._meta.put_version(new_version)
+
+            await audit_move(
+                self._meta,
+                namespace_id=namespace_id,
+                principal_id=principal_id,
+                src_path=src,
+                dst_path=dst,
+                version_id=new_version.id,
+                audit_log_enabled=self._config.audit_log_enabled,
+            )
+            record_op(
+                "move",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+            return new_version
+
+    # --- versions / rollback ---
+
+    async def versions(
+        self,
+        namespace_id: str,
+        path: str,
+        *,
+        principal_id: str,
+        limit: int = 50,
+        before: int | None = None,
+    ) -> list[VersionMeta]:
+        """Return version history for path, newest-first."""
+        t0 = time.monotonic()
+        with vfs_span(
+            "versions",
+            {"vfs.namespace": namespace_id, "vfs.path": path},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            await self._check_perm(principal_id, namespace_id, path, "read")
+            result = await self._meta.list_versions(namespace_id, path, limit=limit, before=before)
+            record_op(
+                "versions",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+            return result
+
+    async def rollback(
+        self,
+        namespace_id: str,
+        path: str,
+        target_version: int,
+        *,
+        principal_id: str,
+    ) -> VersionMeta:
+        """Create a new version restoring target_version's content."""
+        t0 = time.monotonic()
+        with vfs_span(
+            "rollback",
+            {"vfs.namespace": namespace_id, "vfs.path": path},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            await self._check_perm(principal_id, namespace_id, path, "write")
+            target = await self._meta.get_version(namespace_id, path, target_version)
+            if target is None:
+                raise NotFoundError(f"Version {target_version} not found for {namespace_id}:{path}")
+
+            existing = await self._meta.get_file(namespace_id, path)
+            next_num = (existing.current_version_number + 1) if existing else 1
+
+            now = datetime.now(timezone.utc)
+            new_version = VersionMeta(
+                id=str(ULID()),
+                file_path=path,
+                namespace_id=namespace_id,
+                version_number=next_num,
+                content_hash=target.content_hash,
+                size=target.size,
+                created_at=now,
+                created_by=principal_id,
+                parent_version_id=target.id,
+            )
+            await self._meta.put_version(new_version)
+
+            await audit_rollback(
+                self._meta,
+                namespace_id=namespace_id,
+                principal_id=principal_id,
+                path=path,
+                version_id=new_version.id,
+                target_version_id=target.id,
+                audit_log_enabled=self._config.audit_log_enabled,
+            )
+            record_op(
+                "rollback",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+            return new_version
+
+    # --- search ---
+
+    async def search(
+        self,
+        namespace_id: str,
+        query: str,
+        scope: str,
+        search_type: SearchType,
+        *,
+        principal_id: str,
+    ) -> list[SearchResult]:
+        """Search files in scope, silently pruning results the principal cannot read."""
+        t0 = time.monotonic()
+        with vfs_span(
+            "search",
+            {"vfs.namespace": namespace_id, "vfs.path": scope},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            # Capability validation
+            if search_type not in self._search.capabilities():
+                raise ValueError(
+                    f"No search provider supports {search_type.value!r}. "
+                    f"Available: {sorted(t.value for t in self._search.capabilities())}"
+                )
+
+            # List all files in scope
+            all_files = await self._meta.list_dir(namespace_id, scope, recursive=True)
+            # Invisible pruning
+            candidates = [
+                f for f in all_files if await self._meta.check_permission(principal_id, namespace_id, f.path, "read")
+            ]
+
+            # Content fetcher closure — provider calls on demand
+            async def _fetch_content(path: str) -> bytes:
+                ver = await self._meta.get_version(namespace_id, path)
+                if ver is None or ver.is_tombstone:
+                    return b""
+                return await self._blob.get(ver.content_hash)
+
+            results = await self._search.search(query, scope, search_type, candidates, _fetch_content)
+            record_op(
+                "search",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
+            )
+            return results
+
+    # --- GC / reindex ---
+
+    async def run_gc(self, namespace_id: str | None = None):
+        """Run garbage collection and return a GCResult."""
+        from vfs.gc import GarbageCollector
+
+        gc = GarbageCollector(self._meta, self._blob, self._config)
+        return await gc.run(namespace_id)
+
+    async def reindex(self, namespace_id: str, provider_name: str = "default", scope: str = "/") -> int:
+        """Backfill search metadata for files in scope; returns the count of versions updated."""
+        files = await self._meta.list_dir(namespace_id, scope, recursive=True)
+        count = 0
+        for f in files:
+            ver = await self._meta.get_version(namespace_id, f.path)
+            if ver and not ver.is_tombstone:
+                content = await self._blob.get(ver.content_hash)
+                search_meta = await self._search.index(f.path, content, f)
+                if search_meta:
+                    await self._meta.update_search_meta(ver.id, search_meta)
+                    count += 1
+        return count
+
+    # --- Namespace / permission helpers ---
+
+    async def grant(
+        self,
+        principal_id: str,
+        namespace_id: str,
+        path_prefix: str,
+        operations: set[str],
+    ) -> None:
+        """Grant principal the given operations on path_prefix in namespace_id."""
+        perm = Permission(
+            id=str(ULID()),
+            principal_id=principal_id,
+            namespace_id=namespace_id,
+            path_prefix=path_prefix,
+            operations=operations,
+            created_at=datetime.now(timezone.utc),
+        )
+        await self._meta.set_permission(perm)
+
+    async def create_namespace(self, display_name: str, created_by: str) -> Namespace:
+        """Create and register a namespace, returning the Namespace record."""
+        ns = Namespace(
+            id=str(ULID()),
+            display_name=display_name,
+            created_at=datetime.now(timezone.utc),
+            created_by=created_by,
+        )
+        await self._meta.put_namespace(ns)
+        await self._meta.set_name("namespace", ns.id, display_name)
+        return ns
+
+    async def create_principal(self, display_name: str, principal_type: str = "agent") -> Principal:
+        """Create and register a principal (UUID4 id), returning the Principal record."""
+        import uuid
+
+        p = Principal(
+            id=str(uuid.uuid4()),
+            display_name=display_name,
+            principal_type=principal_type,
+            created_at=datetime.now(timezone.utc),
+        )
+        await self._meta.put_principal(p)
+        await self._meta.set_name("principal", p.id, display_name)
+        return p
+
+    async def resolve_name(self, entity_type: str, display_name: str) -> str | None:
+        """Return the entity ID for a display name, or None."""
+        return await self._meta.resolve_name(entity_type, display_name)

@@ -123,3 +123,10 @@ class Principal(BaseModel):
     display_name: str
     principal_type: str
     created_at: datetime
+
+
+class GCResult(BaseModel):
+    """Result of a garbage collection run."""
+
+    versions_reclaimed: int
+    blobs_reclaimed: int

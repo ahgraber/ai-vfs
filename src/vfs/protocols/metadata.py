@@ -107,6 +107,20 @@ class MetadataStore(Protocol):
         """Permanently remove the given version records."""
         ...
 
+    async def has_version_references(self, content_hash: str) -> bool:
+        """Return True if any version record references the given content hash."""
+        ...
+
+    # --- Entity persistence ---
+
+    async def put_namespace(self, namespace: Namespace) -> None:
+        """Persist a namespace record."""
+        ...
+
+    async def put_principal(self, principal: Principal) -> None:
+        """Persist a principal record."""
+        ...
+
     # --- Transactions ---
 
     def transaction(self) -> AsyncIterator[None]:

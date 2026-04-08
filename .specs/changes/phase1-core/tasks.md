@@ -493,7 +493,7 @@
     - `REGEX`: `re.search(query, line)` on each line of decoded content;
       build `SearchResult(path, line_number, match_context)` per match
 - [x] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add DefaultSearchProvider (glob, find, regex)`
+- [x] Commit: `feat(vfs): add DefaultSearchProvider (glob, find, regex)`
 
 ---
 
@@ -545,7 +545,7 @@
 
 - [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add OTel tracing helpers with no-op when disabled`
+- [x] Commit: `feat(vfs): add OTel tracing helpers with no-op when disabled`
 
 ---
 
@@ -597,7 +597,7 @@
 
 - [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add audit log helper with OTel trace ID correlation`
+- [x] Commit: `feat(vfs): add audit log helper with OTel trace ID correlation`
 
 ---
 
@@ -629,7 +629,7 @@
     only if `set_proc_title=True` kwarg
   - `VFS.close()`: close connections
 - [x] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add VFS class with URI resolution and lifecycle`
+- [ x] Commit: `feat(vfs): add VFS class with URI resolution and lifecycle`
 
 ---
 
@@ -658,7 +658,7 @@
   - `list`: calls `meta_store.list_dir(...)` then filters results by permission;
     paths the principal cannot read are silently excluded (invisible pruning)
 - [x] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add VFS.stat and VFS.list with invisible pruning`
+- [x] Commit: `feat(vfs): add VFS.stat and VFS.list with invisible pruning`
 
 ---
 
@@ -703,7 +703,7 @@
 
 - [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add VFS.write with content addressing, versioning, and audit`
+- [x] Commit: `feat(vfs): add VFS.write with content addressing, versioning, and audit`
 
 ---
 
@@ -730,7 +730,7 @@
   3. If `meta.is_tombstone` or `meta is None`: raise `NotFoundError`
   4. `return await blob_store.get(meta.content_hash)`
 - [x] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add VFS.read with permission check and version selection`
+- [x] Commit: `feat(vfs): add VFS.read with permission check and version selection`
 
 ---
 
@@ -755,7 +755,7 @@
   3. `meta_store.put_version(tombstone)`
   4. `audit_delete(...)`
 - [x] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add VFS.delete with tombstone versioning and audit`
+- [x] Commit: `feat(vfs): add VFS.delete with tombstone versioning and audit`
 
 ---
 
@@ -825,7 +825,7 @@
 
 - [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add VFS.copy and VFS.move with atomic move transaction`
+- [x] Commit: `feat(vfs): add VFS.copy and VFS.move with atomic move transaction`
 
 ---
 
@@ -855,7 +855,7 @@
     `parent_version_id=target.id` → `meta_store.put_version(new_version)` →
     audit; no blob copy needed (content-addressed dedup)
 - [x] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add VFS.versions and VFS.rollback`
+- [x] Commit: `feat(vfs): add VFS.versions and VFS.rollback`
 
 ---
 
@@ -887,7 +887,7 @@
   5. For `GLOB` / `FIND`: pass file metadata only (no blob reads)
   6. Return `list[SearchResult]`
 - [x] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add VFS.search with provider dispatch and permission pruning`
+- [x] Commit: `feat(vfs): add VFS.search with provider dispatch and permission pruning`
 
 ---
 
@@ -948,7 +948,7 @@
 
 - [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add GarbageCollector with version and blob GC`
+- [x] Commit: `feat(vfs): add GarbageCollector with version and blob GC`
 
 ---
 
@@ -974,7 +974,7 @@
     `provider.index(path, content, meta)`, update `search_meta` via
     `meta_store.update_search_meta(...)`
 - [x] Run tests — confirm they pass
-- [ ] Commit: `feat(vfs): add VFS.run_gc and VFS.reindex`
+- [x] Commit: `feat(vfs): add VFS.run_gc and VFS.reindex`
 
 ---
 
@@ -1024,7 +1024,7 @@
 
 - [x] Run tests — confirm they pass
 
-- [ ] Commit: `feat(vfs): add public API, namespace helpers, permission grant`
+- [x] Commit: `feat(vfs): add public API, namespace helpers, permission grant`
 
 ---
 
@@ -1035,4 +1035,4 @@
 - [x] Verify all spec requirements from the 6 Phase 1 capabilities have at least one
   passing test covering each scenario in: file-operations, versioning, access-control,
   storage, observability, search
-- [ ] Commit: `chore(vfs): phase1 complete — all tests passing`
+- [x] Commit: `chore(vfs): phase1 complete — all tests passing`

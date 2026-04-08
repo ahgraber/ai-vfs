@@ -508,6 +508,51 @@ ORDER BY version_number DESC
         )
         await self._auto_commit()
 
+    async def has_version_references(self, content_hash: str) -> bool:
+        """Return True if any version record references the given content hash."""
+        row = await self._execute_fetchone(
+            "SELECT 1 FROM versions WHERE content_hash=? LIMIT 1",
+            (content_hash,),
+        )
+        return row is not None
+
+    # --- Entity persistence ---
+
+    async def put_namespace(self, namespace: "Namespace") -> None:
+        """Persist a namespace record."""
+        await self._db.execute(
+            """
+INSERT OR REPLACE INTO namespaces (id, display_name, created_at, created_by, retention_policy)
+VALUES (?, ?, ?, ?, ?)
+""".strip(),
+            (
+                namespace.id,
+                namespace.display_name,
+                namespace.created_at.isoformat(),
+                namespace.created_by,
+                json.dumps(namespace.retention_policy.model_dump(), default=str)
+                if namespace.retention_policy
+                else None,
+            ),
+        )
+        await self._auto_commit()
+
+    async def put_principal(self, principal: "Principal") -> None:
+        """Persist a principal record."""
+        await self._db.execute(
+            """
+INSERT OR REPLACE INTO principals (id, display_name, principal_type, created_at)
+VALUES (?, ?, ?, ?)
+""".strip(),
+            (
+                principal.id,
+                principal.display_name,
+                principal.principal_type,
+                principal.created_at.isoformat(),
+            ),
+        )
+        await self._auto_commit()
+
     # --- Transactions ---
 
     @asynccontextmanager
