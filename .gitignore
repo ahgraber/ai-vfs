@@ -5,6 +5,7 @@
 
 # dot-directories, unless explicitly kept
 .*/
+!.claude/
 !.github/
 !.specs/
 !.renovate/
@@ -113,6 +114,7 @@ chrome-profile
 
 # ai
 docs/superpowers
+settings.local.json
 
 # retain files
 !.gitkeep
