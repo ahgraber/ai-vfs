@@ -1,64 +1,80 @@
-# gitignore
-
-# git
-.worktrees/
-
-# dot-directories, unless explicitly kept
+# -------------------------------------------------------
+# Dot-directories: ignore all, allowlist what we track
+# -------------------------------------------------------
 .*/
 !.claude/
+!.devcontainer
 !.github/
 !.specs/
 !.renovate/
+!.taskfiles
 
-# Editors
-.ipynb_checkpoints/
-.profile
-.ruff_cache/
-.vscode/
-*.profraw
-profile_default/
-ipython_config.py
-CLAUDE.md
-
-# Trash
+# -------------------------------------------------------
+# OS
+# -------------------------------------------------------
 .DS_Store
 Thumbs.db
 
-# secrets
+# -------------------------------------------------------
+# Secrets & environment
+# -------------------------------------------------------
 *.*key
 *.pem
 *.pgp
 *.pub
 .config.env
 .decrypted~*
-# .decrypted~*.yaml
 *.env
 .env.*
 .envrc
 !.env.example
+!.env.sample
 
-# Python and Node dependencies
+# -------------------------------------------------------
+# AI tooling (local/personal files only)
+# -------------------------------------------------------
+CLAUDE.md
+CLAUDE.local.md
+.claude/settings.local.json
+docs/superpowers/
+settings.local.json
+
+# -------------------------------------------------------
+# Editors & profiling
+# -------------------------------------------------------
+.ipynb_checkpoints/
+.profile
+*.profraw
+profile_default/
+ipython_config.py
+
+# -------------------------------------------------------
+# Python
+# -------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.coverage.*
+
+# -------------------------------------------------------
+# Dependencies & build output
+# -------------------------------------------------------
 .local/
 .venv/
 bin/
-__pycache__/
 node_modules/
-*.py[cod]
 venv/
-
-# direnv
-.direnv/*
-
-# Extras
-*pytest*
-*cache*
-!*cache*.py
-
-# Distribution / packaging
-.Python
 build/
-develop-eggs/
 dist/
+site/
+**/cache/
+
+# -------------------------------------------------------
+# Distribution / packaging
+# -------------------------------------------------------
+.Python
+develop-eggs/
 downloads/
 eggs/
 .eggs/
@@ -69,17 +85,16 @@ sdist/
 var/
 wheels/
 share/python-wheels/
-*.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
 
+# -------------------------------------------------------
 # Unit test / coverage reports
+# -------------------------------------------------------
 htmlcov/
 .tox/
 .nox/
-.coverage
-.coverage.*
 nosetests.xml
 coverage.xml
 *.cover
@@ -88,7 +103,19 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# -------------------------------------------------------
+# direnv
+# -------------------------------------------------------
+.direnv/*
+
+# -------------------------------------------------------
+# Extras
+# -------------------------------------------------------
+*pytest*
+
+# -------------------------------------------------------
 # Data files & folders
+# -------------------------------------------------------
 app/
 data/
 *.db
@@ -98,7 +125,9 @@ data/
 *.pdf
 !src/**/*.html
 
-# temp / working files & folders
+# -------------------------------------------------------
+# Temp, logs, & working files
+# -------------------------------------------------------
 *.bak
 *.log
 *.zip
@@ -112,15 +141,18 @@ TODO.md
 chromium-profile
 chrome-profile
 
-# ai
-docs/superpowers
-settings.local.json
+# -------------------------------------------------------
+# Git
+# -------------------------------------------------------
+.worktrees/
 
-# retain files
+# -------------------------------------------------------
+# Sops
+# -------------------------------------------------------
+!*.sops.*
+
+# -------------------------------------------------------
+# Retain (must be last — negations override above)
+# -------------------------------------------------------
 !.gitkeep
 !.gitignore
-!.devcontainer
-!.github
-!.taskfiles
-!*.sops.*
-!.env.sample
