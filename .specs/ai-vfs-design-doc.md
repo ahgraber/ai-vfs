@@ -381,24 +381,64 @@ class ExecutionProvider(Protocol):
 ```python
 @dataclass
 class FsOperations:
-    # Core VFS operations (injected as sandbox callables)
-    read: Callable[[str], bytes]
-    write: Callable[[str, bytes], str]
-    list: Callable[[str, bool], list[dict]]
-    stat: Callable[[str], dict]
-    delete: Callable[[str], None]
+    # Session state operations (Session-backed; see `shell-context` change).
+    # `cd` is async because it triggers a permission check; `pwd` is pure state.
+    cd: Callable[[str], Awaitable[None]]
+    pwd: Callable[[], str]
 
-    # Shell operation wrappers
-    grep: Callable[..., list[dict]]
-    find: Callable[..., list[str]]
-    glob: Callable[[str], list[str]]
-    head: Callable[[str, int], bytes]
-    tail: Callable[[str, int], bytes]
-    edit: Callable[..., dict]
+    # Core VFS operations (injected as sandbox callables). All async — they touch
+    # the metadata/blob stores via the bound Session.
+    read: Callable[[str], Awaitable[bytes]]
+    write: Callable[[str, bytes], Awaitable[str]]
+    list: Callable[[str, bool], Awaitable[list[dict]]]
+    stat: Callable[[str], Awaitable[dict]]
+    delete: Callable[[str], Awaitable[None]]
+
+    # Shell operation wrappers (async; wrap the core ops).
+    grep: Callable[..., Awaitable[list[dict]]]
+    find: Callable[..., Awaitable[list[str]]]
+    glob: Callable[[str], Awaitable[list[str]]]
+    head: Callable[[str, int], Awaitable[bytes]]
+    tail: Callable[[str, int], Awaitable[bytes]]
+    edit: Callable[..., Awaitable[dict]]
 ```
 
-The VFS layer constructs `FsOperations` with permission-scoped callbacks bound to the calling principal and namespace.
-The sandbox can only reach what the principal is allowed to access.
+`FsOperations` is constructed against a `Session` (see `changes/shell-context/` while active, then `changes/archive/<date>-shell-context/` after archival) rather than directly against `VFS`.
+The Session binds `namespace_id`, `principal_id`, and an in-memory `cwd`, so every callback in `FsOperations` resolves relative paths through `cwd` and inherits the principal's permission scope.
+Most adapters need a real `async def` (not a lambda) because they `await` the Session call and post-process the result:
+
+```python
+def fs_operations_for(session: Session) -> FsOperations:
+    async def _write(path: str, data: bytes) -> str:
+        version = await session.write(path, data)
+        return version.id
+
+    async def _list(path: str, recursive: bool) -> list[dict]:
+        entries = await session.list(path, recursive=recursive)
+        return [m.model_dump() for m in entries]
+
+    async def _stat(path: str) -> dict:
+        meta = await session.stat(path)
+        return meta.model_dump()
+
+    async def _delete(path: str) -> None:
+        await session.delete(path)  # VersionMeta discarded — FsOperations exposes fire-and-forget delete
+
+    return FsOperations(
+        cd=session.cd,  # Session methods that already match the FsOperations signature bind directly
+        pwd=session.pwd,
+        read=session.read,
+        write=_write,
+        list=_list,
+        stat=_stat,
+        delete=_delete,
+        grep=...,  # shell wrappers below — see § 3.5
+        ...,
+    )
+```
+
+This keeps three concerns cleanly factored: VFS owns storage + permission gates, Session owns CWD + relative-path resolution, `FsOperations` owns bash naming + anchor management.
+The sandbox can only reach what the principal is allowed to access, and it observes a coherent bash-style filesystem (`cd`, `pwd`, `./relative`) without any of that state leaking into VFS.
 
 ```python
 @dataclass
@@ -417,16 +457,21 @@ Wrappers that expose a curated, bash-familiar function set over VFS operations.
 These are injected into Monty as explicit external functions.
 They are not a POSIX compatibility layer; Bashkit can provide real shell syntax later.
 
-| Wrapper                                                                    | Bash equivalent                     | VFS dispatch                                              |
-| -------------------------------------------------------------------------- | ----------------------------------- | --------------------------------------------------------- |
-| `grep(pattern, path, recursive=True)`                                      | `grep -r "pattern" /path/`          | search provider (bloom/regex) or fallback to read + match |
-| `find(path, name=None, size=None)`                                         | `find /path -name "*.py" -size +1k` | metadata store queries                                    |
-| `glob(pattern)`                                                            | `ls /path/*.py`                     | path-pattern match against metadata                       |
-| `cat(path)`                                                                | `cat /path/file`                    | `vfs.read(path)`                                          |
-| `ls(path, all=False, long=False)`                                          | `ls -la /path/`                     | `vfs.list(path)` with structured metadata                 |
-| `head(path, n=10)`                                                         | `head -n 10 /path/file`             | `vfs.read(path)` + slice                                  |
-| `tail(path, n=10)`                                                         | `tail -n 10 /path/file`             | `vfs.read(path)` + slice                                  |
-| `edit(path, start_anchor, end_anchor, replacement, expected_version=None)` | `apply patch to anchored range`     | validate anchors, then `vfs.write(path)`                  |
+Path-taking wrappers accept relative or absolute paths.
+Relative paths resolve through the bound Session's `cwd`; the wrapper itself does no path math.
+
+| Wrapper                                                                    | Bash equivalent                     | Dispatch                                                       |
+| -------------------------------------------------------------------------- | ----------------------------------- | -------------------------------------------------------------- |
+| `cd(path)`                                                                 | `cd /path/`                         | `session.cd(path)` (resolves, checks read perm, updates `cwd`) |
+| `pwd()`                                                                    | `pwd`                               | `session.pwd()`                                                |
+| `grep(pattern, path, recursive=True)`                                      | `grep -r "pattern" /path/`          | search provider (bloom/regex) or fallback to read + match      |
+| `find(path, name=None, size=None)`                                         | `find /path -name "*.py" -size +1k` | metadata store queries                                         |
+| `glob(pattern)`                                                            | `ls /path/*.py`                     | path-pattern match against metadata                            |
+| `cat(path)`                                                                | `cat /path/file`                    | `session.read(path)`                                           |
+| `ls(path, all=False, long=False)`                                          | `ls -la /path/`                     | `session.list(path)` with structured metadata                  |
+| `head(path, n=10)`                                                         | `head -n 10 /path/file`             | `session.read(path)` + slice                                   |
+| `tail(path, n=10)`                                                         | `tail -n 10 /path/file`             | `session.read(path)` + slice                                   |
+| `edit(path, start_anchor, end_anchor, replacement, expected_version=None)` | `apply patch to anchored range`     | validate anchors, then `session.write(path)`                   |
 
 The shell ops layer enables the [Mintlify/ChromaFS](https://www.mintlify.com/blog/how-we-built-a-virtual-filesystem-for-our-assistant) optimization pattern:
 `grep` hits the search index first as a coarse filter, then verifies matches

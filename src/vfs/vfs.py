@@ -48,6 +48,12 @@ _BLOB_SCHEMES = {
 }
 
 
+def _require_absolute(path: str) -> None:
+    """Reject any path that is not absolute. Relative-path resolution is the caller's job."""
+    if not path.startswith("/"):
+        raise ValueError(f"path must be absolute, got {path!r}")
+
+
 class VFS:
     """Virtual file system orchestrator."""
 
@@ -114,6 +120,7 @@ class VFS:
 
     async def stat(self, namespace_id: str, path: str, *, principal_id: str) -> FileMeta:
         """Return file metadata. Raises PermissionDeniedError or NotFoundError."""
+        _require_absolute(path)
         t0 = time.monotonic()
         with vfs_span(
             "stat",
@@ -141,6 +148,7 @@ class VFS:
         recursive: bool = False,
     ) -> list[FileMeta]:
         """List files under path_prefix, silently pruning entries the principal cannot read."""
+        _require_absolute(path_prefix)
         t0 = time.monotonic()
         with vfs_span(
             "list",
@@ -173,6 +181,7 @@ class VFS:
         expected_version: int | None = None,
     ) -> VersionMeta:
         """Write content and create a new immutable version. Raises ConflictError on CAS mismatch."""
+        _require_absolute(path)
         await self._check_perm(principal_id, namespace_id, path, "write")
         t0 = time.monotonic()
 
@@ -245,6 +254,7 @@ class VFS:
         version_number: int | None = None,
     ) -> bytes:
         """Return blob content for the current version, or a specific version if version_number is given."""
+        _require_absolute(path)
         t0 = time.monotonic()
         with vfs_span(
             "read",
@@ -268,6 +278,7 @@ class VFS:
 
     async def delete(self, namespace_id: str, path: str, *, principal_id: str) -> VersionMeta:
         """Create a tombstone version marking the file deleted; preserves prior versions."""
+        _require_absolute(path)
         t0 = time.monotonic()
         with vfs_span(
             "delete",
@@ -321,6 +332,8 @@ class VFS:
         expected_version: int | None = None,
     ) -> VersionMeta:
         """Copy src to dst within the same namespace, sharing the underlying blob."""
+        _require_absolute(src)
+        _require_absolute(dst)
         t0 = time.monotonic()
         with vfs_span(
             "copy",
@@ -378,6 +391,8 @@ class VFS:
         principal_id: str,
     ) -> VersionMeta:
         """Atomically tombstone src and create dst with the same content hash."""
+        _require_absolute(src)
+        _require_absolute(dst)
         t0 = time.monotonic()
         with vfs_span(
             "move",
@@ -455,6 +470,7 @@ class VFS:
         before: int | None = None,
     ) -> list[VersionMeta]:
         """Return version history for path, newest-first."""
+        _require_absolute(path)
         t0 = time.monotonic()
         with vfs_span(
             "versions",
@@ -480,6 +496,7 @@ class VFS:
         principal_id: str,
     ) -> VersionMeta:
         """Create a new version restoring target_version's content."""
+        _require_absolute(path)
         t0 = time.monotonic()
         with vfs_span(
             "rollback",
@@ -537,6 +554,7 @@ class VFS:
         principal_id: str,
     ) -> list[SearchResult]:
         """Search files in scope, silently pruning results the principal cannot read."""
+        _require_absolute(scope)
         t0 = time.monotonic()
         with vfs_span(
             "search",
@@ -589,6 +607,7 @@ class VFS:
 
     async def reindex(self, namespace_id: str, provider_name: str = "default", scope: str = "/") -> int:
         """Backfill search metadata for files in scope; returns the count of versions updated."""
+        _require_absolute(scope)
         files = await self._meta.list_dir(namespace_id, scope, recursive=True)
         count = 0
         for f in files:

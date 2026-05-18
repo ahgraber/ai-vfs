@@ -125,11 +125,20 @@ When writing tests for code that spawns concurrent work, wrap the act phase with
 
 Existing examples: `test_fetcher.py`, `test_async_utils.py`, `test_limiters.py`, `test_health_checks.py`, `test_worker_shutdown.py`.
 
+## Commit & Review Guidelines
+
+- **Hard gate before committing**: before running `git agent-commit`, present the user with (1) the proposed commit message and (2) a concise diff summary covering which files changed and what each change does.
+  Wait for explicit user approval; do not proceed if the user requests changes.
+- **Every commit message draft, without exception, must be produced by invoking the `commit-message` skill first.**
+  A prior invocation earlier in the same session does not satisfy this requirement — re-invoke for each request.
+  Drafting inline, from memory, or from habit is not acceptable.
+- Commit format: `type(scope): summary` (e.g., `feat(zsh): …`, `fix(vscode): …`).
+  Scope should reflect directories or logical surfaces.
+- Separate unrelated changes (docs vs configs vs lockfile updates) into distinct commits.
+- Use `git agent-commit` (not `git commit`) to create signed commits; this alias uses the dedicated agent signing key at `~/.ssh/id_ed25519_agent_signing`.
+
 ## Sandbox Limitations
 
-- You may add files but must ask the user to commit (hint: give them a commit message) so they can use their signing key.
-  Commit format: `type(scope): summary` (e.g., `feat(zsh): …`, `fix(vscode): …`).
-  Scope should reflect directories or logical surfaces.
 - The sandbox cannot run `uv sync` or read `.env` / `.env.example` (permission errors).
 - `tests/conversion/conftest.py` imports `aizk.conversion.db` → `pydantic_settings`, which may fail with `ModuleNotFoundError: No module named 'pydantic_settings.sources.providers.secrets'` if sandbox permissions are too strict.
 - **Delegate test runs to the user** when any of the above errors occur.
