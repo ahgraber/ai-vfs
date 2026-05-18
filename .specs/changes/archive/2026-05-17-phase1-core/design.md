@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS versions (
     content_hash     TEXT NOT NULL,      -- BLAKE3 hex
     size             INTEGER NOT NULL,
     created_at       TEXT NOT NULL,
-    created_by       TEXT NOT NULL,      -- principal ULID
+    created_by       TEXT NOT NULL,      -- principal UUID4
     is_tombstone     INTEGER NOT NULL DEFAULT 0,
     search_meta      TEXT NOT NULL DEFAULT '{}',  -- JSON
     parent_version_id TEXT,              -- ULID or NULL
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS versions (
 
 CREATE TABLE IF NOT EXISTS permissions (
     id           TEXT PRIMARY KEY,       -- ULID
-    principal_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,          -- principal UUID4
     namespace_id TEXT NOT NULL,
     path_prefix  TEXT NOT NULL,          -- e.g., "/" or "/workspace/"
     operations   TEXT NOT NULL,          -- JSON array: ["read","write",...]
@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
     event_id     TEXT PRIMARY KEY,       -- ULID
     timestamp    TEXT NOT NULL,
     namespace_id TEXT NOT NULL,
-    principal_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,          -- principal UUID4
     operation    TEXT NOT NULL,
     path         TEXT,
     version_id   TEXT,
@@ -276,6 +276,9 @@ But the same concern applies to any entity whose creation sequence could reveal 
 | `Permission`  | ULID    | Internal ACL record                                     |
 | `AuditEvent`  | ULID    | Internal log entry; time-sortable by design             |
 
+Foreign-key references to principals, such as `created_by` and `principal_id`,
+store the principal's UUID4 even when the referencing record itself has a ULID.
+
 **Guidance for future entities:** Ask "if this ID reached an attacker, could the embedded timestamp give them useful information about a person or system?"
 If yes, use UUID4.
 
@@ -333,6 +336,64 @@ async def move(self, ns, src, dst, principal_id):
 The `MetadataStore` protocol gains an optional `transaction()` context manager.
 SQLite implements it via `aiosqlite`'s `execute("BEGIN")` / `commit()`.
 Stores that don't support transactions (future NoSQL) fall back to best-effort sequential operations with a note in their adapter documentation.
+
+---
+
+### D15: `grant()` requires a granter; bootstrap via a one-time `bootstrap_admin()` helper
+
+`PermissionGranting` requires the system to enforce that only principals with admin permission may grant.
+Phase 1 implements this with two surfaces:
+
+```python
+class VFS:
+    async def grant(
+        self,
+        granter_id: str,  # NEW — authenticated caller
+        target_principal_id: str,
+        namespace_id: str,
+        path_prefix: str,
+        operations: set[str],
+    ) -> None:
+        # Gate: granter must hold admin on (namespace_id, path_prefix subtree)
+        if not await self._meta.check_permission(granter_id, namespace_id, path_prefix, "admin"):
+            raise PermissionDeniedError(...)
+        # ... existing set_permission + audit_permission_change
+```
+
+The bootstrap problem (no admin exists yet → no one can grant the first admin) is resolved with a separate, narrow helper:
+
+```python
+class VFS:
+    async def bootstrap_admin(
+        self,
+        principal_id: str,
+        namespace_id: str,
+    ) -> None:
+        """Grant admin on / to `principal_id`. Rejected if any admin already exists for the namespace."""
+        # Single-use guard: check the permissions table for any existing admin in this namespace
+        # If found → raise PermissionDeniedError("bootstrap consumed")
+        # Else → write Permission(operations={"admin"}, path_prefix="/", ...)
+        # Audit as operation="bootstrap_admin" for trail
+```
+
+**Rationale:**
+
+- `grant()` taking a `granter_id` keeps it consistent with every other VFS operation (all of which already take `principal_id` for authorization).
+- `bootstrap_admin()` is narrower than overloading `grant()` with a "first-time" flag — easier to audit, easier to test, easier to remove or replace later.
+- The single-use guard prevents accidental privilege escalation: once any admin exists, the bootstrap door closes.
+- A future deployment surface (Phase 2/3 RPC/MCP layer) authenticates the caller and supplies `granter_id` from the validated identity token (JWT subject, OAuth principal, SSO claim); the VFS layer doesn't care how the granter was authenticated.
+
+**Audit:** both `grant()` and `bootstrap_admin()` emit audit events via `audit_permission_change` (previously dead code from the VFS layer — see verify finding).
+
+---
+
+### D16: VFS spans carry `vfs.principal_id` alongside namespace and path
+
+`OTelSpansOnAllOperations` requires spans to carry `namespace_id`, `path`, and `principal_id`.
+Phase 1 initially set only `vfs.namespace` and `vfs.path` on spans.
+Updated: every `vfs_span(...)` call site in `vfs.py` passes `vfs.principal_id` in the attrs dict so trace consumers can filter by the requesting principal without joining against audit events.
+
+This is a one-line addition per call site (10 sites) plus a per-site test asserting attribute presence.
 
 ---
 

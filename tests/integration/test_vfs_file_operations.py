@@ -8,11 +8,17 @@ import pytest
 
 
 async def _setup_ns_principal(vfs):
-    """Create a namespace, principal, and grant full permissions."""
+    """Create a namespace, bootstrap an admin, and grant a worker principal full operations.
+
+    Returns (namespace, agent_principal, admin_principal). Existing callers that ignore
+    the admin handle can unpack as `ns, p, _ = ...` or `ns, p, admin = ...`.
+    """
     ns = await vfs.create_namespace("test-ws", "admin")
+    admin = await vfs.create_principal("test-admin")
+    await vfs.bootstrap_admin(admin.id, ns.id)
     p = await vfs.create_principal("agent-alice")
-    await vfs.grant(p.id, ns.id, "/", {"read", "write", "delete"})
-    return ns, p
+    await vfs.grant(admin.id, p.id, ns.id, "/", {"read", "write", "delete"})
+    return ns, p, admin
 
 
 # --- Task 14: stat and list ---
@@ -21,7 +27,7 @@ async def _setup_ns_principal(vfs):
 class TestVFSStat:
     @pytest.mark.asyncio
     async def test_stat_returns_metadata(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/src/main.py", b"hello", principal_id=p.id)
         meta = await vfs_instance.stat(ns.id, "/src/main.py", principal_id=p.id)
         assert meta.path == "/src/main.py"
@@ -29,7 +35,7 @@ class TestVFSStat:
 
     @pytest.mark.asyncio
     async def test_stat_not_found(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         from vfs.errors import NotFoundError
 
         with pytest.raises(NotFoundError):
@@ -37,7 +43,7 @@ class TestVFSStat:
 
     @pytest.mark.asyncio
     async def test_stat_permission_denied(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/file", b"data", principal_id=p.id)
         no_perm = await vfs_instance.create_principal("no-perms")
         from vfs.errors import PermissionDeniedError
@@ -49,7 +55,7 @@ class TestVFSStat:
 class TestVFSList:
     @pytest.mark.asyncio
     async def test_list_non_recursive(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         for path in ["/src/a.py", "/src/b.py", "/src/c.py", "/src/sub/d.py"]:
             await vfs_instance.write(ns.id, path, b"x", principal_id=p.id)
         results = await vfs_instance.list(ns.id, "/src/", principal_id=p.id, recursive=False)
@@ -58,7 +64,7 @@ class TestVFSList:
 
     @pytest.mark.asyncio
     async def test_list_recursive(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         for path in ["/src/a.py", "/src/b.py", "/src/sub/c.py"]:
             await vfs_instance.write(ns.id, path, b"x", principal_id=p.id)
         results = await vfs_instance.list(ns.id, "/src/", principal_id=p.id, recursive=True)
@@ -67,12 +73,12 @@ class TestVFSList:
 
     @pytest.mark.asyncio
     async def test_list_invisible_pruning(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/public/a.py", b"x", principal_id=p.id)
         await vfs_instance.write(ns.id, "/secret/b.py", b"x", principal_id=p.id)
         # Create limited principal with read on /public/ only
         limited = await vfs_instance.create_principal("limited")
-        await vfs_instance.grant(limited.id, ns.id, "/public/", {"read"})
+        await vfs_instance.grant(admin.id, limited.id, ns.id, "/public/", {"read"})
         results = await vfs_instance.list(ns.id, "/", principal_id=limited.id, recursive=True)
         paths = {r.path for r in results}
         assert paths == {"/public/a.py"}
@@ -81,9 +87,13 @@ class TestVFSList:
     async def test_list_namespace_isolation(self, vfs_instance):
         ns_a = await vfs_instance.create_namespace("ws-a", "admin")
         ns_b = await vfs_instance.create_namespace("ws-b", "admin")
+        admin_a = await vfs_instance.create_principal("admin-a")
+        admin_b = await vfs_instance.create_principal("admin-b")
+        await vfs_instance.bootstrap_admin(admin_a.id, ns_a.id)
+        await vfs_instance.bootstrap_admin(admin_b.id, ns_b.id)
         p = await vfs_instance.create_principal("agent")
-        await vfs_instance.grant(p.id, ns_a.id, "/", {"read", "write"})
-        await vfs_instance.grant(p.id, ns_b.id, "/", {"read", "write"})
+        await vfs_instance.grant(admin_a.id, p.id, ns_a.id, "/", {"read", "write"})
+        await vfs_instance.grant(admin_b.id, p.id, ns_b.id, "/", {"read", "write"})
         await vfs_instance.write(ns_a.id, "/a.py", b"a", principal_id=p.id)
         await vfs_instance.write(ns_b.id, "/b.py", b"b", principal_id=p.id)
         results_a = await vfs_instance.list(ns_a.id, "/", principal_id=p.id, recursive=True)
@@ -97,14 +107,14 @@ class TestVFSList:
 class TestVFSWrite:
     @pytest.mark.asyncio
     async def test_write_returns_version_meta(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         ver = await vfs_instance.write(ns.id, "/a.py", b"hello", principal_id=p.id)
         assert ver.version_number == 1
         assert ver.file_path == "/a.py"
 
     @pytest.mark.asyncio
     async def test_write_creates_new_version(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         v1 = await vfs_instance.write(ns.id, "/a.py", b"v1", principal_id=p.id)
         v2 = await vfs_instance.write(ns.id, "/a.py", b"v2", principal_id=p.id)
         assert v1.version_number == 1
@@ -112,14 +122,14 @@ class TestVFSWrite:
 
     @pytest.mark.asyncio
     async def test_write_content_addressed(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         v1 = await vfs_instance.write(ns.id, "/a.py", b"same", principal_id=p.id)
         v2 = await vfs_instance.write(ns.id, "/b.py", b"same", principal_id=p.id)
         assert v1.content_hash == v2.content_hash
 
     @pytest.mark.asyncio
     async def test_write_cas_conflict(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"v1", principal_id=p.id)
         from vfs.errors import ConflictError
 
@@ -128,7 +138,7 @@ class TestVFSWrite:
 
     @pytest.mark.asyncio
     async def test_write_permission_denied(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         no_perm = await vfs_instance.create_principal("no-write")
         from vfs.errors import PermissionDeniedError
 
@@ -137,7 +147,7 @@ class TestVFSWrite:
 
     @pytest.mark.asyncio
     async def test_write_creates_audit_event(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"x", principal_id=p.id)
         rows = await vfs_instance._meta._execute_fetchall(
             "SELECT operation FROM audit_events WHERE namespace_id=?", (ns.id,)
@@ -148,7 +158,7 @@ class TestVFSWrite:
     @pytest.mark.asyncio
     async def test_write_updates_search_meta(self, vfs_instance):
         """Search provider returning non-empty dict should populate version.search_meta."""
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
 
         class MockSearchProvider:
             async def index(self, path, content, metadata):
@@ -176,14 +186,14 @@ class TestVFSWrite:
 class TestVFSRead:
     @pytest.mark.asyncio
     async def test_read_returns_content(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"hello world", principal_id=p.id)
         content = await vfs_instance.read(ns.id, "/a.py", principal_id=p.id)
         assert content == b"hello world"
 
     @pytest.mark.asyncio
     async def test_read_specific_version(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"first", principal_id=p.id)
         await vfs_instance.write(ns.id, "/a.py", b"second", principal_id=p.id)
         content = await vfs_instance.read(ns.id, "/a.py", principal_id=p.id, version_number=1)
@@ -191,7 +201,7 @@ class TestVFSRead:
 
     @pytest.mark.asyncio
     async def test_read_deleted_file(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         await vfs_instance.delete(ns.id, "/a.py", principal_id=p.id)
         from vfs.errors import NotFoundError
@@ -201,7 +211,7 @@ class TestVFSRead:
 
     @pytest.mark.asyncio
     async def test_read_permission_denied(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         no_perm = await vfs_instance.create_principal("no-read")
         from vfs.errors import PermissionDeniedError
@@ -211,7 +221,7 @@ class TestVFSRead:
 
     @pytest.mark.asyncio
     async def test_read_not_audited(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         # Clear audit events from write
         await vfs_instance._meta._conn.execute("DELETE FROM audit_events WHERE namespace_id=?", (ns.id,))
@@ -228,7 +238,7 @@ class TestVFSRead:
 class TestVFSDelete:
     @pytest.mark.asyncio
     async def test_delete_creates_tombstone(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         await vfs_instance.delete(ns.id, "/a.py", principal_id=p.id)
         meta = await vfs_instance.stat(ns.id, "/a.py", principal_id=p.id)
@@ -236,7 +246,7 @@ class TestVFSDelete:
 
     @pytest.mark.asyncio
     async def test_delete_old_versions_still_accessible(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"v1 content", principal_id=p.id)
         await vfs_instance.delete(ns.id, "/a.py", principal_id=p.id)
         # Version 1 should still be readable
@@ -245,10 +255,10 @@ class TestVFSDelete:
 
     @pytest.mark.asyncio
     async def test_delete_permission_denied(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         read_only = await vfs_instance.create_principal("reader")
-        await vfs_instance.grant(read_only.id, ns.id, "/", {"read"})
+        await vfs_instance.grant(admin.id, read_only.id, ns.id, "/", {"read"})
         from vfs.errors import PermissionDeniedError
 
         with pytest.raises(PermissionDeniedError):
@@ -256,7 +266,7 @@ class TestVFSDelete:
 
     @pytest.mark.asyncio
     async def test_delete_creates_audit_event(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         await vfs_instance.delete(ns.id, "/a.py", principal_id=p.id)
         rows = await vfs_instance._meta._execute_fetchall(
@@ -272,7 +282,7 @@ class TestVFSDelete:
 class TestVFSCopy:
     @pytest.mark.asyncio
     async def test_copy_to_new_path(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/src/a.py", b"content", principal_id=p.id)
         ver = await vfs_instance.copy(ns.id, "/src/a.py", "/dst/a.py", principal_id=p.id)
         assert ver.version_number == 1
@@ -285,7 +295,7 @@ class TestVFSCopy:
 
     @pytest.mark.asyncio
     async def test_copy_to_existing_path(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"original", principal_id=p.id)
         await vfs_instance.write(ns.id, "/b.py", b"source", principal_id=p.id)
         ver = await vfs_instance.copy(ns.id, "/b.py", "/a.py", principal_id=p.id)
@@ -293,7 +303,7 @@ class TestVFSCopy:
 
     @pytest.mark.asyncio
     async def test_copy_nonexistent_source(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         from vfs.errors import NotFoundError
 
         with pytest.raises(NotFoundError):
@@ -301,14 +311,14 @@ class TestVFSCopy:
 
     @pytest.mark.asyncio
     async def test_copy_no_blob_duplication(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         v1 = await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         v2 = await vfs_instance.copy(ns.id, "/a.py", "/b.py", principal_id=p.id)
         assert v1.content_hash == v2.content_hash
 
     @pytest.mark.asyncio
     async def test_copy_permission_denied(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         no_perm = await vfs_instance.create_principal("no-copy")
         from vfs.errors import PermissionDeniedError
@@ -318,7 +328,7 @@ class TestVFSCopy:
 
     @pytest.mark.asyncio
     async def test_copy_creates_audit_event(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         await vfs_instance.copy(ns.id, "/a.py", "/b.py", principal_id=p.id)
         rows = await vfs_instance._meta._execute_fetchall(
@@ -331,7 +341,7 @@ class TestVFSCopy:
 class TestVFSMove:
     @pytest.mark.asyncio
     async def test_move_to_new_path(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/src/a.py", b"content", principal_id=p.id)
         ver = await vfs_instance.move(ns.id, "/src/a.py", "/dst/a.py", principal_id=p.id)
         assert ver.version_number == 1
@@ -344,7 +354,7 @@ class TestVFSMove:
 
     @pytest.mark.asyncio
     async def test_move_to_existing_path(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"orig", principal_id=p.id)
         await vfs_instance.write(ns.id, "/b.py", b"moved", principal_id=p.id)
         await vfs_instance.move(ns.id, "/b.py", "/a.py", principal_id=p.id)
@@ -353,7 +363,7 @@ class TestVFSMove:
 
     @pytest.mark.asyncio
     async def test_move_nonexistent_source(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         from vfs.errors import NotFoundError
 
         with pytest.raises(NotFoundError):
@@ -361,10 +371,10 @@ class TestVFSMove:
 
     @pytest.mark.asyncio
     async def test_move_permission_denied(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         read_only = await vfs_instance.create_principal("reader")
-        await vfs_instance.grant(read_only.id, ns.id, "/", {"read"})
+        await vfs_instance.grant(admin.id, read_only.id, ns.id, "/", {"read"})
         from vfs.errors import PermissionDeniedError
 
         with pytest.raises(PermissionDeniedError):
@@ -373,7 +383,7 @@ class TestVFSMove:
     @pytest.mark.asyncio
     async def test_move_atomicity(self, vfs_instance):
         """If dst creation fails mid-move, src must NOT be tombstoned (transaction rollback)."""
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/src.py", b"data", principal_id=p.id)
 
         # Sabotage: create a version at dst with the same version_number that
@@ -421,7 +431,7 @@ class TestVFSMove:
 
     @pytest.mark.asyncio
     async def test_move_creates_audit_event(self, vfs_instance):
-        ns, p = await _setup_ns_principal(vfs_instance)
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         await vfs_instance.move(ns.id, "/a.py", "/b.py", principal_id=p.id)
         rows = await vfs_instance._meta._execute_fetchall(
@@ -429,3 +439,130 @@ class TestVFSMove:
         )
         ops = [r[0] for r in rows]
         assert "move" in ops
+
+
+# --- Verify-driven additions: CAS, dedup, lazy I/O, ULID format, immutability ---
+
+
+class TestVFSCopyCAS:
+    """MetadataCASSemantics — copy with expected_version exercises the CAS branch."""
+
+    @pytest.mark.asyncio
+    async def test_copy_cas_success(self, vfs_instance):
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+        # Establish a current version 1 at the destination so we can target it with CAS.
+        await vfs_instance.write(ns.id, "/src.py", b"source", principal_id=p.id)
+        await vfs_instance.write(ns.id, "/dst.py", b"existing", principal_id=p.id)
+        v2 = await vfs_instance.copy(ns.id, "/src.py", "/dst.py", principal_id=p.id, expected_version=1)
+        assert v2.version_number == 2
+
+    @pytest.mark.asyncio
+    async def test_copy_cas_conflict(self, vfs_instance):
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+        await vfs_instance.write(ns.id, "/src.py", b"source", principal_id=p.id)
+        await vfs_instance.write(ns.id, "/dst.py", b"existing", principal_id=p.id)
+        from vfs.errors import ConflictError
+
+        with pytest.raises(ConflictError):
+            await vfs_instance.copy(ns.id, "/src.py", "/dst.py", principal_id=p.id, expected_version=99)
+
+
+class TestVFSWriteCASSuccess:
+    """OptimisticConcurrency — VFS-level happy path complement to existing conflict test."""
+
+    @pytest.mark.asyncio
+    async def test_write_cas_success_at_vfs(self, vfs_instance):
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+        await vfs_instance.write(ns.id, "/a.py", b"v1", principal_id=p.id)
+        v2 = await vfs_instance.write(ns.id, "/a.py", b"v2", principal_id=p.id, expected_version=1)
+        assert v2.version_number == 2
+
+
+class TestVFSDedupAndLazyIO:
+    """ContentAddressedStorage (DeduplicatedWrite) + LazyContentResolution."""
+
+    @pytest.mark.asyncio
+    async def test_write_dedup_single_blob(self, vfs_instance):
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+        await vfs_instance.write(ns.id, "/a.py", b"same-content", principal_id=p.id)
+        await vfs_instance.write(ns.id, "/b.py", b"same-content", principal_id=p.id)
+        hashes = [h async for h in vfs_instance._blob.list_hashes()]
+        assert len(hashes) == 1, f"expected 1 deduped blob, got {len(hashes)}: {hashes}"
+
+    @pytest.mark.asyncio
+    async def test_stat_does_not_fetch_blob(self, vfs_instance):
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+        await vfs_instance.write(ns.id, "/a.py", b"hello", principal_id=p.id)
+        # Spy on blob.get — stat MUST NOT trigger it.
+        calls: list[str] = []
+        original_get = vfs_instance._blob.get
+
+        async def _spy_get(h):
+            calls.append(h)
+            return await original_get(h)
+
+        vfs_instance._blob.get = _spy_get
+        await vfs_instance.stat(ns.id, "/a.py", principal_id=p.id)
+        assert calls == [], f"stat triggered blob fetches: {calls}"
+
+    @pytest.mark.asyncio
+    async def test_list_does_not_fetch_blob(self, vfs_instance):
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+        for path in ("/a.py", "/b.py", "/c.py"):
+            await vfs_instance.write(ns.id, path, b"x", principal_id=p.id)
+        calls: list[str] = []
+        original_get = vfs_instance._blob.get
+
+        async def _spy_get(h):
+            calls.append(h)
+            return await original_get(h)
+
+        vfs_instance._blob.get = _spy_get
+        await vfs_instance.list(ns.id, "/", principal_id=p.id, recursive=True)
+        assert calls == [], f"list triggered blob fetches: {calls}"
+
+
+class TestULIDIdentifierFormat:
+    """ULIDIdentifiers — Namespace.id and VersionMeta.id are 26-character ULID strings."""
+
+    @pytest.mark.asyncio
+    async def test_namespace_id_is_ulid_format(self, vfs_instance):
+        ns = await vfs_instance.create_namespace("ws-format", "admin")
+        assert len(ns.id) == 26, f"expected 26-char ULID, got {len(ns.id)}: {ns.id!r}"
+        # ULID base32 charset (Crockford): excludes I, L, O, U
+        valid = set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+        assert set(ns.id).issubset(valid), f"namespace id has non-ULID chars: {ns.id!r}"
+
+    @pytest.mark.asyncio
+    async def test_version_id_is_ulid_format(self, vfs_instance):
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+        ver = await vfs_instance.write(ns.id, "/a.py", b"x", principal_id=p.id)
+        assert len(ver.id) == 26, f"expected 26-char ULID, got {len(ver.id)}: {ver.id!r}"
+        valid = set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+        assert set(ver.id).issubset(valid)
+
+
+class TestImmutableVersionHistory:
+    """ImmutableVersionHistory — prior versions' content fields are not mutated by later writes."""
+
+    @pytest.mark.asyncio
+    async def test_write_does_not_mutate_prior_version(self, vfs_instance):
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+        v1 = await vfs_instance.write(ns.id, "/a.py", b"v1-content", principal_id=p.id)
+        # Snapshot every immutable field.
+        snapshot = {
+            "id": v1.id,
+            "version_number": v1.version_number,
+            "content_hash": v1.content_hash,
+            "size": v1.size,
+            "created_at": v1.created_at,
+            "created_by": v1.created_by,
+            "is_tombstone": v1.is_tombstone,
+            "parent_version_id": v1.parent_version_id,
+        }
+        # Subsequent writes must not touch v1's record.
+        await vfs_instance.write(ns.id, "/a.py", b"v2-content", principal_id=p.id)
+        await vfs_instance.write(ns.id, "/a.py", b"v3-content", principal_id=p.id)
+        v1_after = await vfs_instance._meta.get_version(ns.id, "/a.py", version_number=1)
+        for field, value in snapshot.items():
+            assert getattr(v1_after, field) == value, f"v1 {field} mutated"

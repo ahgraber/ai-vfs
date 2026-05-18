@@ -404,6 +404,14 @@ ON CONFLICT(principal_id, namespace_id, path_prefix) DO UPDATE SET
         )
         await self._auto_commit()
 
+    async def has_any_admin(self, namespace_id: str) -> bool:
+        """Return True if any permission row in the namespace lists `admin` among its operations."""
+        rows = await self._execute_fetchall(
+            "SELECT operations FROM permissions WHERE namespace_id=?",
+            (namespace_id,),
+        )
+        return any("admin" in set(json.loads(row[0])) for row in rows)
+
     # --- Audit ---
 
     async def append_audit_event(self, event: AuditEvent) -> None:

@@ -11,6 +11,7 @@ from ulid import ULID
 from vfs.config import VFSConfig
 from vfs.errors import NotFoundError, PermissionDeniedError
 from vfs.models import (
+    AuditEvent,
     FileMeta,
     Namespace,
     Permission,
@@ -20,13 +21,20 @@ from vfs.models import (
     VersionMeta,
 )
 from vfs.observability.audit import (
+    audit,
     audit_copy,
     audit_delete,
     audit_move,
+    audit_permission_change,
     audit_rollback,
     audit_write,
 )
-from vfs.observability.tracing import record_blob_size, record_op, vfs_span
+from vfs.observability.tracing import (
+    record_blob_size,
+    record_op,
+    record_search_candidates,
+    vfs_span,
+)
 from vfs.search.default import DefaultSearchProvider
 from vfs.stores.cached_blob import CachedBlobStore
 from vfs.stores.local_blob import LocalFSBlobStore
@@ -109,7 +117,7 @@ class VFS:
         t0 = time.monotonic()
         with vfs_span(
             "stat",
-            {"vfs.namespace": namespace_id, "vfs.path": path},
+            {"vfs.namespace": namespace_id, "vfs.path": path, "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             await self._check_perm(principal_id, namespace_id, path, "read")
@@ -136,7 +144,7 @@ class VFS:
         t0 = time.monotonic()
         with vfs_span(
             "list",
-            {"vfs.namespace": namespace_id, "vfs.path": path_prefix},
+            {"vfs.namespace": namespace_id, "vfs.path": path_prefix, "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             files = await self._meta.list_dir(namespace_id, path_prefix, recursive=recursive)
@@ -170,7 +178,7 @@ class VFS:
 
         with vfs_span(
             "write",
-            {"vfs.namespace": namespace_id, "vfs.path": path},
+            {"vfs.namespace": namespace_id, "vfs.path": path, "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             content_hash = blake3.blake3(content).hexdigest()
@@ -240,7 +248,7 @@ class VFS:
         t0 = time.monotonic()
         with vfs_span(
             "read",
-            {"vfs.namespace": namespace_id, "vfs.path": path},
+            {"vfs.namespace": namespace_id, "vfs.path": path, "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             await self._check_perm(principal_id, namespace_id, path, "read")
@@ -263,7 +271,7 @@ class VFS:
         t0 = time.monotonic()
         with vfs_span(
             "delete",
-            {"vfs.namespace": namespace_id, "vfs.path": path},
+            {"vfs.namespace": namespace_id, "vfs.path": path, "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             await self._check_perm(principal_id, namespace_id, path, "delete")
@@ -316,7 +324,7 @@ class VFS:
         t0 = time.monotonic()
         with vfs_span(
             "copy",
-            {"vfs.namespace": namespace_id, "vfs.path": f"{src}->{dst}"},
+            {"vfs.namespace": namespace_id, "vfs.path": f"{src}->{dst}", "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             await self._check_perm(principal_id, namespace_id, src, "read")
@@ -373,7 +381,7 @@ class VFS:
         t0 = time.monotonic()
         with vfs_span(
             "move",
-            {"vfs.namespace": namespace_id, "vfs.path": f"{src}->{dst}"},
+            {"vfs.namespace": namespace_id, "vfs.path": f"{src}->{dst}", "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             await self._check_perm(principal_id, namespace_id, src, "read")
@@ -450,7 +458,7 @@ class VFS:
         t0 = time.monotonic()
         with vfs_span(
             "versions",
-            {"vfs.namespace": namespace_id, "vfs.path": path},
+            {"vfs.namespace": namespace_id, "vfs.path": path, "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             await self._check_perm(principal_id, namespace_id, path, "read")
@@ -475,7 +483,7 @@ class VFS:
         t0 = time.monotonic()
         with vfs_span(
             "rollback",
-            {"vfs.namespace": namespace_id, "vfs.path": path},
+            {"vfs.namespace": namespace_id, "vfs.path": path, "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             await self._check_perm(principal_id, namespace_id, path, "write")
@@ -532,7 +540,7 @@ class VFS:
         t0 = time.monotonic()
         with vfs_span(
             "search",
-            {"vfs.namespace": namespace_id, "vfs.path": scope},
+            {"vfs.namespace": namespace_id, "vfs.path": scope, "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
             # Capability validation
@@ -548,6 +556,11 @@ class VFS:
             candidates = [
                 f for f in all_files if await self._meta.check_permission(principal_id, namespace_id, f.path, "read")
             ]
+            record_search_candidates(
+                len(candidates),
+                {"vfs.namespace": namespace_id, "vfs.search_type": search_type.value},
+                otel_enabled=self._config.otel_enabled,
+            )
 
             # Content fetcher closure — provider calls on demand
             async def _fetch_content(path: str) -> bytes:
@@ -592,21 +605,72 @@ class VFS:
 
     async def grant(
         self,
-        principal_id: str,
+        granter_id: str,
+        target_principal_id: str,
         namespace_id: str,
         path_prefix: str,
         operations: set[str],
     ) -> None:
-        """Grant principal the given operations on path_prefix in namespace_id."""
+        """Grant `target_principal_id` the given operations on `path_prefix`.
+
+        The `granter_id` principal MUST hold the `admin` operation on
+        `path_prefix` (or a less-specific prefix that covers it) within the
+        namespace; otherwise `PermissionDeniedError` is raised and no permission
+        row is written.
+        """
+        if not await self._meta.check_permission(granter_id, namespace_id, path_prefix, "admin"):
+            raise PermissionDeniedError(
+                f"principal {granter_id!r} lacks admin on {path_prefix!r} in namespace {namespace_id!r}"
+            )
         perm = Permission(
             id=str(ULID()),
-            principal_id=principal_id,
+            principal_id=target_principal_id,
             namespace_id=namespace_id,
             path_prefix=path_prefix,
             operations=operations,
             created_at=datetime.now(timezone.utc),
         )
         await self._meta.set_permission(perm)
+        await audit_permission_change(
+            self._meta,
+            namespace_id=namespace_id,
+            principal_id=granter_id,
+            target_principal_id=target_principal_id,
+            path_prefix=path_prefix,
+            operations=operations,
+            audit_log_enabled=self._config.audit_log_enabled,
+        )
+
+    async def bootstrap_admin(self, principal_id: str, namespace_id: str) -> None:
+        """One-time grant of `admin` on `/` to the first admin in an empty namespace.
+
+        Rejected with `PermissionDeniedError` if any principal already holds
+        admin in this namespace — the bootstrap door closes as soon as the
+        first admin exists. Subsequent grants must go through the gated
+        `grant()` path.
+        """
+        if await self._meta.has_any_admin(namespace_id):
+            raise PermissionDeniedError(
+                f"bootstrap_admin rejected: namespace {namespace_id!r} already has at least one admin"
+            )
+        perm = Permission(
+            id=str(ULID()),
+            principal_id=principal_id,
+            namespace_id=namespace_id,
+            path_prefix="/",
+            operations={"admin"},
+            created_at=datetime.now(timezone.utc),
+        )
+        await self._meta.set_permission(perm)
+        event = AuditEvent(
+            event_id=str(ULID()),
+            timestamp=datetime.now(timezone.utc),
+            namespace_id=namespace_id,
+            principal_id=principal_id,
+            operation="bootstrap_admin",
+            detail={"path_prefix": "/", "operations": ["admin"]},
+        )
+        await audit(self._meta, event, audit_log_enabled=self._config.audit_log_enabled)
 
     async def create_namespace(self, display_name: str, created_by: str) -> Namespace:
         """Create and register a namespace, returning the Namespace record."""

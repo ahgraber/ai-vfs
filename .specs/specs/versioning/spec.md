@@ -1,9 +1,6 @@
-# Versioning — Delta Spec
+# Versioning — Spec
 
-> Change: `phase1-core`
-> Date: 2026-04-04
-
-## ADDED Requirements
+## Requirements
 
 ### Requirement: ImmutableVersionHistory
 
@@ -51,23 +48,23 @@ The system SHALL return version history newest-first with configurable limit and
 ### Requirement: RetentionPolicy
 
 The system SHALL support a configurable Time Machine-style retention policy per namespace, with global defaults.
+The policy SHALL be declarative data: a `RetentionPolicy` model carries `max_recent_versions`, `keep_first_version`, `keep_current_version`, and a list of `RetentionTier(max_age, keep_every)` entries describing the intended Time Machine cadence.
 
-> **Phase 1 scope:** The Phase 1 GC implementation covers `max_recent_versions` and
-> `keep_first_version` only. The time-based retention tiers (24h / 7d / 30d) are modelled
-> in `RetentionPolicy.tiers` but are **not enforced by the GC in Phase 1**. Full tier
-> evaluation is deferred to a later phase.
+> **Phase 1 scope:** Phase 1 GC enforces only `max_recent_versions`, `keep_first_version`, and `keep_current_version`.
+> The time-based `tiers` field is stored as declarative data — neither the metadata store adapter nor the library evaluates tier rules in Phase 1.
+> Tier evaluation lands in `phase2-adapters/TierBasedRetention` and lives in the library (`GarbageCollector`), not in the store adapter; the store gains a coarse `iter_versions_for_gc` enumerator and the library applies tier semantics in a single canonical implementation.
 
-#### Scenario: DefaultRetention
+#### Scenario: DefaultRetentionData
 
-- **GIVEN** no namespace-specific retention override
-- **WHEN** the retention policy is evaluated
-- **THEN** the defaults apply: max 50 recent versions; last 24h keep all; last 7d keep one per hour; last 30d keep one per day; beyond 30d keep one per week
+- **GIVEN** the `RetentionPolicy()` default constructor is invoked
+- **WHEN** its fields are inspected
+- **THEN** `max_recent_versions == 50`, `keep_first_version is True`, `keep_current_version is True`, and `tiers` carries the Time Machine-style default cadence (24h / 7d / 30d / beyond) as declarative data only
 
 #### Scenario: AlwaysKeepCurrentAndFirst
 
 - **GIVEN** a file with versions 1 through 100
 - **WHEN** GC applies retention with max_recent_versions=5
-- **THEN** version 1 (first) and the current version are always preserved regardless of retention tier
+- **THEN** version 1 (first) and the current version are always preserved, independent of any tier definitions stored on the policy
 
 ### Requirement: VersionGarbageCollection
 

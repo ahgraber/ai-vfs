@@ -30,44 +30,82 @@ and orchestrates the index-then-filter pipeline.
 
 ### Design Decisions
 
-| Decision            | Choice                                                           | Rationale                                                                                  |
-| ------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Integration pattern | Composition (not inheritance)                                    | Provider composes bloom-search functions; satisfies `SearchProvider` protocol structurally |
-| Index storage       | Per-version in `search_meta["bloom"]`                            | Atomic with writes; versioning for free; no separate index store                           |
-| Search pipeline     | Provider owns full pipeline internally                           | VFS dispatch stays generic; no bloom-specific orchestration in core                        |
-| Scope limiting      | CWD-expanding shells + recency                                   | Agents search near where they work; graceful degradation for brute-force paths             |
-| Protocol changes    | Add `search_metas` + `read_content` to `SearchProvider.search()` | Needed by any index-accelerated provider; backward-compatible for default provider         |
+| Decision            | Choice                                                      | Rationale                                                                                  |
+| ------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Integration pattern | Composition (not inheritance)                               | Provider composes bloom-search functions; satisfies `SearchProvider` protocol structurally |
+| Index storage       | Per-version `SearchArtifact` at `search_meta[provider_key]` | Atomic with writes; versioning for free; no separate index store                           |
+| Search pipeline     | Provider owns full pipeline internally                      | VFS dispatch stays generic; no bloom-specific orchestration in core                        |
+| Scope limiting      | CWD-expanding shells + recency                              | Agents search near where they work; graceful degradation for brute-force paths             |
+| Protocol changes    | Use `SearchRequest` with `search_metas` + `read_content`    | Needed by any index-accelerated provider; backward-compatible for default provider         |
 
 ---
 
 ## 2. SearchProvider Protocol Changes
 
-The existing protocol gains two parameters on `search()`:
+The existing protocol changes `search()` to accept a `SearchRequest`.
+The request carries the permission-pruned metadata and controlled content reader that index-accelerated providers need:
 
 ```python
+@dataclass(frozen=True)
+class SearchArtifact:
+    status: Literal["ready", "failed", "unsupported"]
+    schema_version: int
+    provider_key: str
+    provider_version: str | None
+    params_hash: str
+    content_hash: str
+    created_at: datetime
+
+    storage: Literal["inline", "blob", "external"]
+    payload: dict | None = None
+    artifact_ref: str | None = None
+
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+SearchMeta = dict[str, SearchArtifact]
+
+
+@dataclass(frozen=True)
+class SearchMetaEntry:
+    path: str
+    file: FileMeta
+    version: VersionMeta
+    search_meta: SearchMeta
+
+
+ContentReader = Callable[[str], Awaitable[bytes]]
+
+
+@dataclass(frozen=True)
+class SearchRequest:
+    query: str
+    scope: str
+    search_type: SearchType
+    search_metas: Iterable[SearchMetaEntry]
+    read_content: ContentReader
+    limits: SearchLimits
+
+
 class SearchProvider(Protocol):
-    async def index(self, path: str, content: bytes, metadata: FileMeta) -> dict:
-        """Build search artifacts from content. Returns dict for search_meta."""
+    def provider_key(self) -> str: ...
+
+    async def index(self, path: str, content: bytes, version: VersionMeta) -> SearchArtifact | None:
+        """Build a provider artifact from content."""
         ...
 
-    async def search(
-        self,
-        query: str,
-        scope: str,
-        search_type: SearchType,
-        search_metas: Iterable[tuple[str, dict]],  # NEW
-        read_content: Callable[[str], Awaitable[bytes]],  # NEW
-    ) -> list[SearchResult]:
+    async def search(self, request: SearchRequest) -> SearchResponse:
         """Search within scope. Provider owns the full pipeline."""
         ...
 
     def capabilities(self) -> set[SearchType]: ...
 ```
 
-- **`search_metas`**: `(path, search_meta_dict)` pairs for all files in scope, already permission-pruned and resolved to current versions.
+- **`request.search_metas`**: entries for all files in scope, already permission-pruned and resolved to current versions.
   The VFS queries metadata and passes results to the provider.
   Providers that don't use indexes ignore the dict contents.
-- **`read_content`**: async callback to fetch file content by path.
+- **`request.read_content`**: async callback to fetch file content by path.
   Providers call this only for candidates that need content verification.
   The VFS owns blob access; the provider never touches storage directly.
 
@@ -100,8 +138,11 @@ class BloomSearchProvider:
         self._normalizer_id = normalizer_id
         self._strict = strict
 
-    async def index(self, path: str, content: bytes, metadata: FileMeta) -> dict:
-        """Build BloomIndex from content, return serialized as dict."""
+    def provider_key(self) -> str:
+        return f"bloom/{self._normalizer_id}"
+
+    async def index(self, path: str, content: bytes, version: VersionMeta) -> SearchArtifact | None:
+        """Build BloomIndex from content, return a standard artifact envelope."""
         text = content.decode("utf-8", errors="replace")
         idx = build_index(
             text,
@@ -109,20 +150,23 @@ class BloomSearchProvider:
             target_fpp=self._target_fpp,
             normalizer=get_normalizer(self._normalizer_id),
         )
-        return {"bloom": BloomSearchMeta.from_index(idx).model_dump()}
+        return SearchArtifact(
+            status="ready",
+            schema_version=SUPPORTED_SCHEMA_VERSION,
+            provider_key=self.provider_key(),
+            provider_version=PROVIDER_VERSION,
+            params_hash=self._params_hash(),
+            content_hash=version.content_hash,
+            created_at=utcnow(),
+            storage="inline",
+            payload=BloomSearchMeta.from_index(idx).model_dump(),
+        )
 
-    async def search(
-        self,
-        query: str,
-        scope: str,
-        search_type: SearchType,
-        search_metas: Iterable[tuple[str, dict]],
-        read_content: Callable[[str], Awaitable[bytes]],
-    ) -> list[SearchResult]:
+    async def search(self, request: SearchRequest) -> SearchResponse:
         """Full pipeline: plan → filter → read candidates → verify."""
         # Phase 1: Build query plan
         plan = build_query_plan(
-            query,
+            request.query,
             window=self._window,
             normalizer=get_normalizer(self._normalizer_id),
         )
@@ -130,13 +174,13 @@ class BloomSearchProvider:
         # Phase 2: Deserialize indexes and filter candidates
         indexed = []
         unindexed = []
-        for path, meta_dict in search_metas:
-            bloom_data = meta_dict.get("bloom")
-            if bloom_data and self._can_use(bloom_data):
-                idx = BloomSearchMeta.model_validate(bloom_data).to_index()
-                indexed.append((path, idx))
+        for entry in request.search_metas:
+            artifact = entry.search_meta.get(self.provider_key())
+            if artifact and self._can_use(artifact, entry.version):
+                idx = BloomSearchMeta.model_validate(artifact.payload).to_index()
+                indexed.append((entry.path, idx))
             else:
-                unindexed.append(path)
+                unindexed.append(entry.path)
 
         candidates = filter_candidates(indexed, plan, strict=self._strict)
         # Unindexed files are always candidates (conservative)
@@ -145,21 +189,24 @@ class BloomSearchProvider:
         # Phase 3: Read content and verify matches
         results = []
         for path in candidates:
-            content = await read_content(path)
-            matches = self._verify(query, search_type, content)
+            content = await request.read_content(path)
+            matches = self._verify(request.query, request.search_type, content)
             if matches:
                 results.append(SearchResult(path=path, matches=matches))
 
-        return results
+        return SearchResponse(results=results)
 
     def capabilities(self) -> set[SearchType]:
         return {SearchType.regex, SearchType.fulltext}
 
-    def _can_use(self, bloom_data: dict) -> bool:
-        """Check if bloom_data has a known schema version and matching normalizer_id."""
+    def _can_use(self, artifact: SearchArtifact, version: VersionMeta) -> bool:
+        """Check whether the artifact envelope matches this provider and version."""
         return (
-            bloom_data.get("version", 0) <= SUPPORTED_SCHEMA_VERSION
-            and bloom_data.get("normalizer_id") == self._normalizer_id
+            artifact.status == "ready"
+            and artifact.schema_version <= SUPPORTED_SCHEMA_VERSION
+            and artifact.params_hash == self._params_hash()
+            and artifact.content_hash == version.content_hash
+            and artifact.payload is not None
         )
 
     def _verify(self, query: str, search_type: SearchType, content: bytes) -> list[Match] | None:
@@ -195,7 +242,7 @@ vfs.search("error.*timeout", scope="/src/", type=regex)
   │
   ├─ 3. Query search_meta for all files in scope (metadata batch read)
   │
-  ├─ 4. provider.search(query, scope, type, search_metas, read_content)
+  ├─ 4. provider.search(SearchRequest(query, scope, type, search_metas, read_content, limits))
   │     │
   │     ├─ 4a. build_query_plan("error.*timeout") → AndNode(["err","rro","ror"], ["tim","ime","meo","eou","out"])
   │     │
@@ -206,7 +253,7 @@ vfs.search("error.*timeout", scope="/src/", type=regex)
   │     │
   │     └─ 4d. For each candidate: read_content(path) → regex verify → results
   │
-  └─ 5. Return SearchResult list
+  └─ 5. Return SearchResponse
 ```
 
 Steps 1-3 are metadata-only.
@@ -251,9 +298,9 @@ Scope limiting only kicks in for the brute-force path.
 ```python
 class SearchResponse:
     results: list[SearchResult]
-    scope_narrowed: bool  # true if brute-force scope was limited
-    actual_scope: str  # the scope that was actually searched
-    total_files_in_scope: int  # full count before narrowing
+    scope_narrowed: bool = False  # true if brute-force scope was limited
+    actual_scope: str | None = None  # the scope that was actually searched
+    total_files_in_scope: int | None = None  # full count before narrowing
 ```
 
 This lets the agent know results may be partial and decide whether to refine.
@@ -274,8 +321,8 @@ class VFSConfig(BaseSettings):
 
 ```text
 vfs.write(path, content)
-  → provider.index(path, content, metadata)
-  → store result in version.search_meta["bloom"]
+  → provider.index(path, content, version)
+  → store SearchArtifact at version.search_meta[provider.provider_key()]
 ```
 
 Inline during every write.
@@ -287,9 +334,9 @@ Sub-millisecond for typical document sizes.
 ```text
 vfs.search(query, scope)
   → provider receives search_metas for files in scope
-  → files missing "bloom" key pass through as candidates (conservative)
+  → files missing the provider key pass through as candidates (conservative)
   → VFS reads content for verification
-  → VFS optionally backfills search_meta for those files
+  → VFS optionally backfills SearchArtifact entries for those files
 ```
 
 The provider never triggers backfill — it returns unindexed files as candidates.
@@ -301,7 +348,7 @@ The VFS decides whether to backfill opportunistically.
 vfs.reindex(namespace, provider="bloom", scope="/src/")
   → iterate all current versions in scope
   → read content, call provider.index() for each
-  → update search_meta on each version
+  → update search_meta[provider.provider_key()] on each version
 ```
 
 Used when: provider config changes, bloom-search upgrades change the normalizer
@@ -313,7 +360,8 @@ Search metadata is **per-version**, not per-file:
 
 - Rollback to version 3 creates version N+1 with the same `content_hash`.
   The `search_meta` can be copied from version 3 — no reindex needed.
-- Each version is self-contained: its search_meta matches its content.
+- Each version is self-contained: every ready artifact records the matching
+  `content_hash`.
 - GC reclaims versions and their search_meta together — no orphaned indexes.
 
 ---
@@ -324,20 +372,21 @@ The principle: **never fail a search, only degrade to brute-force.**
 Index problems reduce performance, not correctness.
 Content verification (regex match against actual content) is always the final arbiter.
 
-| Scenario                                 | Who detects                        | Behavior                                                                                                          |
-| ---------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| Normalizer fingerprint mismatch          | bloom-search (`filter_candidates`) | Raises `NormalizerDriftError`. Provider catches, returns mismatched files as unfiltered candidates. Logs warning. |
-| `search_meta` missing `"bloom"` key      | Provider (`search`)                | File passes through as candidate. VFS may backfill.                                                               |
-| `search_meta` has unknown `version`      | Provider (`search`)                | Treat as unindexed — forward-compatible.                                                                          |
-| `EmptyPlan` (no extractable n-grams)     | bloom-search (`build_query_plan`)  | Provider returns all files as candidates. Scope limiting applies.                                                 |
-| Content decode failure during index      | Provider (`index`)                 | Return empty dict. File is searchable but unindexed. Log warning.                                                 |
-| `strict=False` with fingerprint mismatch | bloom-search                       | Filters using stale index. May produce false negatives. Caller accepted risk.                                     |
+| Scenario                                      | Who detects                       | Behavior                                                                                  |
+| --------------------------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------- |
+| Params hash mismatch                          | Provider (`search`)               | Treat as unindexed; file passes through as candidate.                                     |
+| Missing provider key                          | Provider (`search`)               | File passes through as candidate. VFS may backfill.                                       |
+| Unknown artifact `schema_version`             | Provider (`search`)               | Treat as unindexed.                                                                       |
+| Artifact `content_hash` differs from version  | Provider (`search`)               | Treat as stale and unindexed.                                                             |
+| `EmptyPlan` (no extractable n-grams)          | bloom-search (`build_query_plan`) | Provider returns all files as candidates. Scope limiting applies.                         |
+| Content decode failure during index           | Provider (`index`)                | Return a `failed` or `unsupported` artifact. File remains searchable through brute force. |
+| `strict=False` with stale provider parameters | Provider config                   | Filters using stale index. May produce false negatives. Caller accepted risk.             |
 
 ---
 
 ## 8. Storage Cost
 
-Per-file bloom index stored in `search_meta["bloom"]`:
+Per-file bloom payload stored inside a `SearchArtifact` envelope:
 
 | Component          | Size       |
 | ------------------ | ---------- |

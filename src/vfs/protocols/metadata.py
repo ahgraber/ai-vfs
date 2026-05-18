@@ -73,6 +73,10 @@ class MetadataStore(Protocol):
         """Insert or replace a permission record."""
         ...
 
+    async def has_any_admin(self, namespace_id: str) -> bool:
+        """Return True if any principal holds an `admin` operation grant in the namespace."""
+        ...
+
     # --- Audit ---
 
     async def append_audit_event(self, event: AuditEvent) -> None:

@@ -65,3 +65,43 @@ class TestVFSURIResolution:
         )
         with pytest.raises(ValueError, match="Unsupported blob URI"):
             VFS(config)
+
+
+class TestProcessIdentification:
+    """ProcessIdentification (design D11): VFS.initialize sets the process title when running as a service."""
+
+    @pytest.mark.asyncio
+    async def test_initialize_sets_process_title(self, tmp_path, monkeypatch):
+        import setproctitle
+
+        captured: list[str] = []
+        monkeypatch.setattr(setproctitle, "setproctitle", lambda t: captured.append(t))
+        config = VFSConfig(
+            metadata_store_uri=f"sqlite:///{tmp_path}/test.db",
+            blob_store_uri=f"file:///{tmp_path}/blobs/",
+            otel_enabled=False,
+        )
+        vfs = VFS(config)
+        try:
+            await vfs.initialize(set_proc_title=True)
+        finally:
+            await vfs.close()
+        assert "ai-vfs: service" in captured
+
+    @pytest.mark.asyncio
+    async def test_initialize_default_does_not_set_process_title(self, tmp_path, monkeypatch):
+        import setproctitle
+
+        captured: list[str] = []
+        monkeypatch.setattr(setproctitle, "setproctitle", lambda t: captured.append(t))
+        config = VFSConfig(
+            metadata_store_uri=f"sqlite:///{tmp_path}/test.db",
+            blob_store_uri=f"file:///{tmp_path}/blobs/",
+            otel_enabled=False,
+        )
+        vfs = VFS(config)
+        try:
+            await vfs.initialize()  # default set_proc_title=False
+        finally:
+            await vfs.close()
+        assert captured == []

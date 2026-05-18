@@ -1,9 +1,6 @@
-# Access Control — Delta Spec
+# Access Control — Spec
 
-> Change: `phase1-core`
-> Date: 2026-04-04
-
-## ADDED Requirements
+## Requirements
 
 ### Requirement: DefaultDeny
 
@@ -80,7 +77,9 @@ The execute operation is defined in the permission model but is not enforced by 
 
 ### Requirement: PermissionGranting
 
-The system SHALL allow principals with admin permission to grant or modify permissions on their subtree.
+The system SHALL allow principals with admin permission on a path prefix to grant or modify permissions on that subtree.
+The system SHALL deny permission-granting attempts by principals that lack admin on the target subtree.
+The system SHALL provide a one-time bootstrap mechanism to create the initial admin in an empty namespace, since admin-gated granting is otherwise unreachable from a permissionless starting state.
 
 #### Scenario: GrantPermission
 
@@ -88,11 +87,29 @@ The system SHALL allow principals with admin permission to grant or modify permi
 - **WHEN** that principal grants read+write on /workspace/ to another principal
 - **THEN** the other principal can read and write under /workspace/
 
+#### Scenario: NonAdminCannotGrant
+
+- **GIVEN** a principal with read+write but no admin on /workspace/
+- **WHEN** that principal attempts to grant any operation on /workspace/ to another principal
+- **THEN** a PermissionDeniedError is raised and the permissions table is unchanged
+
+#### Scenario: BootstrapInitialAdmin
+
+- **GIVEN** a namespace with no admin principals
+- **WHEN** a caller invokes the bootstrap mechanism to grant admin on / to a principal
+- **THEN** that principal holds admin on / and can subsequently grant further permissions via the normal admin-gated path
+- **AND** subsequent bootstrap invocations on the same namespace are rejected (single-use guard)
+
 ### Requirement: HumanFriendlyNames
 
 The system SHALL maintain a names table mapping entity identifiers (UUID4 or ULID, depending on the entity type's privacy classification) to human-friendly display names for namespaces, principals, and other entities.
-The VFS API SHALL accept either the raw identifier or a display name, resolving to the underlying identifier at the boundary.
+The VFS API SHALL expose a `resolve_name(entity_type, display_name)` helper that returns the underlying identifier (or `None`) for a given display name.
+Callers are responsible for translating display names to identifiers at their own boundary before invoking other VFS operations.
 The names table stores identifiers as opaque text regardless of format.
+
+> **Phase 1 scope:** VFS operations (`stat`, `read`, `write`, etc.) accept raw identifiers only.
+> Auto-resolution of display names at the operation boundary is deferred — the lookup-helper pattern is the explicit, predictable primitive.
+> A higher-level service surface (Phase 2/3 RPC/MCP layer) may add request-time name resolution above this API.
 
 #### Scenario: ResolveNameToULID
 

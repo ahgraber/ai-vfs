@@ -28,14 +28,29 @@ error handling, and storage cost analysis.
   composes `bloom-search` library (optional dependency)
 - **`SemanticSearchProvider`**: embedding-based similarity search with
   vector artifacts stored in `search_meta`
-- **SearchProvider protocol change**: add `search_metas` and `read_content`
-  parameters to `search()` — providers own the full pipeline, VFS owns blob access
+- **`SearchArtifact` envelope**: replace ad-hoc per-provider keys
+  (e.g., `search_meta["bloom"]`) with a standard envelope keyed by
+  `provider_key`, carrying `status`, `schema_version`, `params_hash`,
+  `content_hash`, and either an inline `payload` or an `artifact_ref` —
+  providers own their payload schemas while the VFS handles lifecycle and
+  freshness uniformly
+- **SearchProvider protocol change**: `search()` accepts a `SearchRequest`
+  bundling query, scope, search type, permission-pruned `search_metas`,
+  a `read_content` callback, and `SearchLimits` — providers own the full
+  pipeline, VFS owns blob access and permission enforcement
 - **Search scope limiting**: `search_brute_force_limit` config, CWD-expanding
   heuristic for brute-force fallback paths, `SearchResponse` metadata
   (`scope_narrowed`, `actual_scope`, `total_files_in_scope`)
 - **Search error degradation**: index problems degrade to brute-force, never fail
 - **Coarse/fine filter pattern**: architectural pattern for search optimization —
   index narrows candidates, content verification confirms matches
+- **`FindSearch` predicate expansion**: extend find from Phase 1's name-only
+  matching to support size ranges, modification times, and content type via
+  a typed `find_predicates` field on `SearchRequest`
+- **`TierBasedRetention`**: library-side evaluator (`GarbageCollector`) for the
+  time-based `RetentionPolicy.tiers` field; metadata store gains
+  `iter_versions_for_gc` as a coarse enumerator so tier semantics stay
+  canonical and adapters stay agnostic
 - **URI resolver extensions**: register `postgresql://`, `mongodb://`, `s3://`
   schemes in the VFS store resolver
 
@@ -54,10 +69,13 @@ error handling, and storage cost analysis.
    leverage native document structure for search_meta
 3. Implement S3 blob adapter — straightforward key-value mapping;
    content-hash as S3 key, prefix structure optional (S3 handles flat namespaces well)
-4. Implement bloom search provider — register capabilities, index method returns
-   bloom hashes, search method pre-filters candidates before content verification
-5. Implement semantic search provider — index method computes embeddings,
-   search method ranks by cosine similarity
+4. Implement bloom search provider — register capabilities, `index` returns a
+   `SearchArtifact` wrapping the bloom hashes; `search` consumes a
+   `SearchRequest`, pre-filters candidates from `search_metas`, then calls
+   `read_content` for content verification
+5. Implement semantic search provider — `index` returns a `SearchArtifact`
+   carrying the embedding vector (inline) or an `artifact_ref` to a vector
+   store; `search` ranks candidates by cosine similarity
 6. Extend URI resolver with new scheme mappings
 7. Integration tests for each adapter against real services (Docker Compose test fixtures)
 

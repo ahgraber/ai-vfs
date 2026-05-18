@@ -8,16 +8,19 @@ from vfs.models import SearchType
 
 
 async def _setup(vfs):
+    """Bootstrap an admin + agent. Returns (namespace, agent_principal, admin_principal)."""
     ns = await vfs.create_namespace("test-ws", "admin")
+    admin = await vfs.create_principal("test-admin")
+    await vfs.bootstrap_admin(admin.id, ns.id)
     p = await vfs.create_principal("agent")
-    await vfs.grant(p.id, ns.id, "/", {"read", "write"})
-    return ns, p
+    await vfs.grant(admin.id, p.id, ns.id, "/", {"read", "write"})
+    return ns, p, admin
 
 
 class TestVFSSearch:
     @pytest.mark.asyncio
     async def test_glob_search(self, vfs_instance):
-        ns, p = await _setup(vfs_instance)
+        ns, p, admin = await _setup(vfs_instance)
         await vfs_instance.write(ns.id, "/src/a.py", b"x", principal_id=p.id)
         await vfs_instance.write(ns.id, "/src/b.txt", b"x", principal_id=p.id)
         await vfs_instance.write(ns.id, "/src/c.py", b"x", principal_id=p.id)
@@ -27,7 +30,7 @@ class TestVFSSearch:
 
     @pytest.mark.asyncio
     async def test_find_search(self, vfs_instance):
-        ns, p = await _setup(vfs_instance)
+        ns, p, admin = await _setup(vfs_instance)
         await vfs_instance.write(ns.id, "/a.txt", b"x", principal_id=p.id)
         await vfs_instance.write(ns.id, "/sub/b.txt", b"x", principal_id=p.id)
         await vfs_instance.write(ns.id, "/c.py", b"x", principal_id=p.id)
@@ -37,7 +40,7 @@ class TestVFSSearch:
 
     @pytest.mark.asyncio
     async def test_regex_grep(self, vfs_instance):
-        ns, p = await _setup(vfs_instance)
+        ns, p, admin = await _setup(vfs_instance)
         content = b"line 1\nline 2\nline 3\nline 4\n# TODO: fix\nline 6\n"
         await vfs_instance.write(ns.id, "/src/main.py", content, principal_id=p.id)
         results = await vfs_instance.search(ns.id, "TODO", "/", SearchType.REGEX, principal_id=p.id)
@@ -46,11 +49,11 @@ class TestVFSSearch:
 
     @pytest.mark.asyncio
     async def test_search_scoped_to_permissions(self, vfs_instance):
-        ns, p = await _setup(vfs_instance)
+        ns, p, admin = await _setup(vfs_instance)
         await vfs_instance.write(ns.id, "/public/a.py", b"data", principal_id=p.id)
         await vfs_instance.write(ns.id, "/secret/b.py", b"data", principal_id=p.id)
         limited = await vfs_instance.create_principal("limited")
-        await vfs_instance.grant(limited.id, ns.id, "/public/", {"read"})
+        await vfs_instance.grant(admin.id, limited.id, ns.id, "/public/", {"read"})
         results = await vfs_instance.search(ns.id, "*.py", "/", SearchType.FIND, principal_id=limited.id)
         paths = {r.path for r in results}
         assert paths == {"/public/a.py"}
@@ -58,6 +61,6 @@ class TestVFSSearch:
     @pytest.mark.asyncio
     async def test_unknown_capability_rejected(self, vfs_instance):
         """Requesting a search type no provider supports raises ValueError."""
-        ns, p = await _setup(vfs_instance)
+        ns, p, admin = await _setup(vfs_instance)
         with pytest.raises(ValueError, match="semantic"):
             await vfs_instance.search(ns.id, "meaning of life", "/", SearchType.SEMANTIC, principal_id=p.id)
