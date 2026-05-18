@@ -17,16 +17,16 @@
 
 **Spec refs:** `file-operations/AbsolutePathsOnly`
 
-- [ ] Add tests:
+- [x] Add tests:
 
   - `test_relative_path_raises_valueerror`: call each VFS method (`read`, `write`, `delete`,
     `stat`, `list`) with a relative path → `ValueError` raised
   - `test_absolute_path_accepted`: call each method with an absolute path → no `ValueError`
     at the boundary (normal permission/not-found errors may follow)
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Add a `_require_absolute(path: str) -> None` helper in `vfs.py`:
+- [x] Add a `_require_absolute(path: str) -> None` helper in `vfs.py`:
 
   ```python
   def _require_absolute(path: str) -> None:
@@ -37,7 +37,7 @@
 Call at the top of each VFS method that accepts a `path` argument.
 For `copy` and `move`, guard both `src` and `dst`.
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): reject non-absolute paths at VFS boundary`
 
@@ -54,7 +54,7 @@ For `copy` and `move`, guard both `src` and `dst`.
 
 **Spec refs:** `session/RelativePathResolution`, `session/PathTraversalPrevention`
 
-- [ ] Write `tests/unit/test_session.py` — `resolve_path` tests:
+- [x] Write `tests/unit/test_session.py` — `resolve_path` tests:
 
   - `test_absolute_path_unchanged`: `resolve_path("/src/", "/data/file.txt")` → `"/data/file.txt"`
   - `test_relative_path_joined`: `resolve_path("/src/", "utils.py")` → `"/src/utils.py"`
@@ -64,9 +64,9 @@ For `copy` and `move`, guard both `src` and `dst`.
   - `test_deep_traversal_clamped`: `resolve_path("/workspace/", "../../../../etc/passwd")` → `"/etc/passwd"`
   - `test_double_slash_normalized`: `resolve_path("/src//", "file.py")` → `"/src/file.py"`
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `resolve_path` in `src/vfs/session.py`:
+- [x] Implement `resolve_path` in `src/vfs/session.py`:
 
   ```python
   import posixpath
@@ -80,7 +80,7 @@ For `copy` and `move`, guard both `src` and `dst`.
       return posixpath.normpath(joined)
   ```
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): add resolve_path utility with POSIX normalization`
 
@@ -97,7 +97,7 @@ For `copy` and `move`, guard both `src` and `dst`.
 
 **Spec refs:** `session/CWDState`, `session/CdOperation`, `session/PwdOperation`
 
-- [ ] Add tests:
+- [x] Add tests:
 
   - `test_default_cwd`: `Session(vfs, ns, principal)` → `pwd()` returns `"/"`
   - `test_pwd_returns_cwd`: after `cd("/workspace/")` → `pwd()` returns `"/workspace/"`
@@ -110,9 +110,9 @@ For `copy` and `move`, guard both `src` and `dst`.
   - `test_cd_updates_only_on_success`: ensure atomicity — `cwd` is not mutated before
     the permission check resolves
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement `Session` in `src/vfs/session.py`:
+- [x] Implement `Session` in `src/vfs/session.py`:
 
   ```python
   class Session:
@@ -135,7 +135,7 @@ For `copy` and `move`, guard both `src` and `dst`.
 Note: `_check_perm` is the internal permission helper already present in `VFS`.
 If it is not exposed, call `vfs.stat(namespace_id, resolved, principal_id)` as a proxy (stat requires read permission and is a lightweight metadata-only call).
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): add Session with CWD state, cd, and pwd`
 
@@ -150,7 +150,7 @@ If it is not exposed, call `vfs.stat(namespace_id, resolved, principal_id)` as a
 
 **Spec refs:** `session/SessionProxiesVFS`
 
-- [ ] Write `tests/integration/test_session_operations.py` using a real VFS fixture:
+- [x] Write `tests/integration/test_session_operations.py` using a real VFS fixture:
 
   - `test_session_read_relative`: write file at `/workspace/file.txt`; session with
     `cwd="/workspace/"` reads `"file.txt"` → correct content returned
@@ -166,9 +166,9 @@ If it is not exposed, call `vfs.stat(namespace_id, resolved, principal_id)` as a
   - `test_session_versions_relative`: versions of `"file.txt"` → versions of `/workspace/file.txt`
   - `test_session_rollback_relative`: rollback `"file.txt"` to version 1 → rolls back correct path
 
-- [ ] Run tests — confirm they fail
+- [x] Run tests — confirm they fail
 
-- [ ] Implement proxy methods on `Session`:
+- [x] Implement proxy methods on `Session`:
 
   ```python
   async def read(self, path: str, *, version_number: int | None = None) -> bytes:
@@ -190,7 +190,7 @@ If it is not exposed, call `vfs.stat(namespace_id, resolved, principal_id)` as a
   # ... stat, delete, list, search, versions, rollback, copy, move — same pattern
   ```
 
-- [ ] Run tests — confirm they pass
+- [x] Run tests — confirm they pass
 
 - [ ] Commit: `feat(vfs): add Session proxy methods for all VFS operations`
 
@@ -204,14 +204,14 @@ If it is not exposed, call `vfs.stat(namespace_id, resolved, principal_id)` as a
 
 **Spec refs:** n/a (API hygiene)
 
-- [ ] Add `Session` and `resolve_path` to `__init__.py` exports
+- [x] Add `Session` and `resolve_path` to `__init__.py` exports
 - [ ] Commit: `feat(vfs): export Session from public API`
 
 ---
 
 ## Final: Coverage check
 
-- [ ] Run full suite: `uv run pytest tests/`
-- [ ] Verify each scenario in `session/spec.md` has a passing test
-- [ ] Verify `file-operations/AbsolutePathsOnly` scenarios are covered
+- [x] Run full suite: `uv run pytest tests/`
+- [x] Verify each scenario in `session/spec.md` has a passing test
+- [x] Verify `file-operations/AbsolutePathsOnly` scenarios are covered
 - [ ] Commit: `chore(vfs): shell-context complete — all tests passing`

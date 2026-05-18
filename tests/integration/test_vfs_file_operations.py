@@ -566,3 +566,79 @@ class TestImmutableVersionHistory:
         v1_after = await vfs_instance._meta.get_version(ns.id, "/a.py", version_number=1)
         for field, value in snapshot.items():
             assert getattr(v1_after, field) == value, f"v1 {field} mutated"
+
+
+class TestAbsolutePathsOnly:
+    """AbsolutePathsOnly — VFS rejects any non-absolute path argument with ValueError."""
+
+    @pytest.mark.asyncio
+    async def test_relative_path_raises_valueerror(self, vfs_instance):
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+        # Seed an absolute file so destination/source-style checks can target it.
+        await vfs_instance.write(ns.id, "/seed.txt", b"x", principal_id=p.id)
+
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.stat(ns.id, "relative/path", principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.list(ns.id, "relative/", principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.read(ns.id, "relative/path", principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.write(ns.id, "relative/path", b"data", principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.delete(ns.id, "relative/path", principal_id=p.id)
+        # copy/move: both src and dst must be absolute
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.copy(ns.id, "relative/src", "/dst", principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.copy(ns.id, "/seed.txt", "relative/dst", principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.move(ns.id, "relative/src", "/dst", principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.move(ns.id, "/seed.txt", "relative/dst", principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.versions(ns.id, "relative/path", principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.rollback(ns.id, "relative/path", 1, principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            from vfs.models import SearchType
+
+            await vfs_instance.search(ns.id, "q", "relative/", SearchType.GLOB, principal_id=p.id)
+        with pytest.raises(ValueError, match="absolute"):
+            await vfs_instance.reindex(ns.id, scope="relative/")
+
+    @pytest.mark.asyncio
+    async def test_absolute_path_accepted(self, vfs_instance):
+        """Absolute paths must pass the boundary; downstream errors are unrelated."""
+        from vfs.errors import NotFoundError
+
+        ns, p, _ = await _setup_ns_principal(vfs_instance)
+
+        # Seed a real file for read/stat/versions/rollback to exercise non-trivial paths.
+        await vfs_instance.write(ns.id, "/seed.txt", b"data", principal_id=p.id)
+
+        # write — absolute path must not raise ValueError at boundary
+        await vfs_instance.write(ns.id, "/abs.txt", b"x", principal_id=p.id)
+        # stat / read on existing file
+        await vfs_instance.stat(ns.id, "/seed.txt", principal_id=p.id)
+        await vfs_instance.read(ns.id, "/seed.txt", principal_id=p.id)
+        # list — absolute prefix accepted
+        await vfs_instance.list(ns.id, "/", principal_id=p.id)
+        # delete on existing
+        await vfs_instance.delete(ns.id, "/abs.txt", principal_id=p.id)
+        # copy with both absolute
+        await vfs_instance.copy(ns.id, "/seed.txt", "/copy.txt", principal_id=p.id)
+        # move with both absolute
+        await vfs_instance.move(ns.id, "/copy.txt", "/moved.txt", principal_id=p.id)
+        # versions / rollback
+        await vfs_instance.versions(ns.id, "/seed.txt", principal_id=p.id)
+        await vfs_instance.rollback(ns.id, "/seed.txt", 1, principal_id=p.id)
+        # search / reindex — absolute scope accepted
+        from vfs.models import SearchType
+
+        await vfs_instance.search(ns.id, "*", "/", SearchType.GLOB, principal_id=p.id)
+        await vfs_instance.reindex(ns.id, scope="/")
+
+        # Absolute path to a missing file: NotFoundError, not ValueError
+        with pytest.raises(NotFoundError):
+            await vfs_instance.stat(ns.id, "/does/not/exist", principal_id=p.id)

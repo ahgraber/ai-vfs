@@ -1,8 +1,6 @@
-# Session Specification (Delta)
+# Session — Spec
 
-**Change:** `shell-context` **Date:** 2026-04-04
-
-## ADDED
+## Requirements
 
 ### Requirement: CWDState
 
@@ -121,10 +119,21 @@ through `cwd` before delegating to the underlying VFS instance.
 - **WHEN** a principal calls `session.copy("a.py", "../archive/a.py")`
 - **THEN** the VFS receives `copy("/workspace/a.py", "/archive/a.py")`
 
+### Requirement: PublicApiSurface
+
+The package SHALL expose `Session` and `resolve_path` as top-level imports from `vfs` so callers can construct a session without reaching into submodules.
+
+#### Scenario: TopLevelImport
+
+- **GIVEN** the `vfs` package is installed
+- **WHEN** a caller executes `from vfs import Session, resolve_path`
+- **THEN** the import succeeds and both names are present in `vfs.__all__`
+
 ## Technical Notes
 
-- **Resolution algorithm**: `posixpath.join(cwd, input_path)` → `posixpath.normpath(result)`
+- **Resolution algorithm**: `posixpath.join(cwd, input_path)` → `posixpath.normpath(result)`, with the input's trailing `/` preserved when present (so directory-style arguments reach the VFS as directory prefixes)
 - **Ephemeral state**: `cwd` is in-memory only; resets to `"/"` on Session construction
 - **No directory existence check on `cd`**: VFS directories are implicit (path prefixes);
   permission check alone gates `cd`
+- **`cd` directory-prefix normalization**: `cd` appends a trailing `/` to the resolved target (except for root `/`) so the stored `cwd` matches the conventional shape of permission `path_prefix` values
 - **Dependencies**: file-operations (VFS operations), access-control (permission check in `cd`)
