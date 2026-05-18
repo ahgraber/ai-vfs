@@ -111,3 +111,82 @@ class TestGarbageCollector:
         rows = await meta._execute_fetchall("SELECT operation FROM audit_events")
         ops = [r[0] for r in rows]
         assert "gc_run" in ops
+
+    @pytest.mark.asyncio
+    async def test_gc_run_sets_process_title(self, tmp_path, monkeypatch):
+        """ProcessIdentification (design D11): GarbageCollector.run sets the process title."""
+        import setproctitle
+
+        captured: list[str] = []
+        monkeypatch.setattr(setproctitle, "setproctitle", lambda t: captured.append(t))
+        meta, blob = await _make_stores(tmp_path)
+        config = VFSConfig(retention_max_recent=50, audit_log_enabled=False)
+        gc = GarbageCollector(meta, blob, config)
+        await gc.run()
+        assert "ai-vfs: gc" in captured
+
+    @pytest.mark.asyncio
+    async def test_audit_log_survives_gc(self, tmp_path):
+        """AuditLogAppendOnly: GC reclaims versions/blobs but MUST NOT touch audit_events."""
+        from datetime import datetime, timezone
+
+        from ulid import ULID
+
+        from vfs.models import AuditEvent
+
+        meta, blob = await _make_stores(tmp_path)
+        config = VFSConfig(retention_max_recent=1, audit_log_enabled=False)
+        # Seed an audit event for an unrelated prior operation.
+        seeded = AuditEvent(
+            event_id=str(ULID()),
+            timestamp=datetime.now(timezone.utc),
+            namespace_id="ns1",
+            principal_id="p1",
+            operation="write",
+            path="/a.py",
+        )
+        await meta.append_audit_event(seeded)
+        # Populate enough versions to trigger reclamation.
+        for i in range(1, 5):
+            v = _version("ns1", "/a.py", i, f"h{i}")
+            ev = None if i == 1 else i - 1
+            await meta.put_version(v, expected_version=ev)
+        # Drop an orphaned blob.
+        await blob.put("orphan_hash_xxxxxxxxxxxxxxxxxxxxx", b"orphan")
+
+        before = await meta._execute_fetchall("SELECT event_id FROM audit_events")
+        before_ids = sorted(r[0] for r in before)
+        assert seeded.event_id in before_ids
+
+        gc = GarbageCollector(meta, blob, config)
+        await gc.run("ns1")
+
+        after = await meta._execute_fetchall("SELECT event_id FROM audit_events")
+        after_ids = sorted(r[0] for r in after)
+        # Seeded audit row MUST survive; GC adds no audit rows when audit_log_enabled=False.
+        assert seeded.event_id in after_ids
+        assert after_ids == before_ids
+
+    @pytest.mark.asyncio
+    async def test_gc_cross_namespace_blob_preservation(self, tmp_path):
+        """VersionGarbageCollection / GCPreservesSharedBlobs:
+        a content_hash referenced by a version in ns2 SHALL NOT be deleted when GC runs on ns1.
+        """
+        meta, blob = await _make_stores(tmp_path)
+        config = VFSConfig(retention_max_recent=1, audit_log_enabled=False)
+        shared_hash = "shared_hash_xxxxxxxxxxxxxxxxxxxxxxxx"
+        await blob.put(shared_hash, b"shared content")
+        # ns1: 3 versions of /a.py with the shared content; older ones become reclaimable.
+        for i in range(1, 4):
+            v = _version("ns1", "/a.py", i, shared_hash)
+            ev = None if i == 1 else i - 1
+            await meta.put_version(v, expected_version=ev)
+        # ns2: a single version pointing at the same hash — this reference must keep the blob alive.
+        v_other = _version("ns2", "/b.py", 1, shared_hash)
+        await meta.put_version(v_other, expected_version=None)
+
+        gc = GarbageCollector(meta, blob, config)
+        result = await gc.run("ns1")
+        # Some ns1 versions reclaimed, but blob retained because ns2 still references it.
+        assert result.versions_reclaimed >= 1
+        assert await blob.exists(shared_hash), "shared blob deleted despite cross-namespace ref"

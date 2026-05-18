@@ -20,7 +20,7 @@ See `.specs/ai-vfs-bloom-provider-design.md` Section 3 for implementation detail
 - **GIVEN** a bloom search provider is active
 - **WHEN** a file is written
 - **THEN** bloom filter hashes, next_masks, and loc_masks are computed and stored
-  in `search_meta.bloom` with a schema version and normalizer_id
+  in a standard `SearchArtifact` envelope at a bloom provider key
 
 #### Scenario: BloomAcceleratedGrep
 
@@ -30,14 +30,14 @@ See `.specs/ai-vfs-bloom-provider-design.md` Section 3 for implementation detail
 
 #### Scenario: UnindexedFilesAreConservativeCandidates
 
-- **GIVEN** some files in scope lack a `"bloom"` key in search_meta
+- **GIVEN** some files in scope lack the active bloom provider key in search_meta
 - **WHEN** a bloom-accelerated search is performed
 - **THEN** unindexed files are included as candidates (conservative — no false negatives)
 
 #### Scenario: NormalizerDriftDegradation
 
-- **GIVEN** a file's bloom index was built with normalizer_id="v1"
-- **WHEN** the active provider uses normalizer_id="v2"
+- **GIVEN** a file's bloom artifact was built with params_hash for normalizer_id="v1"
+- **WHEN** the active provider uses params_hash for normalizer_id="v2"
 - **THEN** the mismatched file is treated as unindexed (forwarded as candidate),
   a warning is logged, and the search completes without error
 
@@ -56,7 +56,7 @@ Content verification is always the final arbiter of match correctness.
 
 #### Scenario: CorruptIndexDegrades
 
-- **GIVEN** a file has a corrupt or unrecognizable bloom index in search_meta
+- **GIVEN** a file has a corrupt or unrecognizable bloom artifact payload in search_meta
 - **WHEN** a search includes that file in scope
 - **THEN** the file is treated as unindexed and included as a candidate;
   the search completes successfully
@@ -65,8 +65,8 @@ Content verification is always the final arbiter of match correctness.
 
 - **GIVEN** a file contains non-UTF-8 content
 - **WHEN** the bloom provider indexes the file on write
-- **THEN** an empty dict is returned (file is searchable but unindexed)
-  and a warning is logged
+- **THEN** a `failed` or `unsupported` `SearchArtifact` is returned, the file
+  remains searchable through brute force, and a warning is logged
 
 ### Requirement: SearchScopeLimiting
 
@@ -111,7 +111,8 @@ vectors on write and ranks results by cosine similarity on search.
 
 - **GIVEN** a semantic search provider is active
 - **WHEN** a file is written
-- **THEN** embedding vectors are computed and stored in search_meta.vector
+- **THEN** embedding vectors or vector references are computed and stored in a
+  standard `SearchArtifact` envelope at a semantic provider key
 
 #### Scenario: SemanticSearch
 
@@ -135,9 +136,9 @@ then content verification confirms matches.
 
 ### Requirement: SearchProviderProtocol
 
-The `SearchProvider.search()` method SHALL accept two additional parameters:
-`search_metas` (iterable of `(path, search_meta_dict)` pairs, already permission-pruned)
-and `read_content` (async callback to fetch file content by path).
+The `SearchProvider.search()` method SHALL accept a `SearchRequest` object.
+`SearchRequest` SHALL include the query, scope, search type, permission-pruned
+`search_metas`, a `read_content` async callback, and search limits.
 (Previously: `search()` accepted `candidates: list[FileMeta] | None`.)
 
 Providers that do not use indexes ignore the `search_metas` dict contents.
@@ -148,14 +149,14 @@ See `.specs/ai-vfs-bloom-provider-design.md` Section 2 for the updated protocol.
 #### Scenario: DefaultProviderBackwardCompatible
 
 - **GIVEN** the default provider (glob, find, regex)
-- **WHEN** search is called with the new signature
+- **WHEN** search is called with a `SearchRequest`
 - **THEN** the default provider ignores search_metas contents and calls
   read_content for every file (same brute-force behavior)
 
 #### Scenario: BloomProviderUsesSearchMetas
 
 - **GIVEN** a bloom provider
-- **WHEN** search is called with search_metas containing bloom indexes
+- **WHEN** search is called with a `SearchRequest` containing bloom indexes
 - **THEN** the provider deserializes bloom data, filters candidates,
   and only calls read_content for candidate files
 
@@ -172,11 +173,51 @@ The VFS SHALL dispatch search requests to the provider with the matching capabil
 
 ### Requirement: SearchMetadataExtensible
 
-The system SHALL store search artifacts per-version in an extensible dict field (JSONB in SQL, nested document in NoSQL).
-The core schema SHALL NOT prescribe the contents — each provider writes its own keys. (Previously: extensibility was defined but only empty-dict usage was demonstrated.)
+The system SHALL store search artifacts per-version in a standard manifest field (JSONB in SQL, nested document in NoSQL).
+The manifest SHALL map provider keys to `SearchArtifact` envelopes.
+The `SearchArtifact` envelope SHALL use common lifecycle and freshness fields, while each provider owns the artifact `payload` schema or `artifact_ref`. (Previously: extensibility was defined but only empty-dict usage was demonstrated.)
+
+### Requirement: FindSearchPredicates
+
+The system SHALL extend `FindSearch` to support predicate-based metadata search matching file name patterns, size ranges, modification times, and content type.
+(Previously, Phase 1 supported only name-pattern matching against the file basename.)
+
+The `SearchRequest` SHALL carry a `find_predicates` field — a typed predicate object whose fields are independently optional and combined conjunctively when multiple are supplied (e.g., name pattern AND size range).
+The `type` predicate distinguishes between live files and tombstones; richer typing (mime / content classification) is out of scope.
+
+#### Scenario: FindByNamePatternUnchanged
+
+- **GIVEN** the existing Phase 1 name-pattern behavior
+- **WHEN** a principal calls find with only a name predicate
+- **THEN** the result set matches the Phase 1 `FindByNamePattern` scenario (backward compatible)
+
+#### Scenario: FindBySizeRange
+
+- **GIVEN** files with sizes 100, 5_000, and 50_000 bytes
+- **WHEN** a principal calls find with `size_min=1_000` and `size_max=10_000`
+- **THEN** only the 5_000-byte file is returned
+
+#### Scenario: FindByModifiedTime
+
+- **GIVEN** files written at t-2h, t-1d, and t-30d (where t is the current time)
+- **WHEN** a principal calls find with `mtime_after = t-24h`
+- **THEN** only the t-2h file is returned
+
+#### Scenario: FindByType
+
+- **GIVEN** an existing live file and a tombstoned file at the same path history
+- **WHEN** a principal calls find with `type="file"`
+- **THEN** only the live file is returned; the tombstone is excluded
+
+#### Scenario: FindConjunctivePredicates
+
+- **GIVEN** files /src/a.py (small, recent), /src/b.py (large, old), /data/c.txt (small, recent)
+- **WHEN** a principal calls find with `name="*.py"` AND `size_max=10_000`
+- **THEN** only /src/a.py is returned
 
 #### Scenario: MultipleProviderArtifacts
 
 - **GIVEN** bloom and semantic providers are both active
 - **WHEN** a file is written
-- **THEN** search_meta contains both {"bloom": ..., "vector": ...}
+- **THEN** search_meta contains provider-keyed `SearchArtifact` entries for
+  both providers

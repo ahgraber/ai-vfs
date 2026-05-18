@@ -69,7 +69,9 @@
     `created_by: str`, `retention_policy: RetentionPolicy | None = None`
   - `Principal`: `id: str`, `display_name: str`, `principal_type: str`, `created_at: datetime`
   - ID generation rule (design D12): use `str(uuid.uuid4())` for person-related entities or any entity where leaking creation time (concrete or relative) could be exploitable; use `str(ULID())` for everything else.
-    For current entities: `Principal.id` → UUID4, all others → ULID.
+    For current entities: `Principal.id` → UUID4, all other entity IDs → ULID.
+    Foreign keys that reference principals (`VersionMeta.created_by`, `Permission.principal_id`, `AuditEvent.principal_id`, `Namespace.created_by`) store the referenced principal's UUID4 — not a ULID — even though the referencing record itself has a ULID.
+    The column type stays `str` either way.
 
 - [x] Run tests — confirm they pass
 
@@ -441,7 +443,9 @@
   - `test_append_audit_event`: event is persisted; second append adds a second row
   - `test_audit_not_updatable`: no `update_audit_event` method on the store (audit-only)
   - `test_update_search_meta`: put version, update `search_meta`, fetch version → meta matches
-  - `test_set_and_resolve_name`: `set_name` then `resolve_name` → same ULID string
+  - `test_set_and_resolve_name`: `set_name` then `resolve_name` → same ID string
+    (ULID for namespaces, UUID4 for principals — `set_name`/`resolve_name` are
+    entity-type agnostic; cover at least one of each)
   - `test_resolve_name_missing`: `resolve_name` unknown name → `None`
   - `test_list_reclaimable_versions`: create file with 3 versions, policy `max_recent=1`
     → 2 older versions returned
@@ -1036,3 +1040,175 @@
   passing test covering each scenario in: file-operations, versioning, access-control,
   storage, observability, search
 - [x] Commit: `chore(vfs): phase1 complete — all tests passing`
+
+---
+
+## Group 7: Verify-driven revisions (post-implementation)
+
+These tasks resolve findings from `sdd-verify` (see `.verify/test-output.log` and the verify report).
+They follow spec edits applied to phase1-core (HumanFriendlyNames, FindSearch, PluggableSearchProviders, RetentionPolicy) and new design decisions D15 (`bootstrap_admin`) and D16 (span `principal_id`).
+
+### Task 23: Wire `grant()` admin gate, add `bootstrap_admin`, audit permission changes
+
+**Files:**
+
+- Modify: `src/vfs/vfs.py` (grant signature, bootstrap_admin, audit hookup)
+- Modify: `tests/integration/test_vfs_access_control.py`
+- Modify: `tests/integration/test_vfs_file_operations.py`, `test_vfs_versioning.py`,
+  `test_vfs_search.py` (existing `vfs.grant(...)` calls gain a `granter_id` arg)
+
+**Spec refs:** `access-control/PermissionGranting`, `observability/AuditLogStateChanges`, design D15
+
+- [x] Update `VFS.grant(...)` signature: insert `granter_id: str` as first positional; rename existing `principal_id` to `target_principal_id`.
+  Add admin check: `await self._meta.check_permission(granter_id, namespace_id, path_prefix, "admin")` → raise `PermissionDeniedError` if false
+- [x] Add `VFS.bootstrap_admin(principal_id, namespace_id)`: query permissions for any
+  existing admin in the namespace; raise `PermissionDeniedError("bootstrap consumed")`
+  if any exist; otherwise write `Permission(operations={"admin"}, path_prefix="/", ...)`
+  and call `audit_permission_change` with `operation="bootstrap_admin"`
+- [x] Add `audit_permission_change` call to `grant()` after the `set_permission` write
+- [x] Add tests in `test_vfs_access_control.py`:
+  - `test_non_admin_cannot_grant`: principal with read+write (no admin) on `/workspace/`
+    calls grant → `PermissionDeniedError`; permissions table unchanged
+  - `test_admin_can_grant`: admin on `/` grants read+write on `/workspace/` to another
+    principal → that principal can write under `/workspace/`
+  - `test_bootstrap_admin_creates_first_admin`: fresh namespace; `bootstrap_admin(p)`
+    → `p` has admin on `/`; can subsequently `grant(granter_id=p.id, ...)`
+  - `test_bootstrap_admin_rejected_when_admin_exists`: second `bootstrap_admin` call
+    on the same namespace → `PermissionDeniedError`
+  - `test_grant_creates_audit_event`: `grant` writes an `AuditEvent`
+    with `operation="permission_change"` to the audit log
+  - `test_bootstrap_admin_creates_audit_event`: audit row with
+    `operation="bootstrap_admin"`
+- [x] Update every existing `vfs.grant(...)` call in tests to use the new signature
+  (insert a bootstrapped admin as `granter_id`)
+- [x] Run tests — confirm they pass
+- [ ] Commit: `feat(vfs): gate grant() with admin check; add bootstrap_admin; audit permission changes`
+
+---
+
+### Task 24: Add `vfs.principal_id` span attribute at all 10 VFS write-sites
+
+**Files:**
+
+- Modify: `src/vfs/vfs.py` (10 `vfs_span(...)` call sites)
+- Modify: `tests/unit/test_observability.py` (per-site attribute coverage)
+
+**Spec refs:** `observability/OTelSpansOnAllOperations`, design D16
+
+- [x] At each `vfs_span(operation, attrs, ...)` call site, add `"vfs.principal_id": principal_id`
+  to the attrs dict — sites: stat, list, write, read, delete, copy, move, versions, rollback, search
+- [x] Add `test_span_attributes_include_principal_id_*` for each of the 10 operations
+  in `test_observability.py` (or as a parametrized test) — mocks the tracer and asserts
+  `principal_id` appears in span attributes
+- [x] Run tests — confirm they pass
+- [ ] Commit: `feat(vfs): add principal_id to OTel span attributes at all VFS write-sites`
+
+---
+
+### Task 25: Add `search_candidate_count` metric
+
+**Files:**
+
+- Modify: `src/vfs/observability/tracing.py` (new histogram + helper)
+- Modify: `src/vfs/vfs.py` (record after candidate-build in `search()`)
+- Modify: `tests/unit/test_observability.py`
+
+**Spec refs:** `observability/OTelMetrics`
+
+- [x] Add `search_candidate_histogram = _meter.create_histogram("vfs.search.candidates", unit="1")`
+  in `tracing.py` and `record_search_candidates(count: int, attrs: dict, *, otel_enabled: bool)` helper
+- [x] In `VFS.search`, after `candidates = [...]` is built, call
+  `record_search_candidates(len(candidates), {"vfs.namespace": namespace_id}, otel_enabled=...)`
+- [x] Add `test_search_candidate_count_recorded` asserting the histogram is recorded
+- [ ] Commit: `feat(vfs): add search candidate count metric`
+
+---
+
+### Task 26: OTelContextPropagation parent-link test
+
+**Files:**
+
+- Modify: `tests/unit/test_observability.py`
+
+**Spec refs:** `observability/OTelContextPropagation`
+
+- [x] Add `test_vfs_span_links_to_parent_span`: create a parent span via
+  `_tracer.start_as_current_span("parent")`; inside it call `vfs_span(...)`;
+  capture spans (use an in-memory `InMemorySpanExporter` from `opentelemetry.sdk.trace.export`);
+  assert the vfs span's `parent_span_id == parent.get_span_context().span_id`
+- [ ] Commit: `test(vfs): verify OTel context propagation links vfs spans to parent`
+
+---
+
+### Task 27: Close remaining CRITICAL test gaps
+
+**Files:**
+
+- Modify: tests under `tests/unit/` and `tests/integration/`
+
+- [x] `test_versions_permission_denied` in `test_vfs_versioning.py` —
+  principal with no permissions calls `versions()` → `PermissionDeniedError`
+
+- [x] `test_copy_cas_success` and `test_copy_cas_conflict` in
+  `test_vfs_file_operations.py` — exercise the copy `expected_version` branch
+
+- [x] `test_cached_blob_put_idempotent` in `test_cached_blob.py` —
+  `cached_store.put(hash, data)` twice; inner is called once (or check no-op semantic)
+
+- [x] `test_initialize_sets_process_title` and `test_gc_run_sets_process_title`
+  using `monkeypatch.setattr("setproctitle.setproctitle", capture_fn)` and asserting
+  the captured value matches `"ai-vfs: service"` / `"ai-vfs: gc"`
+
+- [x] `test_reindex_backfills_search_meta` in `test_vfs_versioning.py` or new
+  `test_vfs_reindex.py` — register a mock provider that returns `{"k": "v"}`,
+  call `vfs.reindex(...)`, assert `search_meta` is populated for files in scope
+
+- [x] `test_admin_permission_storable` in `test_vfs_access_control.py` —
+  grant `{admin}` to a principal; query permissions; admin is in the set;
+  the principal can then call `grant(...)` (covers `OperationGranularity` admin path)
+
+- [ ] Commit: `test(vfs): close CRITICAL gaps from verify (versions perms, copy CAS, cached blob idempotency, proc title, reindex, admin op)`
+
+---
+
+### Task 28: Close WARNING test gaps
+
+**Files:**
+
+- Modify: tests under `tests/unit/` and `tests/integration/`
+
+- [x] `test_audit_log_survives_gc` — write a few audits, run version+blob GC,
+  assert audit rows are unchanged (count + content)
+
+- [x] `test_write_dedup_single_blob` — write identical content under two paths,
+  assert `blob_store.list_hashes()` yields one hash (proves DeduplicatedWrite at VFS layer)
+
+- [x] `test_stat_does_not_fetch_blob` and `test_list_does_not_fetch_blob` —
+  wrap blob_store with a spy; call stat/list; assert spy never called (LazyContentResolution)
+
+- [x] `test_write_cas_success_at_vfs` — write twice with `expected_version=1` on the
+  second call → new version 2 (VFS-level happy path complement to existing conflict test)
+
+- [x] `test_namespace_id_is_ulid_format` + `test_version_id_is_ulid_format` —
+  assert `len(ns.id) == 26` and `len(ver.id) == 26` (ULID base32 string)
+
+- [x] `test_cached_blob_list_hashes` — `CachedBlobStore.list_hashes()` delegates to inner
+
+- [x] `test_write_does_not_mutate_prior_version` — write v1; capture all fields; write v2;
+  re-fetch v1; assert all immutable fields are byte-identical
+
+- [x] `test_rollback_sets_parent_version_id` — rollback to v1; new version's
+  `parent_version_id == v1.id`
+
+- [x] `test_gc_cross_namespace_blob_preservation` — two files in different namespaces
+  share a content_hash; GC one namespace's old version; blob still exists
+
+- [ ] Commit: `test(vfs): close WARNING gaps from verify (audit/GC isolation, dedup count, lazy I/O, CAS happy, ULID format, immutability, rollback link, x-ns GC)`
+
+---
+
+### Task 29: Re-run `sdd-verify`
+
+- [x] Re-run `sdd-verify` per the verify skill workflow
+- [x] Confirm zero CRITICAL findings remain
+- [ ] Commit: `chore(vfs): close phase1 verify findings; ready to sync`

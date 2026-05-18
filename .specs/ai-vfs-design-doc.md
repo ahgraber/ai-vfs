@@ -15,7 +15,7 @@ It separates file content (stored in S3-compatible blob storage) from file metad
 - **Pluggable storage**: S3-compatible blobs + SQL or NoSQL metadata adapters
 - **Per-file versioning** with undo/rollback and Time Machine-style retention
 - **Path-based access control** with invisible pruning (default-deny)
-- **Sandboxed execution** via pluggable providers ([Bashkit](https://github.com/everruns/bashkit), [Monty](https://github.com/pydantic/monty) initially)
+- **Sandboxed execution** via [Monty](https://github.com/pydantic/monty) initially, with [Bashkit](https://github.com/everruns/bashkit) as a future shell provider and [just-bash](https://github.com/vercel-labs/just-bash) as a tertiary JS/TS integration
 - **Self-hostable** with sensible local defaults (SQLite + local filesystem)
 
 ### Non-Goals (for this spec)
@@ -34,8 +34,23 @@ It separates file content (stored in S3-compatible blob storage) from file metad
 | Concurrency        | Optimistic (CAS via version stamps)                                        | No locks, no coordination layer; borrowed from [turbopuffer's S3 pattern](https://turbopuffer.com/blog/turbopuffer) |
 | Identifiers        | ULIDs (file/metadata entities) + UUID4 (person-related entities)           | ULID for temporal sortability in logs; UUID4 for principals to avoid leaking creation-time ordering                 |
 | Metadata adapter   | Abstract protocol (~10 methods)                                            | Supports SQL (SQLite, Postgres) and NoSQL (Mongo, Cosmos) without ORM coupling                                      |
-| Execution          | Pluggable provider protocol                                                | Start with Bashkit + Monty; expand to Eryx, E2B without core changes                                                |
+| Execution          | Pluggable provider protocol                                                | Start with Monty external functions; add Bashkit later, then evaluate just-bash for JS/TS environments              |
 | Config             | pydantic-settings                                                          | Validated, environment-aware, typed configuration                                                                   |
+
+### Prior Art Decision Map
+
+The appendix lists broader references.
+These are the prior-art links that directly shape ai-vfs decisions:
+
+| Decision surface           | Prior art                                                                                | Effect on ai-vfs                                                                                                    |
+| -------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| VFS boundary               | LangChain Deep Agents backends, AGFS, fsspec                                             | Keep a small native VFS contract and defer fsspec to an adapter rather than making fsspec the domain model          |
+| Access pruning             | Mintlify ChromaFS, Leonie Monigatti's Elasticsearch VFS                                  | Enforce permissions before listing, search, and result rendering so unauthorized paths are invisible                |
+| Search acceleration        | Mintlify ChromaFS, Cursor fast regex search                                              | Use coarse-provider filtering plus content verification; indexes improve speed but never become the correctness API |
+| Search artifact lifecycle  | Cursor-style local indexes, vector-backend patterns from agent filesystem writing        | Store provider artifacts behind a standard `SearchArtifact` envelope while leaving payloads provider-defined        |
+| Execution interface        | Cloudflare Code Mode, Anthropic code execution with MCP, Monty, Bashkit, just-bash       | Prefer code-mode orchestration over many tiny tools; expose curated VFS operations first, then shell syntax later   |
+| Token-efficient editing    | Anthropic MCP filesystem organization, Dirac hash anchors with Myers diff reconciliation | Return compact, anchored read output and edit by anchors so large changes do not repeat unchanged text              |
+| Persistent agent workspace | AIGNE, "Agent OS is a Filesystem", managed-agent persistence patterns                    | Treat files, versions, search artifacts, and execution state as persistent agent context rather than transient logs |
 
 ---
 
@@ -53,7 +68,7 @@ Namespace:
   id: ULID
   display_name: str               # human-friendly, looked up via names table
   created_at: datetime
-  created_by: ULID                # principal
+  created_by: UUID4               # principal
   retention_policy: RetentionPolicy | None   # override global default
 ```
 
@@ -81,9 +96,9 @@ Version:
   content_hash: str               # BLAKE3 → blob store key
   size: int                       # bytes
   created_at: datetime
-  created_by: ULID                # principal
+  created_by: UUID4               # principal
   is_tombstone: bool              # true for deletes
-  search_meta: dict               # extensible search artifacts (bloom hashes, vectors, etc.)
+  search_meta: SearchMeta         # derived artifact manifest; provider_key → SearchArtifact
   parent_version_id: ULID | None  # for rollbacks, points to the version this was rolled back from
 ```
 
@@ -106,6 +121,9 @@ Name:
   entity_id: str                  # ULID for file-system entities; UUID4 for principals
   display_name: str
 ```
+
+Identifier fields use the identifier type of the entity they point to.
+For example, `Permission.id` is a ULID because the permission record is internal metadata, while `Permission.principal_id` is a UUID4 because it references a principal.
 
 ### 2.2 Operations
 
@@ -153,20 +171,20 @@ Name:
 | Store| Store  | Provider  | Provider         |
 | Proto| Proto  | Protocol  | Protocol         |
 +------+--------+-----------+------------------+
-|SQLite| S3     | Glob/Grep | Bashkit          |
-|Postgr| MinIO  | Bloom     | Monty            |
+|SQLite| S3     | Glob/Grep | Monty            |
+|Postgr| MinIO  | Bloom     | Bashkit          |
 |Mongo | Azure  | Semantic  | Eryx             |
 |      | LocalFS| (plugin)  | (plugin)         |
 +------+--------+-----------+------------------+
 ```
 
 Between the Execution Provider and the VFS Layer sits the **Shell Operations Layer** —
-thin wrappers that translate standard bash command signatures into VFS operations:
+thin wrappers that expose a curated set of bash-familiar functions over VFS operations:
 
 ```text
-Execution Provider (bashkit / Monty)
+Execution Provider (Monty initially; Bashkit later)
     |
-    |  sandbox calls: grep("-r", "pattern", "/workspace/")
+    |  sandbox calls: grep("pattern", "/workspace/", recursive=True)
     v
 Shell Operations Layer
     |  translates to: vfs.search(query="pattern", scope="/workspace/", type=regex)
@@ -194,18 +212,19 @@ class MetadataStore(Protocol):
     ) -> list[VersionMeta]: ...
 
     # Permissions
-    async def check_permission(self, principal_id: ULID, namespace_id: ULID, path: str, operation: str) -> bool: ...
+    async def check_permission(self, principal_id: UUID4, namespace_id: ULID, path: str, operation: str) -> bool: ...
     async def set_permission(self, permission: Permission) -> None: ...
 
     # Audit
     async def append_audit_event(self, event: AuditEvent) -> None: ...
 
     # Search metadata
-    async def update_search_meta(self, version_id: str, search_meta: dict) -> None: ...
+    async def get_search_meta_batch(self, version_ids: list[ULID]) -> dict[ULID, SearchMeta]: ...
+    async def update_search_artifact(self, version_id: ULID, provider_key: str, artifact: SearchArtifact) -> None: ...
 
     # Names
-    async def set_name(self, entity_type: str, entity_id: ULID, display_name: str) -> None: ...
-    async def resolve_name(self, entity_type: str, display_name: str) -> ULID | None: ...
+    async def set_name(self, entity_type: str, entity_id: str, display_name: str) -> None: ...
+    async def resolve_name(self, entity_type: str, display_name: str) -> str | None: ...
 
     # GC (namespace_id=None means scan all namespaces)
     async def list_reclaimable_versions(
@@ -249,9 +268,67 @@ Cache eviction is LRU with a configurable max size.
 ### 3.3 Search Provider Protocol
 
 ```python
+ProviderKey = str
+SearchMeta = dict[ProviderKey, "SearchArtifact"]
+
+
+@dataclass(frozen=True)
+class SearchArtifact:
+    status: Literal["ready", "failed", "unsupported"]
+    schema_version: int
+    provider_key: ProviderKey
+    provider_version: str | None
+    params_hash: str
+    content_hash: str
+    created_at: datetime
+
+    storage: Literal["inline", "blob", "external"]
+    payload: dict | None = None
+    artifact_ref: str | None = None
+
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class SearchMetaEntry:
+    path: str
+    file: FileMeta
+    version: VersionMeta
+    search_meta: SearchMeta
+
+
+ContentReader = Callable[[str], Awaitable[bytes]]
+
+
+@dataclass(frozen=True)
+class SearchLimits:
+    max_content_reads: int | None = None
+    cwd: str | None = None
+
+
+@dataclass(frozen=True)
+class SearchRequest:
+    query: str
+    scope: str
+    search_type: SearchType
+    search_metas: Iterable[SearchMetaEntry]
+    read_content: ContentReader
+    limits: SearchLimits
+
+
+@dataclass(frozen=True)
+class SearchResponse:
+    results: list[SearchResult]
+    scope_narrowed: bool = False
+    actual_scope: str | None = None
+    total_files_in_scope: int | None = None
+
+
 class SearchProvider(Protocol):
-    async def index(self, path: str, content: bytes, metadata: FileMeta) -> dict: ...
-    async def search(self, query: str, scope: str, search_type: SearchType) -> list[SearchResult]: ...
+    def provider_key(self) -> ProviderKey: ...
+    async def index(self, path: str, content: bytes, version: VersionMeta) -> SearchArtifact | None: ...
+    async def search(self, request: SearchRequest) -> SearchResponse: ...
     def capabilities(self) -> set[SearchType]: ...
 ```
 
@@ -261,13 +338,27 @@ Multiple providers can be active simultaneously.
 The VFS dispatches a search to the provider that declares the matching capability.
 If multiple providers match, the VFS uses the most specific (e.g., bloom-accelerated regex over brute-force regex).
 
+The VFS owns the safety boundary for every search request:
+
+- resolves the requested scope against the caller's namespace
+- filters to paths and current versions visible to the principal
+- builds permission-pruned `SearchMetaEntry` values
+- injects a `read_content` callback that enforces the same authorization,
+  version, timeout, and rate-limit checks
+- fills response metadata such as `scope_narrowed`, `actual_scope`, and
+  `total_files_in_scope`
+
+The provider owns the search strategy inside that envelope.
+A provider may ignore `search_meta` and brute-force through `read_content`, use `search_meta` as a coarse filter before verification, or rank metadata-only artifacts such as embeddings.
+
 `index()` is called synchronously during `write`.
-Returns a dict of search artifacts to store in the version's `search_meta` field.
+Returns a `SearchArtifact` to store at `search_meta[provider_key]`.
 For the default provider (glob/find only), this is a no-op.
+The `SearchArtifact` envelope is standard; its `payload` is provider-defined.
 
 **Dependency note:** Search providers do not access the metadata or blob stores directly.
-The VFS orchestrator queries `search_meta` from metadata, fetches blob content as needed, and passes both to the provider.
-Providers are pure functions over content and metadata — they have no storage dependencies.
+They receive VFS-scoped metadata entries and a controlled content reader.
+Providers are storage-independent and search has no direct side effects on VFS state.
 
 ### 3.4 Execution Provider Protocol
 
@@ -303,6 +394,7 @@ class FsOperations:
     glob: Callable[[str], list[str]]
     head: Callable[[str, int], bytes]
     tail: Callable[[str, int], bytes]
+    edit: Callable[..., dict]
 ```
 
 The VFS layer constructs `FsOperations` with permission-scoped callbacks bound to the calling principal and namespace.
@@ -317,26 +409,52 @@ class ResourceLimits:
 ```
 
 `max_operations` is VFS-level rate limiting.
-The execution provider enforces its own internal limits (Bashkit command count, Monty fuel, Eryx WASM fuel).
+The execution provider enforces its own internal limits (Monty memory/allocation/time, future Bashkit command/parser/filesystem limits, Eryx WASM fuel).
 
 ### 3.5 Shell Operations Layer
 
-Wrappers that translate standard bash command signatures into VFS operations.
-These are injected into the sandbox as the external functions the agent calls.
+Wrappers that expose a curated, bash-familiar function set over VFS operations.
+These are injected into Monty as explicit external functions.
+They are not a POSIX compatibility layer; Bashkit can provide real shell syntax later.
 
-| Wrapper                       | Bash equivalent                     | VFS dispatch                                              |
-| ----------------------------- | ----------------------------------- | --------------------------------------------------------- |
-| `grep(flags, pattern, paths)` | `grep -r "pattern" /path/`          | search provider (bloom/regex) or fallback to read + match |
-| `find(path, predicates)`      | `find /path -name "*.py" -size +1k` | metadata store queries                                    |
-| `glob(pattern)`               | `ls /path/*.py`                     | path-pattern match against metadata                       |
-| `cat(path)`                   | `cat /path/file`                    | `vfs.read(path)`                                          |
-| `ls(flags, path)`             | `ls -la /path/`                     | `vfs.list(path)` with formatting                          |
-| `head(path, n)`               | `head -n 10 /path/file`             | `vfs.read(path)` + slice                                  |
-| `tail(path, n)`               | `tail -n 10 /path/file`             | `vfs.read(path)` + slice                                  |
+| Wrapper                                                                    | Bash equivalent                     | VFS dispatch                                              |
+| -------------------------------------------------------------------------- | ----------------------------------- | --------------------------------------------------------- |
+| `grep(pattern, path, recursive=True)`                                      | `grep -r "pattern" /path/`          | search provider (bloom/regex) or fallback to read + match |
+| `find(path, name=None, size=None)`                                         | `find /path -name "*.py" -size +1k` | metadata store queries                                    |
+| `glob(pattern)`                                                            | `ls /path/*.py`                     | path-pattern match against metadata                       |
+| `cat(path)`                                                                | `cat /path/file`                    | `vfs.read(path)`                                          |
+| `ls(path, all=False, long=False)`                                          | `ls -la /path/`                     | `vfs.list(path)` with structured metadata                 |
+| `head(path, n=10)`                                                         | `head -n 10 /path/file`             | `vfs.read(path)` + slice                                  |
+| `tail(path, n=10)`                                                         | `tail -n 10 /path/file`             | `vfs.read(path)` + slice                                  |
+| `edit(path, start_anchor, end_anchor, replacement, expected_version=None)` | `apply patch to anchored range`     | validate anchors, then `vfs.write(path)`                  |
 
 The shell ops layer enables the [Mintlify/ChromaFS](https://www.mintlify.com/blog/how-we-built-a-virtual-filesystem-for-our-assistant) optimization pattern:
 `grep` hits the search index first as a coarse filter, then verifies matches
 against actual content as a fine filter.
+
+### 3.6 Token-Efficient Anchored Editing
+
+Monty read-like commands can expose editable text with compact, session-scoped anchors.
+This follows the [Dirac hash-anchor pattern](https://dirac.run/posts/hash-anchors-myers-diff-single-token#token-efficiency): the model reads anchored lines, then edits by naming start/end anchors plus replacement text instead of repeating the old text.
+For large edits this reduces edit-call output from `O(old_text + replacement)` to `O(replacement)`.
+
+Anchors are a Shell Operations concern, not VFS metadata.
+The shell ops layer maintains an execution/session-scoped anchor map for files read through `cat`, `head`, `tail`, `grep`, or an explicit editable read mode.
+The map binds compact anchors to `(namespace_id, path, version_number, line_content)` entries.
+Anchors should be single-token when available, falling back to longer anchors only after the single-token pool is exhausted for the current session.
+
+`edit(path, start_anchor, end_anchor, replacement, expected_version=None)` validates that:
+
+- the anchors belong to the requested path and current session
+- the file version still matches `expected_version` when provided
+- the current line content still matches the anchored lines
+
+After a successful edit, the shell ops layer reconciles the old and new line sequences with Myers diff.
+Unchanged lines keep their anchors; changed or inserted lines receive new anchors.
+The edit response returns the new version number plus updated anchors for the affected range.
+
+If anchor validation fails, the command fails closed with a conflict result and asks the agent to reread the affected file.
+No stale anchor should ever silently apply to a different line.
 
 ---
 
@@ -403,7 +521,7 @@ No correctness dependency on GC.
 ```text
 Permission:
   id: ULID
-  principal_id: ULID
+  principal_id: UUID4
   namespace_id: ULID
   path_prefix: str              # default "/" = entire namespace
   operations: set[str]          # {"read", "write", "delete", "execute", "admin"}
@@ -440,7 +558,7 @@ Span: vfs.write
   Attributes:
     vfs.namespace_id: "01JQX..."
     vfs.path: "/workspace/main.py"
-    vfs.principal_id: "01JQX..."
+    vfs.principal_id: "550e8400-e29b-41d4-a716-446655440000"
     vfs.version_number: 4
     vfs.content_hash: "b3_a1b2c3..."
     vfs.blob_size_bytes: 1234
@@ -471,7 +589,7 @@ AuditEvent:
   event_id: ULID
   timestamp: datetime
   namespace_id: ULID
-  principal_id: ULID
+  principal_id: UUID4
   operation: str              # "write", "delete", "rollback", "permission_change", "gc_run"
   path: str | None
   version_id: ULID | None
@@ -504,16 +622,19 @@ Handles path-based operations with no indexing overhead:
 - **Find**: predicate-based metadata search (name patterns, size, mtime, type)
 - **Grep**: regex or literal match against file content — requires blob reads
 
-Grep without an acceleration provider falls back to: `list(scope, recursive)` then `read` + match per file.
-Correct but O(n) in file count.
+Grep without an acceleration provider uses the default provider: the VFS enumerates the permission-pruned scope, injects `read_content`, and the provider reads and matches each file.
+Correct but O(n) in visible file count.
 
 ### 7.2 Bloom Filter Provider (Plugin)
 
 - **On `index`**: Computes bloom filter hashes (xxhash-based) for file content.
-  Stores in `search_meta.bloom`.
-- **On `search(regex)`**: Tests bloom filters across files in scope.
-  Returns candidate set (coarse filter).
-  VFS verifies candidates with content match (fine filter).
+  Stores a ready `SearchArtifact` at a provider key such as `search_meta["bloom/default"]`.
+  The artifact uses the standard envelope; bloom hashes, masks, normalizer IDs, and similar details live in the provider-defined payload.
+- **On `search(regex)`**: Receives permission-pruned `SearchMetaEntry` values,
+  tests bloom filters across the visible files in scope, and treats missing or
+  corrupt bloom data as conservative candidates.
+- **Verification**: Calls `read_content` only for candidate files and verifies
+  actual content before returning matches.
 - Reduces grep from O(n) blob reads to O(k) where k \<< n.
 
 Potential integration with [ahgraber/bloom-search](https://github.com/ahgraber/bloom-search) or
@@ -522,9 +643,12 @@ a [Cursor-style bloom extension](https://cursor.com/blog/fast-regex-search) for 
 ### 7.3 Semantic Search Provider (Future Plugin)
 
 - **On `index`**: Computes embedding vector.
-  Stores in `search_meta.vector`.
-- **On `search(semantic)`**: Vector similarity query against stored embeddings.
+  Stores a ready `SearchArtifact` at a provider key such as `search_meta["semantic/local-minilm"]`.
+- **On `search(semantic)`**: Ranks permission-pruned semantic artifacts by similarity to the query embedding.
+  Small/local providers may store vectors inline in `payload`.
+  Larger providers should store `artifact_ref` values that point to blob-backed vectors or provider-owned external indexes.
 - Backend options: pgvector (Postgres), Atlas Search (Mongo), external vector DB.
+  Any external vector backend must preserve the same VFS boundary: authorization, scope, and visibility are resolved before the provider can rank or fetch content.
 
 ### 7.4 Search Dispatch
 
@@ -532,31 +656,41 @@ a [Cursor-style bloom extension](https://cursor.com/blog/fast-regex-search) for 
 search(query, scope, type)
     |
     v
-VFS: which providers declare this search_type?
+VFS: authorize caller, resolve scope, enumerate visible current versions
     |
-    +-- acceleration provider found
-    |       |
-    |       v
-    |   provider.search() --> candidate paths
-    |       |
-    |       v
-    |   VFS: read candidates, verify matches --> results
+    v
+VFS: select provider, build SearchRequest(search_metas, read_content, limits)
     |
-    +-- no acceleration provider
-            |
-            v
-        fallback: list all files in scope, read + match
+    v
+provider.search(request)
+    |
+    +-- default provider: read_content for each visible file
+    |
+    +-- bloom provider: search_meta coarse filter, read_content verification
+    |
+    +-- semantic provider: rank semantic SearchArtifact entries
+    |
+    v
+SearchResponse(results, scope_narrowed, actual_scope, total_files_in_scope)
 ```
 
 The agent doesn't know or care which path was taken.
+Monty receives the same `grep(...)` function either way.
+Bashkit later maps `grep -r pattern path` to the same shell operation.
 
 ### 7.5 Search Metadata Storage
 
-Search artifacts are stored per-version in an extensible `search_meta` field (JSONB in SQL, nested document in NoSQL).
-The core schema does not prescribe the contents — each active SearchProvider writes its own keys.
+Search artifacts are stored per-version in a `search_meta` manifest (JSONB in SQL, nested document in NoSQL).
+The manifest shape is standard: provider keys map to `SearchArtifact` envelopes.
+The envelope carries lifecycle and freshness fields that the VFS can reason about generically.
+Each provider owns only the `payload` schema or external artifact referenced by `artifact_ref`.
 
-The metadata store adapter supports querying against `search_meta` subfields
-(e.g., bloom filter lookups, vector similarity).
+`search_meta` is a derived attachment to a version, not part of the immutable content identity.
+Adapters may physically embed it on the version record for simplicity, but they must treat artifact updates as version-scoped derived metadata keyed by `version_id + provider_key`.
+
+Required metadata-store behavior is limited to storing, updating, and batch loading `SearchArtifact` envelopes for VFS-visible current versions.
+Metadata adapters do not need to understand bloom filters, embedding vectors, or provider-specific query semantics.
+Provider-specific accelerated indexes may be added later, but they must remain behind the provider boundary and the VFS authorization/scope filter.
 
 ---
 
@@ -564,35 +698,46 @@ The metadata store adapter supports querying against `search_meta` subfields
 
 ### 8.1 Tiered Model
 
-| Tier    | Provider                                               | Language      | Startup             | Security                            | Use case                       |
-| ------- | ------------------------------------------------------ | ------------- | ------------------- | ----------------------------------- | ------------------------------ |
-| Initial | [Bashkit](https://github.com/everruns/bashkit)         | Bash subset   | In-process          | Rust VM, no I/O by default          | File manipulation, scripting   |
-| Initial | [Monty](https://github.com/pydantic/monty)             | Python subset | In-process, ~3-15us | Rust VM, external functions only    | Data transforms, orchestration |
-| Future  | [Eryx](https://github.com/eryx-org/eryx)               | Full CPython  | ~16ms (AOT)         | WASM sandbox, all 6 vectors blocked | Complex Python, stdlib         |
-| Future  | [PyMiniRacer](https://github.com/bpcreech/PyMiniRacer) | JavaScript    | In-process          | V8 isolate                          | JS/TS execution                |
-| Future  | [E2B](https://e2b.dev)/sidecar                         | Any           | ~150ms              | Firecracker microVM                 | Pip packages, full OS          |
+| Tier     | Provider                                               | Language      | Startup           | Security                                  | Use case                         |
+| -------- | ------------------------------------------------------ | ------------- | ----------------- | ----------------------------------------- | -------------------------------- |
+| Initial  | [Monty](https://github.com/pydantic/monty)             | Python subset | In-process, \<1us | Rust VM, explicit external functions only | Code-mode orchestration over VFS |
+| Future   | [Bashkit](https://github.com/everruns/bashkit)         | Bash          | In-process        | Rust virtual bash, no host I/O by default | Shell syntax and command scripts |
+| Tertiary | [just-bash](https://github.com/vercel-labs/just-bash)  | Bash-like TS  | In-process / VM   | TypeScript interpreter, no shell process  | JS/TS ecosystem integration      |
+| Future   | [Eryx](https://github.com/eryx-org/eryx)               | Full CPython  | ~16ms (AOT)       | WASM sandbox, all 6 vectors blocked       | Complex Python, stdlib           |
+| Future   | [PyMiniRacer](https://github.com/bpcreech/PyMiniRacer) | JavaScript    | In-process        | V8 isolate                                | JS/TS execution                  |
+| Future   | [E2B](https://e2b.dev)/sidecar                         | Any           | ~150ms            | Firecracker microVM                       | Pip packages, full OS            |
+
+Bashkit is not deferred because it requires a Node sidecar.
+Current Bashkit docs describe an in-process Rust virtual bash with Python bindings via PyO3 and JavaScript/TypeScript bindings via NAPI-RS.
+It is deferred because real shell syntax, parsing, and command semantics expand the execution contract beyond the initial Monty callback model.
+Vercel's just-bash is the Node/TypeScript bash-like runtime previously considered as a sidecar-style option.
+It remains a tertiary follow-on after Monty and Bashkit because it primarily serves JS/TS agent stacks.
 
 ### 8.2 Integration Pattern
 
-All execution providers use the **function-injection pattern**:
+The initial Monty provider uses the **function-injection pattern**:
 
 1. VFS constructs `FsOperations` bound to the calling principal/namespace
 2. Shell ops layer wraps VFS operations in bash-familiar signatures
-3. Execution provider receives `FsOperations` as injectable callables
+3. Monty receives `FsOperations` as explicit external functions
 4. Sandboxed code calls these functions — they route back through the VFS
 5. The sandbox never accesses storage directly
 
+`SearchRequest`, `search_meta`, and `read_content` remain internal to the VFS and search-provider boundary.
+Monty sees only the curated shell functions.
+Bashkit later exposes shell syntax for the same operations without changing the underlying search contract.
+
 ```text
-Agent code: grep -r "TODO" /workspace/
+Agent code: grep("TODO", "/workspace/", recursive=True)
     |
     v
-Bashkit sandbox --> shell_ops.grep("-r", "TODO", "/workspace/")
+Monty sandbox --> shell_ops.grep("TODO", "/workspace/", recursive=True)
     |
     v
 VFS.search(query="TODO", scope="/workspace/", type=regex)
     |
     v
-BloomProvider.search() --> candidates --> VFS.read() + verify --> results
+SearchRequest(search_metas, read_content) --> BloomProvider.search() --> SearchResponse
 ```
 
 ### 8.3 Resource Limits
@@ -601,8 +746,8 @@ Enforced at two levels:
 
 - **VFS level**: `max_operations` caps the number of VFS callbacks per execution
   (prevents unbounded read loops)
-- **Provider level**: Each provider enforces its own limits (Bashkit command count,
-  Monty fuel, Eryx WASM fuel, timeout)
+- **Provider level**: Each provider enforces its own limits (Monty memory/allocation/time,
+  future Bashkit command/parser/filesystem limits, Eryx WASM fuel, timeout)
 
 ---
 
@@ -674,8 +819,9 @@ vfs = VFS(
 | Profile     | Metadata | Blobs    | Search              | Execution              |
 | ----------- | -------- | -------- | ------------------- | ---------------------- |
 | Local dev   | SQLite   | Local FS | Default (glob/grep) | None                   |
-| Self-hosted | Postgres | MinIO/S3 | Bloom               | Bashkit + Monty        |
-| Production  | Postgres | S3       | Bloom + Semantic    | Bashkit + Monty + Eryx |
+| Self-hosted | Postgres | MinIO/S3 | Bloom               | Monty                  |
+| Production  | Postgres | S3       | Bloom + Semantic    | Monty + Bashkit + Eryx |
+| JS/TS agent | Postgres | S3       | Bloom + Semantic    | Monty + just-bash      |
 
 ### 9.5 Secrets
 
@@ -776,8 +922,9 @@ await vfs.reindex(namespace=ns.id, provider="bloom", scope="/src/")
 
 4. **Search metadata schema evolution**: Two mechanisms:
 
-   - **Lazy backfill**: When a search provider encounters a file without its `search_meta` entries during a search, it reads the content, computes the index, and writes the `search_meta` back.
-     Transparent to the caller.
+   - **Lazy backfill**: When a search encounters a file without a ready `SearchArtifact` for the active provider key, the provider treats the file as an unindexed candidate and verifies content through `read_content`.
+     The VFS may then call `provider.index(...)` with that content and persist the returned artifact with the same version/CAS checks used on write.
+     Providers compute artifacts; the VFS writes them.
    - **Batch reindex**: `vfs.reindex(namespace, provider, scope)` as an explicit command for bulk backfill.
      Runnable as a background job.
 
@@ -790,26 +937,31 @@ await vfs.reindex(namespace=ns.id, provider="bloom", scope="/src/")
 
 ## Appendix: Prior Art & Influences
 
-| Project / Source                                                                                                                               | Influence on ai-vfs                                                                                                                                        |
-| ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Mintlify ChromaFS](https://www.mintlify.com/blog/how-we-built-a-virtual-filesystem-for-our-assistant)                                         | Virtual filesystem over DB, invisible access pruning, grep optimization via coarse+fine filter                                                             |
-| [Anthropic: Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)                                            | Progressive disclosure, filesystem-organized tool definitions, 98.7% token reduction                                                                       |
-| [Cloudflare: Code Mode](https://blog.cloudflare.com/code-mode/)                                                                                | Code execution > direct tool calling, V8 isolate sandboxing                                                                                                |
-| [AIGNE / CSIRO: Agentic File System Abstraction](https://arxiv.org/abs/2512.05470)                                                             | Persistent context repository, memory lifecycle (history/memory/scratchpad), implemented in [AIGNE framework](https://github.com/aigne-io/aigne-framework) |
-| [yarnnn: Agent OS is a Filesystem](https://www.yarnnn.com/blog/the-agent-operating-system-is-a-filesystem)                                     | Three storage domains, filesystem semantics + vector acceleration backend                                                                                  |
-| [AGFS](https://github.com/c4pt0r/agfs)                                                                                                         | Heterogeneous backends (Redis, S3, SQL, queues) under unified POSIX namespace, Plan 9 philosophy                                                           |
-| [Vercel just-bash](https://github.com/vercel-labs/just-bash) / [bash-tool benchmarks](https://vercel.com/blog/testing-if-bash-is-all-you-need) | IFileSystem interface, MountableFs, hybrid bash+SQL outperforms either alone                                                                               |
-| [Bashkit](https://github.com/everruns/bashkit)                                                                                                 | Rust virtual bash, FileSystem trait, MountableFs, [Python bindings](https://github.com/everruns/bashkit/blob/main/crates/bashkit-python/README.md)         |
-| [Pydantic Monty](https://github.com/pydantic/monty)                                                                                            | External function injection, snapshot/resume, sub-microsecond execution                                                                                    |
-| [Eryx](https://github.com/eryx-org/eryx)                                                                                                       | CPython 3.14 in WASM sandbox, sandbox pooling, TypedCallbacks                                                                                              |
-| [fsspec](https://github.com/fsspec/filesystem_spec)                                                                                            | Python ecosystem standard for filesystem abstraction                                                                                                       |
-| [turbopuffer](https://turbopuffer.com/blog/turbopuffer) ([Latent Space interview](https://www.latent.space/p/turbopuffer))                     | S3 conditional writes for coordination-free concurrency, optimistic CAS, metadata-as-JSON-files pattern                                                    |
-| [Fly.io Litestream VFS](https://fly.io/blog/litestream-writable-vfs/)                                                                          | Writable VFS over S3, hydration pattern, lazy content serving before full download                                                                         |
-| [Cursor: Fast Regex Search](https://cursor.com/blog/fast-regex-search)                                                                         | Bloom filters for regex-capable file content indexing                                                                                                      |
-| [Dead Neurons: Forget MCP, Bash Is All You Need](https://deadneurons.substack.com/p/forget-mcp-bash-is-all-you-need)                           | MCP converging on POSIX; OS as agent runtime; composition via pipes                                                                                        |
-| [HuggingFace smolagents](https://huggingface.co/blog/smolagents)                                                                               | Code agents > tool-calling agents; function-injection pattern                                                                                              |
-| [JuiceFS](https://github.com/juicedata/juicefs)                                                                                                | Metadata/data separation architecture (metadata in Redis/Postgres, data in S3)                                                                             |
-| [Filestash](https://github.com/mickael-kerjean/filestash)                                                                                      | 8 methods suffice to unify 20+ storage backends; MCP gateway                                                                                               |
-| [TigerFS](https://github.com/timescale/tigerfs)                                                                                                | Postgres-backed filesystem, ACID file writes, version history                                                                                              |
-| [Starlark (starlark-pyo3)](https://github.com/inducer/starlark-pyo3)                                                                           | Hermetic sandboxed execution by language design                                                                                                            |
-| [Yjs](https://github.com/yjs/yjs) / [ProseMirror collab](https://code.haverbeke.berlin/prosemirror/prosemirror-collab)                         | Future horizon: CRDT-based collaborative editing ([caveats](https://www.moment.dev/blog/lies-i-was-told-pt-2))                                             |
+| Project / Source                                                                                                                               | Influence on ai-vfs                                                                                                                                                                                |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Mintlify ChromaFS](https://www.mintlify.com/blog/how-we-built-a-virtual-filesystem-for-our-assistant)                                         | Virtual filesystem over DB, invisible access pruning, grep optimization via coarse+fine filter                                                                                                     |
+| [Leonie Monigatti: Virtual Filesystem over Elasticsearch](https://leoniemonigatti.com/blog/virtual-filesystem-elasticsearch.html)              | Shell commands as interface over search-backed storage; two-stage grep (ES coarse filter + regex verify); in-memory path tree; data-layer access control                                           |
+| [LangChain Deep Agents: Backends](https://docs.langchain.com/oss/python/deepagents/backends#use-a-virtual-filesystem)                          | Pluggable filesystem backend protocol projecting remote storage (S3, Postgres) into the agent's tool namespace; standardized contract over native ops                                              |
+| [Anthropic: Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp)                                            | Progressive disclosure, filesystem-organized tool definitions, 98.7% token reduction                                                                                                               |
+| [Scaling Managed Agents: Decoupling the brain from the hands \\ Anthropic](https://www.anthropic.com/engineering/managed-agents)               | Architecture for decoupled harness, sandbox, and session persistence                                                                                                                               |
+| [Cloudflare: Code Mode](https://blog.cloudflare.com/code-mode/)                                                                                | Code execution > direct tool calling, V8 isolate sandboxing                                                                                                                                        |
+| [AIGNE / CSIRO: Agentic File System Abstraction](https://arxiv.org/abs/2512.05470)                                                             | Persistent context repository, memory lifecycle (history/memory/scratchpad), implemented in [AIGNE framework](https://github.com/aigne-io/aigne-framework)                                         |
+| [yarnnn: Agent OS is a Filesystem](https://www.yarnnn.com/blog/the-agent-operating-system-is-a-filesystem)                                     | Three storage domains, filesystem semantics + vector acceleration backend                                                                                                                          |
+| [AGFS](https://github.com/c4pt0r/agfs)                                                                                                         | Heterogeneous backends (Redis, S3, SQL, queues) under unified POSIX namespace, Plan 9 philosophy                                                                                                   |
+| [Vercel just-bash](https://github.com/vercel-labs/just-bash) / [bash-tool benchmarks](https://vercel.com/blog/testing-if-bash-is-all-you-need) | TypeScript bash-like runtime with virtual filesystem; bash-tool context retrieval; tertiary JS/TS execution-provider candidate                                                                     |
+| [Bashkit](https://github.com/everruns/bashkit)                                                                                                 | In-process Rust virtual bash, FileSystem trait, MountableFs, [Python bindings](https://github.com/everruns/bashkit/blob/main/crates/bashkit-python/README.md) via PyO3, JS/TS bindings via NAPI-RS |
+| [Bashkit architecture docs](https://www.mintlify.com/everruns/bashkit/concepts/architecture)                                                   | Confirms modular async-first Rust core, virtual filesystem by default, and trait-based filesystem/custom builtin extension points                                                                  |
+| [Pydantic Monty](https://github.com/pydantic/monty)                                                                                            | External function injection, snapshot/resume, sub-microsecond execution, explicit filesystem/network/env control                                                                                   |
+| [Dirac: Hash anchors + Myers diff + single-token anchors](https://dirac.run/posts/hash-anchors-myers-diff-single-token#token-efficiency)       | Session-scoped single-token anchors plus Myers diff reconciliation for token-efficient file edits                                                                                                  |
+| [Eryx](https://github.com/eryx-org/eryx)                                                                                                       | CPython 3.14 in WASM sandbox, sandbox pooling, TypedCallbacks                                                                                                                                      |
+| [fsspec](https://github.com/fsspec/filesystem_spec)                                                                                            | Python ecosystem standard for filesystem abstraction                                                                                                                                               |
+| [turbopuffer](https://turbopuffer.com/blog/turbopuffer) ([Latent Space interview](https://www.latent.space/p/turbopuffer))                     | S3 conditional writes for coordination-free concurrency, optimistic CAS, metadata-as-JSON-files pattern                                                                                            |
+| [Fly.io Litestream VFS](https://fly.io/blog/litestream-writable-vfs/)                                                                          | Writable VFS over S3, hydration pattern, lazy content serving before full download                                                                                                                 |
+| [Cursor: Fast Regex Search](https://cursor.com/blog/fast-regex-search)                                                                         | Bloom filters for regex-capable file content indexing                                                                                                                                              |
+| [Dead Neurons: Forget MCP, Bash Is All You Need](https://deadneurons.substack.com/p/forget-mcp-bash-is-all-you-need)                           | MCP converging on POSIX; OS as agent runtime; composition via pipes                                                                                                                                |
+| [HuggingFace smolagents](https://huggingface.co/blog/smolagents)                                                                               | Code agents > tool-calling agents; function-injection pattern                                                                                                                                      |
+| [JuiceFS](https://github.com/juicedata/juicefs)                                                                                                | Metadata/data separation architecture (metadata in Redis/Postgres, data in S3)                                                                                                                     |
+| [Filestash](https://github.com/mickael-kerjean/filestash)                                                                                      | 8 methods suffice to unify 20+ storage backends; MCP gateway                                                                                                                                       |
+| [TigerFS](https://github.com/timescale/tigerfs)                                                                                                | Postgres-backed filesystem, ACID file writes, version history                                                                                                                                      |
+| [Starlark (starlark-pyo3)](https://github.com/inducer/starlark-pyo3)                                                                           | Hermetic sandboxed execution by language design                                                                                                                                                    |
+| [Yjs](https://github.com/yjs/yjs) / [ProseMirror collab](https://code.haverbeke.berlin/prosemirror/prosemirror-collab)                         | Future horizon: CRDT-based collaborative editing ([caveats](https://www.moment.dev/blog/lies-i-was-told-pt-2))                                                                                     |

@@ -13,6 +13,7 @@ _meter = metrics.get_meter("vfs")
 op_counter = _meter.create_counter("vfs.operation.count", unit="1")
 op_histogram = _meter.create_histogram("vfs.operation.duration", unit="ms")
 blob_histogram = _meter.create_histogram("vfs.blob.size", unit="By")
+search_candidate_histogram = _meter.create_histogram("vfs.search.candidates", unit="1")
 
 
 @contextmanager
@@ -38,3 +39,10 @@ def record_blob_size(size: int, *, otel_enabled: bool) -> None:
     if not otel_enabled:
         return
     blob_histogram.record(size)
+
+
+def record_search_candidates(count: int, attrs: dict[str, Any], *, otel_enabled: bool) -> None:
+    """Record the number of permission-pruned candidates a search considered."""
+    if not otel_enabled:
+        return
+    search_candidate_histogram.record(count, attrs)
