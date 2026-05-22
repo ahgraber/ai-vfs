@@ -1,6 +1,30 @@
 # ai-vfs: Bloom Search Provider Integration
 
-**Date:** 2026-04-04 **Status:** Draft **Authors:** ahgraber + Claude
+**Date:** 2026-04-04 **Status:** Superseded (2026-05-22) **Authors:** ahgraber + Claude
+
+> [!IMPORTANT]
+> **Superseded — bloom integration is not pursued.**
+> Benchmarking in the `bloom-search` repo (`docs/benchmark/analysis.md`) showed bloom
+> prefiltering passes ~20–22% of the corpus as candidates regardless of corpus size and
+> never beats plain `ripgrep` through 100k documents, while SQLite FTS5 serves queries in
+> well under a millisecond. For S3-backed agentic grep, bloom _reduces_ blob reads but
+> full-text search _avoids_ them on the hot path — so Phase 2 search pivoted to a family of
+> per-backend full-text search providers (SQLite FTS5 first, Postgres `tsvector`+`pg_trgm`,
+> brute-force fallback elsewhere), indexing **one searchable text record per immutable file
+> version** rather than chunking or per-file bloom artifacts.
+>
+> **What survives** from this document: the `SearchArtifact` envelope (provider-owned payload
+> behind common lifecycle/freshness fields), the `SearchRequest`/`SearchResponse` protocol,
+> and the VFS-owned content reader. **What changed:** the coarse filter is a DB
+> full-text/trigram index, not per-file bloom hashes; the content reader is a _guarded_ object
+> that reads by `content_hash` (immutable) rather than by path.
+>
+> **Current contract:** the **`phase2-search`** change — its **Search** delta
+> (`SearchArtifactEnvelope`, `SearchProviderProtocol`, `FullTextSearchProviders`,
+> `SearchScopeLimiting`, `SearchErrorDegradation`, `FindSearchPredicates`) and its
+> **Versioning** delta (`SearchMetaReindex`). Referenced by name; the change is at
+> `.specs/changes/phase2-search/` until archived. The remainder of this document is retained
+> for historical context only.
 
 **Inspired by:** [Cursor: Fast Regex Search](https://cursor.com/blog/fast-regex-search) — trigram indexing with bloom filters and augmented masks for code search acceleration.
 Adapted here for generic document content in a virtual filesystem context.

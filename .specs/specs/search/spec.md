@@ -23,7 +23,7 @@ The system SHALL support glob pattern matching against file paths within a scope
 The system SHALL support predicate-based metadata search matching file name patterns.
 
 > **Phase 1 scope:** Phase 1 implements only the name-pattern predicate (fnmatch against the file basename).
-> Richer predicates (size ranges, modification times, type) are deferred to `phase2-adapters` alongside the `SearchRequest` protocol redesign, where the multi-predicate input shape can be defined once.
+> Richer predicates (size ranges, modification times, type) are deferred to `phase2-search` alongside the `SearchRequest` protocol redesign, where the multi-predicate input shape can be defined once.
 
 #### Scenario: FindByNamePattern
 
@@ -58,7 +58,7 @@ The callback lazily fetches blob bytes for a given path, allowing providers to c
 Metadata-only strategies (glob, find) ignore the callback entirely.
 
 > **Phase 1 scope:** Phase 1 ships a single bundled `DefaultSearchProvider` (glob, find, regex).
-> Multi-provider runtime dispatch — registering bloom, semantic, or fulltext providers alongside the default and routing each search request to the most specific match — is deferred to `phase2-adapters/PluggableSearchProviders`, which lands together with the bloom and semantic providers.
+> Multi-provider runtime dispatch — registering full-text search providers alongside the default and routing each search request to the most specific match — is deferred to `phase2-search/PluggableSearchProviders`, which lands together with the full-text search providers (bloom is not pursued; semantic search is a separate future change).
 
 #### Scenario: SingleProviderDispatch
 

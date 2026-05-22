@@ -52,7 +52,7 @@ The policy SHALL be declarative data: a `RetentionPolicy` model carries `max_rec
 
 > **Phase 1 scope:** Phase 1 GC enforces only `max_recent_versions`, `keep_first_version`, and `keep_current_version`.
 > The time-based `tiers` field is stored as declarative data — neither the metadata store adapter nor the library evaluates tier rules in Phase 1.
-> Tier evaluation lands in `phase2-adapters/TierBasedRetention` and lives in the library (`GarbageCollector`), not in the store adapter; the store gains a coarse `iter_versions_for_gc` enumerator and the library applies tier semantics in a single canonical implementation.
+> Tier evaluation lands in `phase2-storage/TierBasedRetention` and lives in the library (`GarbageCollector`), not in the store adapter; the store gains a coarse `iter_versions_for_gc` enumerator and the library applies tier semantics in a single canonical implementation.
 
 #### Scenario: DefaultRetentionData
 
