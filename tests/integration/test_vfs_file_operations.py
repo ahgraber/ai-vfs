@@ -224,7 +224,7 @@ class TestVFSRead:
         ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/a.py", b"data", principal_id=p.id)
         # Clear audit events from write
-        await vfs_instance._meta._conn.execute("DELETE FROM audit_events WHERE namespace_id=?", (ns.id,))
+        await vfs_instance._meta._conn.exec_driver_sql("DELETE FROM audit_events WHERE namespace_id=?", (ns.id,))
         await vfs_instance._meta._conn.commit()
         # Read should not create audit
         await vfs_instance.read(ns.id, "/a.py", principal_id=p.id)

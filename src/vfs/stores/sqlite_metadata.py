@@ -1,16 +1,19 @@
-"""SQLite-backed metadata store."""
+"""SQLite-backed metadata store, expressed on the shared SQLAlchemy Core schema."""
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime
 import json
-import textwrap
-from typing import AsyncIterator
+from typing import AsyncIterator, Sequence
 
-import aiosqlite
+import sqlalchemy as sa
+from sqlalchemy import delete, insert, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.pool import StaticPool
 
-from vfs.errors import ConflictError, NotFoundError
+from vfs.errors import ConflictError
 from vfs.models import (
     AuditEvent,
     FileMeta,
@@ -20,113 +23,61 @@ from vfs.models import (
     RetentionPolicy,
     VersionMeta,
 )
-
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS namespaces (
-    id          TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    created_by  TEXT NOT NULL,
-    retention_policy TEXT
-);
-
-CREATE TABLE IF NOT EXISTS principals (
-    id          TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    principal_type TEXT NOT NULL,
-    created_at  TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS files (
-    namespace_id         TEXT NOT NULL,
-    path                 TEXT NOT NULL,
-    current_version_id   TEXT NOT NULL,
-    current_version_number INTEGER NOT NULL,
-    created_at           TEXT NOT NULL,
-    updated_at           TEXT NOT NULL,
-    is_deleted           INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (namespace_id, path)
-);
-
-CREATE TABLE IF NOT EXISTS versions (
-    id               TEXT PRIMARY KEY,
-    file_path        TEXT NOT NULL,
-    namespace_id     TEXT NOT NULL,
-    version_number   INTEGER NOT NULL,
-    content_hash     TEXT NOT NULL,
-    size             INTEGER NOT NULL,
-    created_at       TEXT NOT NULL,
-    created_by       TEXT NOT NULL,
-    is_tombstone     INTEGER NOT NULL DEFAULT 0,
-    search_meta      TEXT NOT NULL DEFAULT '{}',
-    parent_version_id TEXT,
-    UNIQUE (namespace_id, file_path, version_number)
-);
-
-CREATE TABLE IF NOT EXISTS permissions (
-    id           TEXT PRIMARY KEY,
-    principal_id TEXT NOT NULL,
-    namespace_id TEXT NOT NULL,
-    path_prefix  TEXT NOT NULL,
-    operations   TEXT NOT NULL,
-    created_at   TEXT NOT NULL,
-    UNIQUE (principal_id, namespace_id, path_prefix)
-);
-
-CREATE TABLE IF NOT EXISTS audit_events (
-    event_id     TEXT PRIMARY KEY,
-    timestamp    TEXT NOT NULL,
-    namespace_id TEXT NOT NULL,
-    principal_id TEXT NOT NULL,
-    operation    TEXT NOT NULL,
-    path         TEXT,
-    version_id   TEXT,
-    detail       TEXT NOT NULL DEFAULT '{}',
-    trace_id     TEXT
-);
-
-CREATE TABLE IF NOT EXISTS names (
-    entity_type  TEXT NOT NULL,
-    entity_id    TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    PRIMARY KEY (entity_type, entity_id),
-    UNIQUE (entity_type, display_name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_versions_ns_path
-    ON versions (namespace_id, file_path, version_number DESC);
-CREATE INDEX IF NOT EXISTS idx_permissions_principal
-    ON permissions (principal_id, namespace_id);
-CREATE INDEX IF NOT EXISTS idx_audit_ns_time
-    ON audit_events (namespace_id, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_versions_hash
-    ON versions (content_hash);
-"""
+from vfs.stores.schema import (
+    audit_events,
+    files,
+    metadata,
+    names,
+    namespaces,
+    permissions,
+    principals,
+    versions,
+)
 
 
 class SQLiteMetadataStore:
-    """MetadataStore implementation backed by SQLite via aiosqlite."""
+    """MetadataStore implementation backed by SQLite via SQLAlchemy Core + aiosqlite.
+
+    Holds a single long-lived :class:`AsyncConnection` for the store's lifetime so an
+    in-memory database (``:memory:``) and explicit transactions both work against one
+    connection.  Operations auto-commit unless wrapped in :meth:`transaction`.
+    """
 
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
-        self._conn: aiosqlite.Connection | None = None
+        self._engine: AsyncEngine | None = None
+        self._conn: AsyncConnection | None = None
         self._in_transaction: bool = False
 
+    def _create_engine(self) -> AsyncEngine:
+        if self._db_path == ":memory:":
+            # A single shared connection keeps the in-memory database alive for the store's lifetime.
+            return create_async_engine(
+                "sqlite+aiosqlite:///:memory:",
+                poolclass=StaticPool,
+                connect_args={"check_same_thread": False},
+            )
+        return create_async_engine(f"sqlite+aiosqlite:///{self._db_path}")
+
     async def initialize(self) -> None:
-        """Create tables and indexes; enable WAL mode."""
-        self._conn = await aiosqlite.connect(self._db_path)
-        await self._conn.execute("PRAGMA journal_mode=WAL")
-        await self._conn.executescript(_SCHEMA_SQL)
+        """Open the connection, enable WAL mode, and create tables and indexes."""
+        self._engine = self._create_engine()
+        self._conn = await self._engine.connect()
+        await self._conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+        await self._conn.run_sync(metadata.create_all)
         await self._conn.commit()
 
     async def close(self) -> None:
-        """Close the underlying aiosqlite connection."""
-        if self._conn:
+        """Close the held connection and dispose the engine."""
+        if self._conn is not None:
             await self._conn.close()
             self._conn = None
+        if self._engine is not None:
+            await self._engine.dispose()
+            self._engine = None
 
     @property
-    def _db(self) -> aiosqlite.Connection:
+    def _db(self) -> AsyncConnection:
         if self._conn is None:
             raise RuntimeError("SQLiteMetadataStore is not initialized; call initialize() first")
         return self._conn
@@ -136,199 +87,160 @@ class SQLiteMetadataStore:
     async def _auto_commit(self) -> None:
         """Commit unless we're inside an explicit transaction."""
         if not self._in_transaction:
-            await self._conn.commit()
+            await self._db.commit()
 
-    async def _execute_fetchall(self, sql: str, params: tuple = ()) -> list[tuple]:
-        cursor = await self._db.execute(sql, params)
-        return await cursor.fetchall()
+    async def _execute_fetchall(self, sql: str, params: tuple = ()) -> Sequence[sa.Row]:
+        result = await self._db.exec_driver_sql(sql, params)
+        return result.fetchall()
 
-    async def _execute_fetchone(self, sql: str, params: tuple = ()) -> tuple | None:
-        cursor = await self._db.execute(sql, params)
-        return await cursor.fetchone()
+    async def _execute_fetchone(self, sql: str, params: tuple = ()) -> sa.Row | None:
+        result = await self._db.exec_driver_sql(sql, params)
+        return result.fetchone()
 
     # --- File operations ---
 
     async def put_file(self, file_meta: FileMeta) -> None:
         """Insert or replace a file record."""
-        await self._db.execute(
-            """
-INSERT INTO files (namespace_id, path, current_version_id,
-    current_version_number, created_at, updated_at, is_deleted)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(namespace_id, path) DO UPDATE SET
-    current_version_id=excluded.current_version_id,
-    current_version_number=excluded.current_version_number,
-    updated_at=excluded.updated_at,
-    is_deleted=excluded.is_deleted
-""".strip(),
-            (
-                file_meta.namespace_id,
-                file_meta.path,
-                file_meta.current_version_id,
-                file_meta.current_version_number,
-                file_meta.created_at.isoformat(),
-                file_meta.updated_at.isoformat(),
-                int(file_meta.is_deleted),
-            ),
+        stmt = sqlite_insert(files).values(
+            namespace_id=file_meta.namespace_id,
+            path=file_meta.path,
+            current_version_id=file_meta.current_version_id,
+            current_version_number=file_meta.current_version_number,
+            created_at=file_meta.created_at.isoformat(),
+            updated_at=file_meta.updated_at.isoformat(),
+            is_deleted=file_meta.is_deleted,
         )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["namespace_id", "path"],
+            set_={
+                "current_version_id": stmt.excluded.current_version_id,
+                "current_version_number": stmt.excluded.current_version_number,
+                "updated_at": stmt.excluded.updated_at,
+                "is_deleted": stmt.excluded.is_deleted,
+            },
+        )
+        await self._db.execute(stmt)
         await self._auto_commit()
 
     async def get_file(self, namespace_id: str, path: str) -> FileMeta | None:
         """Return the file record for namespace_id/path, or None if absent."""
-        row = await self._execute_fetchone(
-            "SELECT * FROM files WHERE namespace_id=? AND path=?",
-            (namespace_id, path),
-        )
+        row = (
+            await self._db.execute(select(files).where(files.c.namespace_id == namespace_id, files.c.path == path))
+        ).first()
         if row is None:
             return None
-        return FileMeta(
-            namespace_id=row[0],
-            path=row[1],
-            current_version_id=row[2],
-            current_version_number=row[3],
-            created_at=datetime.fromisoformat(row[4]),
-            updated_at=datetime.fromisoformat(row[5]),
-            is_deleted=bool(row[6]),
-        )
+        return self._row_to_file(row)
 
     async def delete_file(self, namespace_id: str, path: str) -> None:
         """Hard-delete the file record (use put_version with is_tombstone for soft delete)."""
-        await self._db.execute(
-            "DELETE FROM files WHERE namespace_id=? AND path=?",
-            (namespace_id, path),
-        )
+        await self._db.execute(delete(files).where(files.c.namespace_id == namespace_id, files.c.path == path))
         await self._auto_commit()
 
     async def list_dir(self, namespace_id: str, path_prefix: str, *, recursive: bool = False) -> list[FileMeta]:
         """List live (non-deleted) files under path_prefix; recurse into subdirectories when recursive=True."""
-        rows = await self._execute_fetchall(
-            "SELECT * FROM files WHERE namespace_id=? AND path LIKE ? AND is_deleted=0",
-            (namespace_id, path_prefix + "%"),
-        )
+        rows = (
+            await self._db.execute(
+                select(files).where(
+                    files.c.namespace_id == namespace_id,
+                    files.c.path.like(path_prefix + "%"),
+                    files.c.is_deleted == False,  # noqa: E712 — SQL boolean comparison, not a Python identity check
+                )
+            )
+        ).fetchall()
         results = []
         for row in rows:
-            path = row[1]
+            path = row.path
             if not recursive:
                 # Non-recursive: exclude paths with additional '/' after prefix
                 remainder = path[len(path_prefix) :]
                 if "/" in remainder:
                     continue
-            results.append(
-                FileMeta(
-                    namespace_id=row[0],
-                    path=row[1],
-                    current_version_id=row[2],
-                    current_version_number=row[3],
-                    created_at=datetime.fromisoformat(row[4]),
-                    updated_at=datetime.fromisoformat(row[5]),
-                    is_deleted=bool(row[6]),
-                )
-            )
+            results.append(self._row_to_file(row))
         return results
 
     # --- Version operations ---
 
     async def put_version(self, version: VersionMeta, *, expected_version: int | None = None) -> None:
-        """Persist a new version; raise ConflictError before inserting if the CAS check fails."""
-        now = version.created_at.isoformat()
+        """Persist a new version and advance the file's current-version pointer.
 
-        if expected_version is not None:
-            # Pre-check before inserting to avoid orphaned version rows on CAS conflict.
-            # SQLite serializes writes, so the check-then-insert is safe within a single connection.
-            row = await self._execute_fetchone(
-                "SELECT current_version_number FROM files WHERE namespace_id=? AND path=?",
-                (version.namespace_id, version.file_path),
+        When ``expected_version`` is set, the pointer is advanced with a
+        ``WHERE current_version_number = expected_version`` compare-and-swap. If that matches
+        no row — the file was concurrently advanced, or does not exist — the pending write is
+        rolled back and ``ConflictError`` is raised at the write site, leaving no orphan
+        version row. The CAS update precedes the version insert so a mismatch inserts nothing.
+        """
+        now = version.created_at.isoformat()
+        version_values = {
+            "id": version.id,
+            "file_path": version.file_path,
+            "namespace_id": version.namespace_id,
+            "version_number": version.version_number,
+            "content_hash": version.content_hash,
+            "size": version.size,
+            "created_at": now,
+            "created_by": version.created_by,
+            "is_tombstone": version.is_tombstone,
+            "search_meta": version.search_meta,
+            "parent_version_id": version.parent_version_id,
+        }
+
+        if expected_version is None:
+            # New file or unconditional upsert: insert the version, then upsert the pointer.
+            await self._db.execute(insert(versions).values(**version_values))
+            stmt = sqlite_insert(files).values(
+                namespace_id=version.namespace_id,
+                path=version.file_path,
+                current_version_id=version.id,
+                current_version_number=version.version_number,
+                created_at=now,
+                updated_at=now,
+                is_deleted=version.is_tombstone,
             )
-            if row is None or row[0] != expected_version:
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["namespace_id", "path"],
+                set_={
+                    "current_version_id": stmt.excluded.current_version_id,
+                    "current_version_number": stmt.excluded.current_version_number,
+                    "updated_at": stmt.excluded.updated_at,
+                    "is_deleted": stmt.excluded.is_deleted,
+                },
+            )
+            await self._db.execute(stmt)
+        else:
+            # Compare-and-swap at the write site: advance the pointer only while the file is
+            # still at expected_version. Zero matched rows => conflict.
+            result = await self._db.execute(
+                update(files)
+                .where(
+                    files.c.namespace_id == version.namespace_id,
+                    files.c.path == version.file_path,
+                    files.c.current_version_number == expected_version,
+                )
+                .values(
+                    current_version_id=version.id,
+                    current_version_number=version.version_number,
+                    updated_at=now,
+                    is_deleted=version.is_tombstone,
+                )
+            )
+            if result.rowcount == 0:
+                if not self._in_transaction:
+                    await self._db.rollback()
                 raise ConflictError(
                     f"CAS conflict: expected version {expected_version} for {version.namespace_id}:{version.file_path}"
                 )
-
-        await self._db.execute(
-            """
-INSERT INTO versions (id, file_path, namespace_id, version_number,
-    content_hash, size, created_at, created_by, is_tombstone,
-    search_meta, parent_version_id)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-""".strip(),
-            (
-                version.id,
-                version.file_path,
-                version.namespace_id,
-                version.version_number,
-                version.content_hash,
-                version.size,
-                now,
-                version.created_by,
-                int(version.is_tombstone),
-                json.dumps(version.search_meta),
-                version.parent_version_id,
-            ),
-        )
-
-        if expected_version is None:
-            # New file or upsert
-            await self._db.execute(
-                """
-INSERT INTO files (namespace_id, path, current_version_id,
-    current_version_number, created_at, updated_at, is_deleted)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(namespace_id, path) DO UPDATE SET
-    current_version_id=excluded.current_version_id,
-    current_version_number=excluded.current_version_number,
-    updated_at=excluded.updated_at,
-    is_deleted=excluded.is_deleted
-""".strip(),
-                (
-                    version.namespace_id,
-                    version.file_path,
-                    version.id,
-                    version.version_number,
-                    now,
-                    now,
-                    int(version.is_tombstone),
-                ),
-            )
-        else:
-            # CAS update — precondition was verified above
-            await self._db.execute(
-                """
-UPDATE files SET current_version_id=?, current_version_number=?,
-    updated_at=?, is_deleted=?
-WHERE namespace_id=? AND path=? AND current_version_number=?
-""".strip(),
-                (
-                    version.id,
-                    version.version_number,
-                    now,
-                    int(version.is_tombstone),
-                    version.namespace_id,
-                    version.file_path,
-                    expected_version,
-                ),
-            )
+            await self._db.execute(insert(versions).values(**version_values))
 
         await self._auto_commit()
 
     async def get_version(self, namespace_id: str, path: str, version_number: int | None = None) -> VersionMeta | None:
         """Return the specified version, or the latest when version_number is None."""
+        stmt = select(versions).where(versions.c.namespace_id == namespace_id, versions.c.file_path == path)
         if version_number is None:
-            row = await self._execute_fetchone(
-                """
-SELECT * FROM versions
-WHERE namespace_id=? AND file_path=?
-ORDER BY version_number DESC LIMIT 1
-""".strip(),
-                (namespace_id, path),
-            )
+            stmt = stmt.order_by(versions.c.version_number.desc()).limit(1)
         else:
-            row = await self._execute_fetchone(
-                """
-SELECT * FROM versions
-WHERE namespace_id=? AND file_path=? AND version_number=?
-""".strip(),
-                (namespace_id, path, version_number),
-            )
+            stmt = stmt.where(versions.c.version_number == version_number)
+        row = (await self._db.execute(stmt)).first()
         if row is None:
             return None
         return self._row_to_version(row)
@@ -342,98 +254,78 @@ WHERE namespace_id=? AND file_path=? AND version_number=?
         before: int | None = None,
     ) -> list[VersionMeta]:
         """Return up to limit versions, newest-first; cursor-paginate with before."""
+        stmt = select(versions).where(versions.c.namespace_id == namespace_id, versions.c.file_path == path)
         if before is not None:
-            rows = await self._execute_fetchall(
-                """
-SELECT * FROM versions
-WHERE namespace_id=? AND file_path=? AND version_number < ?
-ORDER BY version_number DESC LIMIT ?
-""".strip(),
-                (namespace_id, path, before, limit),
-            )
-        else:
-            rows = await self._execute_fetchall(
-                """
-SELECT * FROM versions
-WHERE namespace_id=? AND file_path=?
-ORDER BY version_number DESC LIMIT ?
-""".strip(),
-                (namespace_id, path, limit),
-            )
+            stmt = stmt.where(versions.c.version_number < before)
+        stmt = stmt.order_by(versions.c.version_number.desc()).limit(limit)
+        rows = (await self._db.execute(stmt)).fetchall()
         return [self._row_to_version(row) for row in rows]
 
     # --- Permissions ---
 
     async def check_permission(self, principal_id: str, namespace_id: str, path: str, operation: str) -> bool:
         """Return True if the principal's most-specific matching rule allows operation."""
-        rows = await self._execute_fetchall(
-            "SELECT path_prefix, operations FROM permissions WHERE principal_id=? AND namespace_id=?",
-            (principal_id, namespace_id),
-        )
+        rows = (
+            await self._db.execute(
+                select(permissions.c.path_prefix, permissions.c.operations).where(
+                    permissions.c.principal_id == principal_id,
+                    permissions.c.namespace_id == namespace_id,
+                )
+            )
+        ).fetchall()
         if not rows:
             return False
         # Sort by path_prefix length descending (most-specific first)
-        rows = sorted(rows, key=lambda r: len(r[0]), reverse=True)
+        rows = sorted(rows, key=lambda r: len(r.path_prefix), reverse=True)
         for row in rows:
-            prefix = row[0]
-            if path.startswith(prefix):
-                operations = set(json.loads(row[1]))
-                return operation in operations
+            if path.startswith(row.path_prefix):
+                return operation in set(row.operations)
         return False
 
     async def set_permission(self, permission: Permission) -> None:
         """Insert or replace the permission entry for the given (principal, namespace, path_prefix) scope."""
-        await self._db.execute(
-            """
-INSERT INTO permissions
-    (id, principal_id, namespace_id, path_prefix, operations, created_at)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(principal_id, namespace_id, path_prefix) DO UPDATE SET
-    id=excluded.id,
-    operations=excluded.operations,
-    created_at=excluded.created_at
-""".strip(),
-            (
-                permission.id,
-                permission.principal_id,
-                permission.namespace_id,
-                permission.path_prefix,
-                json.dumps(sorted(permission.operations)),
-                permission.created_at.isoformat(),
-            ),
+        stmt = sqlite_insert(permissions).values(
+            id=permission.id,
+            principal_id=permission.principal_id,
+            namespace_id=permission.namespace_id,
+            path_prefix=permission.path_prefix,
+            operations=sorted(permission.operations),
+            created_at=permission.created_at.isoformat(),
         )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["principal_id", "namespace_id", "path_prefix"],
+            set_={
+                "id": stmt.excluded.id,
+                "operations": stmt.excluded.operations,
+                "created_at": stmt.excluded.created_at,
+            },
+        )
+        await self._db.execute(stmt)
         await self._auto_commit()
 
     async def has_any_admin(self, namespace_id: str) -> bool:
         """Return True if any permission row in the namespace lists `admin` among its operations."""
-        rows = await self._execute_fetchall(
-            "SELECT operations FROM permissions WHERE namespace_id=?",
-            (namespace_id,),
-        )
-        return any("admin" in set(json.loads(row[0])) for row in rows)
+        rows = (
+            await self._db.execute(select(permissions.c.operations).where(permissions.c.namespace_id == namespace_id))
+        ).fetchall()
+        return any("admin" in set(row.operations) for row in rows)
 
     # --- Audit ---
 
     async def append_audit_event(self, event: AuditEvent) -> None:
         """Append an immutable audit record."""
         await self._db.execute(
-            """
-INSERT INTO audit_events
-    (event_id, timestamp, namespace_id, principal_id, operation,
-    path, version_id, detail, trace_id)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-""".strip(),
-            (
-                event.event_id,
-                event.timestamp.isoformat(),
-                event.namespace_id,
-                event.principal_id,
-                event.operation,
-                event.path,
-                event.version_id,
-                json.dumps(event.detail),
-                event.trace_id,
-            ),
+            insert(audit_events).values(
+                event_id=event.event_id,
+                timestamp=event.timestamp.isoformat(),
+                namespace_id=event.namespace_id,
+                principal_id=event.principal_id,
+                operation=event.operation,
+                path=event.path,
+                version_id=event.version_id,
+                detail=event.detail,
+                trace_id=event.trace_id,
+            )
         )
         await self._auto_commit()
 
@@ -441,10 +333,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 
     async def update_search_meta(self, version_id: str, search_meta: dict) -> None:
         """Update the search_meta field on a version record."""
-        await self._db.execute(
-            "UPDATE versions SET search_meta=? WHERE id=?",
-            (json.dumps(search_meta), version_id),
-        )
+        await self._db.execute(update(versions).where(versions.c.id == version_id).values(search_meta=search_meta))
         await self._auto_commit()
 
     # --- Name resolution ---
@@ -452,20 +341,22 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     async def set_name(self, entity_type: str, entity_id: str, display_name: str) -> None:
         """Register or replace the display name for an entity."""
         await self._db.execute(
-            """
-INSERT OR REPLACE INTO names (entity_type, entity_id, display_name)
-VALUES (?, ?, ?)
-""".strip(),
-            (entity_type, entity_id, display_name),
+            insert(names)
+            .prefix_with("OR REPLACE")
+            .values(entity_type=entity_type, entity_id=entity_id, display_name=display_name)
         )
         await self._auto_commit()
 
     async def resolve_name(self, entity_type: str, display_name: str) -> str | None:
         """Return the entity ID for a display name, or None if not found."""
-        row = await self._execute_fetchone(
-            "SELECT entity_id FROM names WHERE entity_type=? AND display_name=?",
-            (entity_type, display_name),
-        )
+        row = (
+            await self._db.execute(
+                select(names.c.entity_id).where(
+                    names.c.entity_type == entity_type,
+                    names.c.display_name == display_name,
+                )
+            )
+        ).first()
         return row[0] if row else None
 
     # --- GC ---
@@ -474,29 +365,28 @@ VALUES (?, ?, ?)
         self, policy: RetentionPolicy, namespace_id: str | None = None
     ) -> list[VersionMeta]:
         """Return non-tombstone versions exceeding the retention policy, excluding version 1 and the current version."""
-        # Get all files in scope
+        file_select = select(files.c.namespace_id, files.c.path)
         if namespace_id:
-            file_rows = await self._execute_fetchall(
-                "SELECT namespace_id, path FROM files WHERE namespace_id=?",
-                (namespace_id,),
-            )
-        else:
-            file_rows = await self._execute_fetchall("SELECT namespace_id, path FROM files")
+            file_select = file_select.where(files.c.namespace_id == namespace_id)
+        file_rows = (await self._db.execute(file_select)).fetchall()
 
         reclaimable: list[VersionMeta] = []
-        for ns_id, path in file_rows:
-            versions = await self._execute_fetchall(
-                """
-SELECT * FROM versions
-WHERE namespace_id=? AND file_path=? AND is_tombstone=0
-ORDER BY version_number DESC
-""".strip(),
-                (ns_id, path),
-            )
-            if len(versions) <= policy.max_recent_versions:
+        for file_row in file_rows:
+            version_rows = (
+                await self._db.execute(
+                    select(versions)
+                    .where(
+                        versions.c.namespace_id == file_row.namespace_id,
+                        versions.c.file_path == file_row.path,
+                        versions.c.is_tombstone == False,  # noqa: E712 — SQL boolean comparison
+                    )
+                    .order_by(versions.c.version_number.desc())
+                )
+            ).fetchall()
+            if len(version_rows) <= policy.max_recent_versions:
                 continue
             # Keep the N most recent
-            excess = versions[policy.max_recent_versions :]
+            excess = version_rows[policy.max_recent_versions :]
             for row in excess:
                 ver = self._row_to_version(row)
                 # Always keep first version if configured
@@ -509,55 +399,47 @@ ORDER BY version_number DESC
         """Hard-delete version records by ID."""
         if not version_ids:
             return
-        placeholders = ",".join("?" for _ in version_ids)
-        await self._db.execute(
-            f"DELETE FROM versions WHERE id IN ({placeholders})",  # noqa: S608 — placeholders are ? params, not user data
-            tuple(version_ids),
-        )
+        await self._db.execute(delete(versions).where(versions.c.id.in_(version_ids)))
         await self._auto_commit()
 
     async def has_version_references(self, content_hash: str) -> bool:
         """Return True if any version record references the given content hash."""
-        row = await self._execute_fetchone(
-            "SELECT 1 FROM versions WHERE content_hash=? LIMIT 1",
-            (content_hash,),
-        )
+        row = (
+            await self._db.execute(select(versions.c.id).where(versions.c.content_hash == content_hash).limit(1))
+        ).first()
         return row is not None
 
     # --- Entity persistence ---
 
-    async def put_namespace(self, namespace: "Namespace") -> None:
+    async def put_namespace(self, namespace: Namespace) -> None:
         """Persist a namespace record."""
+        retention = (
+            json.dumps(namespace.retention_policy.model_dump(), default=str) if namespace.retention_policy else None
+        )
         await self._db.execute(
-            """
-INSERT OR REPLACE INTO namespaces (id, display_name, created_at, created_by, retention_policy)
-VALUES (?, ?, ?, ?, ?)
-""".strip(),
-            (
-                namespace.id,
-                namespace.display_name,
-                namespace.created_at.isoformat(),
-                namespace.created_by,
-                json.dumps(namespace.retention_policy.model_dump(), default=str)
-                if namespace.retention_policy
-                else None,
-            ),
+            insert(namespaces)
+            .prefix_with("OR REPLACE")
+            .values(
+                id=namespace.id,
+                display_name=namespace.display_name,
+                created_at=namespace.created_at.isoformat(),
+                created_by=namespace.created_by,
+                retention_policy=retention,
+            )
         )
         await self._auto_commit()
 
-    async def put_principal(self, principal: "Principal") -> None:
+    async def put_principal(self, principal: Principal) -> None:
         """Persist a principal record."""
         await self._db.execute(
-            """
-INSERT OR REPLACE INTO principals (id, display_name, principal_type, created_at)
-VALUES (?, ?, ?, ?)
-""".strip(),
-            (
-                principal.id,
-                principal.display_name,
-                principal.principal_type,
-                principal.created_at.isoformat(),
-            ),
+            insert(principals)
+            .prefix_with("OR REPLACE")
+            .values(
+                id=principal.id,
+                display_name=principal.display_name,
+                principal_type=principal.principal_type,
+                created_at=principal.created_at.isoformat(),
+            )
         )
         await self._auto_commit()
 
@@ -565,14 +447,17 @@ VALUES (?, ?, ?, ?)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
-        """Async context manager for atomic multi-step operations; rolls back on exception."""
-        await self._db.execute("BEGIN")
+        """Async context manager for atomic multi-step operations; rolls back on exception.
+
+        Suppresses per-operation auto-commit so all writes share one transaction on the
+        held connection, committing on success and rolling back on any exception.
+        """
         self._in_transaction = True
         try:
             yield
-            await self._db.execute("COMMIT")
+            await self._db.commit()
         except Exception:
-            await self._db.execute("ROLLBACK")
+            await self._db.rollback()
             raise
         finally:
             self._in_transaction = False
@@ -580,17 +465,29 @@ VALUES (?, ?, ?, ?)
     # --- Row mapping helpers ---
 
     @staticmethod
-    def _row_to_version(row: tuple) -> VersionMeta:
+    def _row_to_file(row: sa.Row) -> FileMeta:
+        return FileMeta(
+            namespace_id=row.namespace_id,
+            path=row.path,
+            current_version_id=row.current_version_id,
+            current_version_number=row.current_version_number,
+            created_at=datetime.fromisoformat(row.created_at),
+            updated_at=datetime.fromisoformat(row.updated_at),
+            is_deleted=bool(row.is_deleted),
+        )
+
+    @staticmethod
+    def _row_to_version(row: sa.Row) -> VersionMeta:
         return VersionMeta(
-            id=row[0],
-            file_path=row[1],
-            namespace_id=row[2],
-            version_number=row[3],
-            content_hash=row[4],
-            size=row[5],
-            created_at=datetime.fromisoformat(row[6]),
-            created_by=row[7],
-            is_tombstone=bool(row[8]),
-            search_meta=json.loads(row[9]) if row[9] else {},
-            parent_version_id=row[10],
+            id=row.id,
+            file_path=row.file_path,
+            namespace_id=row.namespace_id,
+            version_number=row.version_number,
+            content_hash=row.content_hash,
+            size=row.size,
+            created_at=datetime.fromisoformat(row.created_at),
+            created_by=row.created_by,
+            is_tombstone=bool(row.is_tombstone),
+            search_meta=row.search_meta if row.search_meta else {},
+            parent_version_id=row.parent_version_id,
         )

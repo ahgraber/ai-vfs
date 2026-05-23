@@ -11,11 +11,21 @@ from vfs.stores.local_blob import LocalFSBlobStore
 from vfs.stores.sqlite_metadata import SQLiteMetadataStore
 
 
-async def _make_stores(tmp_path):
-    meta = SQLiteMetadataStore(":memory:")
-    await meta.initialize()
-    blob = LocalFSBlobStore(tmp_path / "blobs")
-    return meta, blob
+@pytest_asyncio.fixture
+async def make_stores(tmp_path):
+    """Factory yielding (meta, blob) stores, closing each metadata store on teardown."""
+    created: list[SQLiteMetadataStore] = []
+
+    async def _make():
+        meta = SQLiteMetadataStore(":memory:")
+        await meta.initialize()
+        blob = LocalFSBlobStore(tmp_path / "blobs")
+        created.append(meta)
+        return meta, blob
+
+    yield _make
+    for meta in created:
+        await meta.close()
 
 
 def _version(ns, path, num, content_hash="h1"):
@@ -39,8 +49,8 @@ def _version(ns, path, num, content_hash="h1"):
 
 class TestGarbageCollector:
     @pytest.mark.asyncio
-    async def test_version_gc_respects_max_recent(self, tmp_path):
-        meta, blob = await _make_stores(tmp_path)
+    async def test_version_gc_respects_max_recent(self, make_stores):
+        meta, blob = await make_stores()
         config = VFSConfig(retention_max_recent=2, audit_log_enabled=False)
         for i in range(1, 6):
             v = _version("ns1", "/a.py", i, f"h{i}")
@@ -52,8 +62,8 @@ class TestGarbageCollector:
         assert result.versions_reclaimed == 2
 
     @pytest.mark.asyncio
-    async def test_version_gc_keeps_first_version(self, tmp_path):
-        meta, blob = await _make_stores(tmp_path)
+    async def test_version_gc_keeps_first_version(self, make_stores):
+        meta, blob = await make_stores()
         config = VFSConfig(retention_max_recent=1, audit_log_enabled=False)
         for i in range(1, 4):
             v = _version("ns1", "/a.py", i, f"h{i}")
@@ -66,8 +76,8 @@ class TestGarbageCollector:
         assert 1 in nums  # first version kept
 
     @pytest.mark.asyncio
-    async def test_version_gc_keeps_current(self, tmp_path):
-        meta, blob = await _make_stores(tmp_path)
+    async def test_version_gc_keeps_current(self, make_stores):
+        meta, blob = await make_stores()
         config = VFSConfig(retention_max_recent=1, audit_log_enabled=False)
         for i in range(1, 4):
             v = _version("ns1", "/a.py", i, f"h{i}")
@@ -80,8 +90,8 @@ class TestGarbageCollector:
         assert 3 in nums  # current version kept
 
     @pytest.mark.asyncio
-    async def test_blob_gc_removes_orphaned_blobs(self, tmp_path):
-        meta, blob = await _make_stores(tmp_path)
+    async def test_blob_gc_removes_orphaned_blobs(self, make_stores):
+        meta, blob = await make_stores()
         config = VFSConfig(retention_max_recent=50, audit_log_enabled=False)
         # Put a blob manually (no version references it)
         await blob.put("orphaned_hash_0000000000000000", b"orphan data")
@@ -91,8 +101,8 @@ class TestGarbageCollector:
         assert not await blob.exists("orphaned_hash_0000000000000000")
 
     @pytest.mark.asyncio
-    async def test_blob_gc_keeps_referenced_blobs(self, tmp_path):
-        meta, blob = await _make_stores(tmp_path)
+    async def test_blob_gc_keeps_referenced_blobs(self, make_stores):
+        meta, blob = await make_stores()
         config = VFSConfig(retention_max_recent=50, audit_log_enabled=False)
         await blob.put("referenced_hash_00000000000000", b"data")
         v = _version("ns1", "/a.py", 1, "referenced_hash_00000000000000")
@@ -103,8 +113,8 @@ class TestGarbageCollector:
         assert await blob.exists("referenced_hash_00000000000000")
 
     @pytest.mark.asyncio
-    async def test_gc_creates_audit_event(self, tmp_path):
-        meta, blob = await _make_stores(tmp_path)
+    async def test_gc_creates_audit_event(self, make_stores):
+        meta, blob = await make_stores()
         config = VFSConfig(retention_max_recent=50, audit_log_enabled=True)
         gc = GarbageCollector(meta, blob, config)
         await gc.run()
@@ -113,20 +123,20 @@ class TestGarbageCollector:
         assert "gc_run" in ops
 
     @pytest.mark.asyncio
-    async def test_gc_run_sets_process_title(self, tmp_path, monkeypatch):
+    async def test_gc_run_sets_process_title(self, make_stores, monkeypatch):
         """ProcessIdentification (design D11): GarbageCollector.run sets the process title."""
         import setproctitle
 
         captured: list[str] = []
         monkeypatch.setattr(setproctitle, "setproctitle", lambda t: captured.append(t))
-        meta, blob = await _make_stores(tmp_path)
+        meta, blob = await make_stores()
         config = VFSConfig(retention_max_recent=50, audit_log_enabled=False)
         gc = GarbageCollector(meta, blob, config)
         await gc.run()
         assert "ai-vfs: gc" in captured
 
     @pytest.mark.asyncio
-    async def test_audit_log_survives_gc(self, tmp_path):
+    async def test_audit_log_survives_gc(self, make_stores):
         """AuditLogAppendOnly: GC reclaims versions/blobs but MUST NOT touch audit_events."""
         from datetime import datetime, timezone
 
@@ -134,7 +144,7 @@ class TestGarbageCollector:
 
         from vfs.models import AuditEvent
 
-        meta, blob = await _make_stores(tmp_path)
+        meta, blob = await make_stores()
         config = VFSConfig(retention_max_recent=1, audit_log_enabled=False)
         # Seed an audit event for an unrelated prior operation.
         seeded = AuditEvent(
@@ -168,11 +178,11 @@ class TestGarbageCollector:
         assert after_ids == before_ids
 
     @pytest.mark.asyncio
-    async def test_gc_cross_namespace_blob_preservation(self, tmp_path):
+    async def test_gc_cross_namespace_blob_preservation(self, make_stores):
         """VersionGarbageCollection / GCPreservesSharedBlobs:
         a content_hash referenced by a version in ns2 SHALL NOT be deleted when GC runs on ns1.
         """
-        meta, blob = await _make_stores(tmp_path)
+        meta, blob = await make_stores()
         config = VFSConfig(retention_max_recent=1, audit_log_enabled=False)
         shared_hash = "shared_hash_xxxxxxxxxxxxxxxxxxxxxxxx"
         await blob.put(shared_hash, b"shared content")
