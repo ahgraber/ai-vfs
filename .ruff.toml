@@ -110,6 +110,7 @@ unfixable = ["B"]
 # "path/to/file.py" = ["E402"]
 ".ci/*" = ["D"]
 "docs/*" = ["D"]
+"migrations/*" = ["D"]  # Alembic scaffolding: revision message as docstring; upgrade/downgrade undocumented by convention
 "notebooks/*" = ["B018", "D", "S"]
 "**/tests/*" = ["D", "S101", "S301"]
 

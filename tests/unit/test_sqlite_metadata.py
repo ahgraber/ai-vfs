@@ -167,6 +167,24 @@ class TestFileAndVersionOps:
         assert versions[0].version_number == 1
 
     @pytest.mark.asyncio
+    async def test_put_version_cas_conflict_at_write_site(self, sqlite_store):
+        """MetadataCASSemantics/CASConflictDetected: a file at version 5 rejects an
+        expected_version=3 write at the `WHERE current_version_number = ?` write site,
+        leaving the pointer at 5 and inserting no orphan version row."""
+        for i in range(1, 6):
+            v = _version("ns1", "/a.py", i, content_hash=f"h{i}")
+            await sqlite_store.put_version(v, expected_version=None if i == 1 else i - 1)
+        stale = _version("ns1", "/a.py", 6, content_hash="h6")
+        with pytest.raises(ConflictError):
+            await sqlite_store.put_version(stale, expected_version=3)
+        # Pointer unchanged and the rejected write left no version row behind.
+        f = await sqlite_store.get_file("ns1", "/a.py")
+        assert f.current_version_number == 5
+        versions = await sqlite_store.list_versions("ns1", "/a.py", limit=100)
+        assert len(versions) == 5
+        assert stale.id not in {v.id for v in versions}
+
+    @pytest.mark.asyncio
     async def test_list_dir_excludes_deleted(self, sqlite_store):
         """list_dir must not return files with is_deleted=True."""
         now = _now()

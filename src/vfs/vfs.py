@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import importlib
+import importlib.util
 import time
 
 import blake3
@@ -40,12 +42,45 @@ from vfs.stores.cached_blob import CachedBlobStore
 from vfs.stores.local_blob import LocalFSBlobStore
 from vfs.stores.sqlite_metadata import SQLiteMetadataStore
 
+#: Built-in adapters with no optional dependency, mapping URI scheme to class.
 _METADATA_SCHEMES = {
     "sqlite:///": SQLiteMetadataStore,
 }
 _BLOB_SCHEMES = {
     "file:///": LocalFSBlobStore,
 }
+
+#: Adapters resolved lazily because they require an installable extra.
+#: scheme -> (extra_name, driver_module, adapter_module, class_name).
+#: Driver-backed adapters receive the full URI (asyncpg/motor/aiobotocore parse it themselves).
+_METADATA_OPTIONAL = {
+    "postgresql://": ("postgres", "asyncpg", "vfs.stores.postgres_metadata", "PostgresMetadataStore"),
+    "mongodb://": ("mongo", "motor", "vfs.stores.mongo_metadata", "MongoMetadataStore"),
+}
+_BLOB_OPTIONAL = {
+    "s3://": ("s3", "aiobotocore", "vfs.stores.s3_blob", "S3BlobStore"),
+}
+
+
+def _load_optional_adapter(scheme: str, spec: tuple[str, str, str, str]) -> type:
+    """Import and return an optional adapter class, or raise a clear, actionable error.
+
+    Both the driver and the adapter module are probed before import so neither a missing
+    optional dependency nor a not-yet-shipped adapter surfaces as an opaque
+    ``ModuleNotFoundError``.
+    """
+    extra, driver, adapter_module, class_name = spec
+    if importlib.util.find_spec(driver) is None:
+        raise ImportError(
+            f"{scheme!r} support requires the optional {extra!r} extra "
+            f"(missing dependency {driver!r}). Install it with: pip install 'ai-vfs[{extra}]'"
+        )
+    if importlib.util.find_spec(adapter_module) is None:
+        raise ImportError(
+            f"{scheme!r} support is not available in this build of ai-vfs (adapter {adapter_module!r} is not present)."
+        )
+    module = importlib.import_module(adapter_module)
+    return getattr(module, class_name)
 
 
 def _require_absolute(path: str) -> None:
@@ -63,23 +98,27 @@ class VFS:
         self._blob = self._resolve_blob_store()
         self._search = DefaultSearchProvider()
 
-    def _resolve_metadata_store(self) -> SQLiteMetadataStore:
+    def _resolve_metadata_store(self):
         uri = self._config.metadata_store_uri
         for scheme, cls in _METADATA_SCHEMES.items():
             if uri.startswith(scheme):
-                path = uri[len(scheme) :]
-                return cls(path)
-        supported = ", ".join(_METADATA_SCHEMES.keys())
+                return cls(uri[len(scheme) :])
+        for scheme, spec in _METADATA_OPTIONAL.items():
+            if uri.startswith(scheme):
+                return _load_optional_adapter(scheme, spec)(uri)
+        supported = ", ".join([*_METADATA_SCHEMES, *_METADATA_OPTIONAL])
         raise ValueError(f"Unsupported metadata URI {uri!r}. Supported: {supported}")
 
     def _resolve_blob_store(self):
         uri = self._config.blob_store_uri
         for scheme, cls in _BLOB_SCHEMES.items():
             if uri.startswith(scheme):
-                path = uri[len(scheme) :]
-                store = cls(path)
+                return self._maybe_wrap_cache(cls(uri[len(scheme) :]), uri)
+        for scheme, spec in _BLOB_OPTIONAL.items():
+            if uri.startswith(scheme):
+                store = _load_optional_adapter(scheme, spec)(uri)
                 return self._maybe_wrap_cache(store, uri)
-        supported = ", ".join(_BLOB_SCHEMES.keys())
+        supported = ", ".join([*_BLOB_SCHEMES, *_BLOB_OPTIONAL])
         raise ValueError(f"Unsupported blob URI {uri!r}. Supported: {supported}")
 
     def _maybe_wrap_cache(self, store, uri: str):
