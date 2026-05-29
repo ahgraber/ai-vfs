@@ -144,6 +144,24 @@ class TestOptionalAdapterResolution:
         # No connection opened at construction time.
         assert vfs._meta._conn is None
 
+    @pytest.mark.skipif(
+        importlib.util.find_spec("motor") is None,
+        reason="requires the 'mongo' extra (motor) to import the adapter",
+    )
+    def test_mongodb_uri_resolves_to_mongo_store(self, tmp_path):
+        """MongoURIResolution: with the mongo extra installed, a mongodb:// URI resolves to
+        MongoMetadataStore. Construction must not open a client/connection."""
+        from vfs.stores.mongo_metadata import MongoMetadataStore
+
+        config = VFSConfig(
+            metadata_store_uri="mongodb://localhost/aifs",
+            blob_store_uri=f"file:///{tmp_path}/blobs/",
+        )
+        vfs = VFS(config)
+        assert isinstance(vfs._meta, MongoMetadataStore)
+        # No client/connection opened at construction time.
+        assert vfs._meta._client is None
+
 
 class TestProcessIdentification:
     """ProcessIdentification (design D11): VFS.initialize sets the process title when running as a service."""
