@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
+from pyleak import no_task_leaks
 import pytest
 import pytest_asyncio
 
@@ -409,6 +411,26 @@ class TestAuditSearchNamesGC:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_set_name_duplicate_raises_conflict_and_store_stays_usable(self, sqlite_store):
+        """A different entity claiming an existing display name raises ConflictError, the
+        store stays usable after the aborted statement, and same-entity rename still works."""
+        await sqlite_store.set_name("namespace", "id_A", "shared")
+
+        # A different entity of the same type claiming "shared" is rejected cleanly.
+        with pytest.raises(ConflictError):
+            await sqlite_store.set_name("namespace", "id_B", "shared")
+
+        # After the rejected write the store is still usable: the original mapping holds,
+        # and a fresh, non-conflicting write succeeds.
+        assert await sqlite_store.resolve_name("namespace", "shared") == "id_A"
+        await sqlite_store.set_name("namespace", "id_C", "other")
+        assert await sqlite_store.resolve_name("namespace", "other") == "id_C"
+
+        # The legitimate same-entity rename still works.
+        await sqlite_store.set_name("namespace", "id_A", "renamed")
+        assert await sqlite_store.resolve_name("namespace", "renamed") == "id_A"
+
+    @pytest.mark.asyncio
     async def test_list_reclaimable_versions(self, sqlite_store):
         for i in range(1, 4):
             v = _version("ns1", "/a.py", i, content_hash=f"h{i}")
@@ -435,3 +457,83 @@ class TestAuditSearchNamesGC:
     @pytest.mark.asyncio
     async def test_conforms_to_protocol(self, sqlite_store):
         assert isinstance(sqlite_store, MetadataStore)
+
+
+class TestConcurrencyAndIsolation:
+    """Findings 1 & 2: the single connection is serialized by an asyncio.Lock, transactions
+    are exclusive per task, and reads commit so the connection is never idle-in-transaction.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_put_version_no_corruption(self, sqlite_store):
+        """Concurrent operations on the one shared connection must not corrupt or raise:
+        the lock serializes them. All 20 writes land and are readable afterward."""
+        async with no_task_leaks(action="raise"):
+            await asyncio.gather(
+                *[sqlite_store.put_version(_version("ns", f"/f{i}.py", 1), expected_version=None) for i in range(20)]
+            )
+        for i in range(20):
+            f = await sqlite_store.get_file("ns", f"/f{i}.py")
+            assert f is not None
+            assert f.current_version_number == 1
+            v = await sqlite_store.get_version("ns", f"/f{i}.py")
+            assert v is not None
+
+    @pytest.mark.asyncio
+    async def test_transaction_isolation_across_tasks(self, sqlite_store):
+        """A transaction() in task A is exclusive: a concurrent write in task B does not join
+        A's transaction. When A rolls back, B's committed write survives and A's does not."""
+        b_started = asyncio.Event()
+
+        def _file(path: str) -> FileMeta:
+            now = _now()
+            return FileMeta(
+                namespace_id="ns1",
+                path=path,
+                current_version_id="v1",
+                current_version_number=1,
+                created_at=now,
+                updated_at=now,
+            )
+
+        async def task_a() -> None:
+            async with sqlite_store.transaction():
+                await sqlite_store.put_file(_file("/X.py"))
+                # Release control so task B contends for the lock while A holds the txn.
+                b_started.set()
+                await asyncio.sleep(0.05)
+                raise RuntimeError("force rollback")
+
+        async def task_b() -> None:
+            # Ensure A has the lock/txn before B attempts its write (B blocks on the lock).
+            await b_started.wait()
+            await sqlite_store.put_file(_file("/Y.py"))
+
+        async with no_task_leaks(action="raise"):
+            results = await asyncio.gather(task_a(), task_b(), return_exceptions=True)
+
+        # Task A raised (and rolled back); task B succeeded.
+        assert isinstance(results[0], RuntimeError)
+        assert results[1] is None
+
+        # B's write is committed independently; A's write was rolled back, not committed by B.
+        assert await sqlite_store.get_file("ns1", "/Y.py") is not None
+        assert await sqlite_store.get_file("ns1", "/X.py") is None
+
+    @pytest.mark.asyncio
+    async def test_read_leaves_no_open_transaction(self, sqlite_store):
+        """A read commits inside _operation(), so the connection is not idle-in-transaction
+        afterward (the portable assertion for the Finding 2 fix)."""
+        await sqlite_store.put_file(
+            FileMeta(
+                namespace_id="ns1",
+                path="/a.py",
+                current_version_id="v1",
+                current_version_number=1,
+                created_at=_now(),
+                updated_at=_now(),
+            )
+        )
+        result = await sqlite_store.get_file("ns1", "/a.py")
+        assert result is not None
+        assert sqlite_store._db.in_transaction() is False

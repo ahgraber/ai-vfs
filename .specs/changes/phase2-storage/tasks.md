@@ -12,12 +12,12 @@
 
 ## Postgres Adapter
 
-- [ ] Implement `PostgresMetadataStore` on the shared Core schema with `asyncpg`, JSONB columns for `search_meta`/`detail`, and `BEGIN`/`COMMIT`/`ROLLBACK` `transaction()`
-- [ ] Implement Postgres CAS via `UPDATE ... WHERE version_number = ?` raising `ConflictError` on zero rows
-- [ ] Test (integration, Postgres fixture): file + version round-trip with non-empty `search_meta`/`detail` returns equal models, JSONB-stored (`MetadataStoreProtocol`/`PostgresAdapterRoundTrip`)
-- [ ] Test (integration): `put_version(expected_version=3)` against version 5 raises `ConflictError` (`MetadataCASSemantics`/`CASConflictDetected`, SQL write-site)
-- [ ] Test (integration): `transaction()` rolls back all writes on mid-transaction error (`MetadataTransactions`/`TransactionRollbackOnError`)
-- [ ] Test: with the `postgres` extra installed, the VFS resolves `postgresql://` to `PostgresMetadataStore` (`URIBasedStoreResolution`/`PostgresURIResolution`)
+- [x] Implement `PostgresMetadataStore` on the shared Core schema with `asyncpg`, JSONB columns for `search_meta`/`detail`, and `BEGIN`/`COMMIT`/`ROLLBACK` `transaction()`
+- [x] Implement Postgres CAS via `UPDATE ... WHERE version_number = ?` raising `ConflictError` on zero rows
+- [x] Test (integration, Postgres fixture): file + version round-trip with non-empty `search_meta`/`detail` returns equal models, JSONB-stored (`MetadataStoreProtocol`/`PostgresAdapterRoundTrip`)
+- [x] Test (integration): `put_version(expected_version=3)` against version 5 raises `ConflictError` (`MetadataCASSemantics`/`CASConflictDetected`, SQL write-site)
+- [x] Test (integration): `transaction()` rolls back all writes on mid-transaction error (`MetadataTransactions`/`TransactionRollbackOnError`)
+- [x] Test: with the `postgres` extra installed, the VFS resolves `postgresql://` to `PostgresMetadataStore` (`URIBasedStoreResolution`/`PostgresURIResolution`)
 
 ## Mongo Adapter
 
