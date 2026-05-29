@@ -93,6 +93,29 @@ class TestAccessControl:
         assert await vfs_instance.resolve_name("principal", "fresh-agent") == again.id
 
     @pytest.mark.asyncio
+    async def test_duplicate_namespace_no_orphan_on_best_effort_store(self, vfs_instance):
+        """With a best-effort no-op transaction(), set_name-before-put_namespace ordering
+        (not rollback) prevents an orphan: the uniqueness gate raises ConflictError and writes
+        nothing, so the duplicate never persists a namespace row."""
+        from contextlib import asynccontextmanager
+
+        # Simulate a best-effort store: transaction() is a no-op, so each write commits on its
+        # own — there is no rollback to lean on.
+        @asynccontextmanager
+        async def _noop_txn():
+            yield
+
+        vfs_instance._meta.transaction = _noop_txn
+
+        first = await vfs_instance.create_namespace("dup", "admin")
+        with pytest.raises(ConflictError):
+            await vfs_instance.create_namespace("dup", "admin")
+
+        # Exactly one namespace resolves for "dup", and it is the first id — no orphan written
+        # despite the no-op transaction.
+        assert await vfs_instance.resolve_name("namespace", "dup") == first.id
+
+    @pytest.mark.asyncio
     async def test_execute_permission_storable(self, vfs_instance, admin_factory):
         ns = await vfs_instance.create_namespace("ws", "admin")
         admin = await admin_factory(ns.id)

@@ -2,7 +2,7 @@
 #
 # Postgres backs tests/integration/test_postgres_metadata.py. Start it with:
 #
-#     docker compose -f tests/integration/docker-compose.yml up -d postgres
+#     docker compose -f tests/integration/docker-compose.yaml up -d postgres
 #
 # then point the test suite at it:
 #
@@ -13,11 +13,23 @@
 # connection to the `postgres` database, so the role in the DSN needs CREATEDB. The
 # default `aivfs` superuser below has it; the DSN's own database is never modified.
 #
+# Mongo backs tests/integration/test_mongo_metadata.py. Start it with:
+#
+#     docker compose -f tests/integration/docker-compose.yaml up -d mongo
+#
+# then point the test suite at it:
+#
+#     export AIVFS_TEST_MONGO_URI=mongodb://localhost:27017/aivfs
+#     uv run pytest tests/integration/test_mongo_metadata.py
+#
+# The tests provision a per-xdist-worker database (aivfs_test_<worker>) derived from the URI,
+# dropping it before and after each test, so parallel workers never clobber each other.
+#
 # Tear down with:
 #
-#     docker compose -f tests/integration/docker-compose.yml down -v
+#     docker compose -f tests/integration/docker-compose.yaml down -v
 #
-# MongoDB and MinIO services are added by their respective adapter task groups.
+# MinIO is added by its adapter task group.
 services:
   postgres:
     image: postgres:17-alpine
@@ -29,6 +41,15 @@ services:
       - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U aivfs -d aivfs"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
       interval: 5s
       timeout: 5s
       retries: 5

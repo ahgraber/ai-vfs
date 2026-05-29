@@ -21,17 +21,17 @@
 
 ## Mongo Adapter
 
-- [ ] Implement `MongoMetadataStore` with Motor, native subdocuments for `search_meta`/`detail`, and a documented best-effort no-op `transaction()` (real transaction when a session/replica set is available)
-- [ ] Implement Mongo CAS via `find_one_and_update({_id, version_number: expected}, ...)` raising `ConflictError` when no document matches
-- [ ] Test (integration, Mongo fixture): file + version round-trip with non-empty extensible fields returns equal models, subdocument-stored (`MetadataStoreProtocol`/`MongoAdapterRoundTrip`)
-- [ ] Test (integration): `put_version(expected_version=3)` against version 5 raises `ConflictError` via `find_one_and_update` (`MetadataCASSemantics`/`MongoCASConflict`, NoSQL write-site)
-- [ ] Test: with the `mongo` extra installed, the VFS resolves `mongodb://` to `MongoMetadataStore` (`URIBasedStoreResolution`/`MongoURIResolution`)
+- [x] Implement `MongoMetadataStore` with Motor, native subdocuments for `search_meta`/`detail`, and a documented best-effort no-op `transaction()`
+- [x] Implement Mongo CAS via `find_one_and_update({_id, version_number: expected}, ...)` raising `ConflictError` when no document matches
+- [x] Test (integration, Mongo fixture): file + version round-trip with non-empty extensible fields returns equal models, subdocument-stored (`MetadataStoreProtocol`/`MongoAdapterRoundTrip`)
+- [x] Test (integration): `put_version(expected_version=3)` against version 5 raises `ConflictError` via `find_one_and_update` (`MetadataCASSemantics`/`MongoCASConflict`, NoSQL write-site)
+- [x] Test: with the `mongo` extra installed, the VFS resolves `mongodb://` to `MongoMetadataStore` (`URIBasedStoreResolution`/`MongoURIResolution`)
 
 ## Move Ordering
 
-- [ ] Reorder `VFS.move()` to create the destination version before tombstoning the source, keeping the `transaction()` wrapper
-- [ ] Test: move on a transactional store leaves neither partial destination nor source tombstone after an injected mid-operation failure (`MoveFile`/`MoveAtomicOnTransactionalStore`)
-- [ ] Test: move on a best-effort `transaction()` store, failing after destination create and before source tombstone, leaves the file readable at both paths — no loss (`MoveFile`/`MoveNonDestructiveOnBestEffortStore`)
+- [x] Reorder `VFS.move()` to create the destination version before tombstoning the source, keeping the `transaction()` wrapper
+- [x] Test: move on a transactional store leaves neither partial destination nor source tombstone after an injected mid-operation failure (`MoveFile`/`MoveAtomicOnTransactionalStore`)
+- [x] Test: move on a best-effort `transaction()` store, failing after destination create and before source tombstone, leaves the file readable at both paths — no loss (`MoveFile`/`MoveNonDestructiveOnBestEffortStore`)
 
 ## S3 Blob Adapter & Cache
 

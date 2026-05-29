@@ -381,34 +381,19 @@ class TestVFSMove:
             await vfs_instance.move(ns.id, "/a.py", "/b.py", principal_id=read_only.id)
 
     @pytest.mark.asyncio
-    async def test_move_atomicity(self, vfs_instance):
-        """If dst creation fails mid-move, src must NOT be tombstoned (transaction rollback)."""
+    async def test_move_atomic_on_transactional_store(self, vfs_instance):
+        """MoveAtomicOnTransactionalStore: on the default SQLite store (real transaction), a
+        failure on the 2nd put_version (the source tombstone, issued after the destination
+        write) must roll back the whole block — neither a partial destination nor an
+        unintended source tombstone is observable."""
+        from vfs.errors import NotFoundError
+
         ns, p, admin = await _setup_ns_principal(vfs_instance)
         await vfs_instance.write(ns.id, "/src.py", b"data", principal_id=p.id)
 
-        # Sabotage: create a version at dst with the same version_number that
-        # the move would try to write, causing a UNIQUE constraint failure inside
-        # the transaction.
-        from datetime import datetime, timezone
-
-        from ulid import ULID
-
-        from vfs.models import VersionMeta
-
-        dst_ver = VersionMeta(
-            id=str(ULID()),
-            file_path="/dst.py",
-            namespace_id=ns.id,
-            version_number=1,
-            content_hash="fake",
-            size=0,
-            created_at=datetime.now(timezone.utc),
-            created_by=p.id,
-        )
-        await vfs_instance._meta.put_version(dst_ver, expected_version=None)
-
-        # Now attempt to move — the dst put_version will compute version_number=2
-        # but we need to force a conflict. Instead, we'll monkeypatch to raise mid-transaction.
+        # After the destination-before-source reorder, the 2nd put_version is the source
+        # tombstone. Inject a failure there; the SQLite transaction must roll back the
+        # already-issued destination write too.
         original_put = vfs_instance._meta.put_version
         call_count = 0
 
@@ -416,18 +401,66 @@ class TestVFSMove:
             nonlocal call_count
             call_count += 1
             if call_count == 2:
-                raise RuntimeError("Simulated dst failure")
+                raise RuntimeError("Simulated tombstone failure")
             return await original_put(version, expected_version=expected_version)
 
         vfs_instance._meta.put_version = failing_put
 
-        with pytest.raises(RuntimeError, match="Simulated dst failure"):
+        with pytest.raises(RuntimeError, match="Simulated tombstone failure"):
             await vfs_instance.move(ns.id, "/src.py", "/dst.py", principal_id=p.id)
 
-        # Source must NOT be tombstoned — transaction should have rolled back
+        vfs_instance._meta.put_version = original_put
+
+        # Source must NOT be tombstoned — the transaction rolled back.
         src = await vfs_instance.stat(ns.id, "/src.py", principal_id=p.id)
         assert src.is_deleted is False
         assert src.current_version_number == 1
+        # Destination must NOT have been created — the already-issued dst write rolled back.
+        assert await vfs_instance._meta.get_file(ns.id, "/dst.py") is None
+        with pytest.raises(NotFoundError):
+            await vfs_instance.stat(ns.id, "/dst.py", principal_id=p.id)
+
+    @pytest.mark.asyncio
+    async def test_move_non_destructive_on_best_effort_store(self, vfs_instance):
+        """MoveNonDestructiveOnBestEffortStore: with a best-effort no-op transaction(), each
+        put_version commits on its own. A failure on the 2nd put_version (the source
+        tombstone, after the destination is created) must leave the file readable at BOTH
+        source and destination — no version is lost."""
+        from contextlib import asynccontextmanager
+
+        ns, p, admin = await _setup_ns_principal(vfs_instance)
+        await vfs_instance.write(ns.id, "/src.py", b"data", principal_id=p.id)
+
+        # Simulate a best-effort store: transaction() becomes a no-op, so each put_version
+        # commits via the store's own per-operation boundary rather than as one unit.
+        @asynccontextmanager
+        async def _noop_txn():
+            yield
+
+        vfs_instance._meta.transaction = _noop_txn
+
+        # Fail on the 2nd put_version (the source tombstone) — after the destination is
+        # already created and committed.
+        original_put = vfs_instance._meta.put_version
+        call_count = 0
+
+        async def failing_put(version, *, expected_version=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("Simulated tombstone failure")
+            return await original_put(version, expected_version=expected_version)
+
+        vfs_instance._meta.put_version = failing_put
+
+        with pytest.raises(RuntimeError, match="Simulated tombstone failure"):
+            await vfs_instance.move(ns.id, "/src.py", "/dst.py", principal_id=p.id)
+
+        vfs_instance._meta.put_version = original_put
+
+        # No version lost: the file is readable at BOTH source and destination.
+        assert await vfs_instance.read(ns.id, "/src.py", principal_id=p.id) == b"data"
+        assert await vfs_instance.read(ns.id, "/dst.py", principal_id=p.id) == b"data"
 
     @pytest.mark.asyncio
     async def test_move_creates_audit_event(self, vfs_instance):

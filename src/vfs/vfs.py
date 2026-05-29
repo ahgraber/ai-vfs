@@ -453,7 +453,24 @@ class VFS:
             now = datetime.now(timezone.utc)
 
             async with self._meta.transaction():
-                # Tombstone source
+                # Create at destination FIRST. On a best-effort no-op transaction()
+                # (standalone Mongo) each put_version commits on its own, so writing the
+                # destination before the source tombstone makes a mid-move failure
+                # non-destructive (a duplicate, never a loss) per the MoveFile spec; on a
+                # transactional store the whole block still rolls back atomically.
+                new_version = VersionMeta(
+                    id=str(ULID()),
+                    file_path=dst,
+                    namespace_id=namespace_id,
+                    version_number=dst_version_number,
+                    content_hash=src_version.content_hash,
+                    size=src_version.size,
+                    created_at=now,
+                    created_by=principal_id,
+                )
+                await self._meta.put_version(new_version)
+
+                # Tombstone source second.
                 tombstone = VersionMeta(
                     id=str(ULID()),
                     file_path=src,
@@ -466,19 +483,6 @@ class VFS:
                     is_tombstone=True,
                 )
                 await self._meta.put_version(tombstone)
-
-                # Create at destination
-                new_version = VersionMeta(
-                    id=str(ULID()),
-                    file_path=dst,
-                    namespace_id=namespace_id,
-                    version_number=dst_version_number,
-                    content_hash=src_version.content_hash,
-                    size=src_version.size,
-                    created_at=now,
-                    created_by=principal_id,
-                )
-                await self._meta.put_version(new_version)
 
             await audit_move(
                 self._meta,
@@ -738,11 +742,13 @@ class VFS:
             created_at=datetime.now(timezone.utc),
             created_by=created_by,
         )
-        # Atomic so a duplicate display_name (ConflictError from set_name) rolls back the
-        # namespace row rather than leaving an entity with no resolvable name.
+        # set_name() is the uniqueness gate: a duplicate display_name raises ConflictError
+        # and writes nothing, so claiming the name BEFORE persisting the namespace prevents
+        # an orphan entity even on a best-effort no-op transaction() (standalone Mongo). On a
+        # transactional store the whole block still rolls back atomically.
         async with self._meta.transaction():
-            await self._meta.put_namespace(ns)
             await self._meta.set_name("namespace", ns.id, display_name)
+            await self._meta.put_namespace(ns)
         return ns
 
     async def create_principal(self, display_name: str, principal_type: str = "agent") -> Principal:
@@ -755,11 +761,13 @@ class VFS:
             principal_type=principal_type,
             created_at=datetime.now(timezone.utc),
         )
-        # Atomic so a duplicate display_name (ConflictError from set_name) rolls back the
-        # principal row rather than leaving an entity with no resolvable name.
+        # set_name() is the uniqueness gate: a duplicate display_name raises ConflictError
+        # and writes nothing, so claiming the name BEFORE persisting the principal prevents
+        # an orphan entity even on a best-effort no-op transaction() (standalone Mongo). On a
+        # transactional store the whole block still rolls back atomically.
         async with self._meta.transaction():
-            await self._meta.put_principal(p)
             await self._meta.set_name("principal", p.id, display_name)
+            await self._meta.put_principal(p)
         return p
 
     async def resolve_name(self, entity_type: str, display_name: str) -> str | None:
