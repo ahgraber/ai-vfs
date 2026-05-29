@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from vfs.errors import PermissionDeniedError
+from vfs.errors import ConflictError, PermissionDeniedError
 
 
 class TestAccessControl:
@@ -68,6 +68,29 @@ class TestAccessControl:
         # Verify it's a valid UUID4
         parsed = uuid.UUID(p.id)
         assert parsed.version == 4
+
+    @pytest.mark.asyncio
+    async def test_duplicate_namespace_name_is_atomic(self, vfs_instance):
+        """A duplicate display name raises ConflictError and leaves no orphan namespace:
+        the name still resolves to the first namespace, and the VFS stays usable."""
+        first = await vfs_instance.create_namespace("dup-ws", "admin")
+        with pytest.raises(ConflictError):
+            await vfs_instance.create_namespace("dup-ws", "admin")
+        # The first namespace's name mapping is intact (the failed create rolled back).
+        assert await vfs_instance.resolve_name("namespace", "dup-ws") == first.id
+        # Store remains usable for subsequent, non-conflicting work.
+        other = await vfs_instance.create_namespace("other-ws", "admin")
+        assert await vfs_instance.resolve_name("namespace", "other-ws") == other.id
+
+    @pytest.mark.asyncio
+    async def test_duplicate_principal_name_is_atomic(self, vfs_instance):
+        """Duplicate principal display name raises ConflictError without orphaning the row."""
+        first = await vfs_instance.create_principal("dup-agent")
+        with pytest.raises(ConflictError):
+            await vfs_instance.create_principal("dup-agent")
+        assert await vfs_instance.resolve_name("principal", "dup-agent") == first.id
+        again = await vfs_instance.create_principal("fresh-agent")
+        assert await vfs_instance.resolve_name("principal", "fresh-agent") == again.id
 
     @pytest.mark.asyncio
     async def test_execute_permission_storable(self, vfs_instance, admin_factory):

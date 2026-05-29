@@ -105,7 +105,7 @@ For multi-step tasks, state a brief plan defining the step task and associated v
 
 - Semantic Versioning is REQUIRED (MAJOR.MINOR.PATCH).
 - Conventional Commits are REQUIRED for commit messages and/or PR titles.
-- Keep a Changelog is REQUIRED; maintain `CHANGELOG.md` following <https://keepachangelog.com>.
+- Changelog updates are generated during the release process.
 - After the first MINOR release, all changes affecting data/schema/contracts MUST include a migration plan and a deprecation schedule.
 
 ## Testing

@@ -6,7 +6,6 @@ import importlib.metadata
 import importlib.util
 
 import pytest
-import pytest_asyncio
 
 from vfs.config import VFSConfig
 from vfs.stores.cached_blob import CachedBlobStore
@@ -126,6 +125,24 @@ class TestOptionalAdapterResolution:
         spec = ("fake", "json", "vfs.stores.does_not_exist", "Missing")
         with pytest.raises(ImportError, match="not available in this build"):
             _load_optional_adapter("fake://", spec)
+
+    @pytest.mark.skipif(
+        importlib.util.find_spec("asyncpg") is None,
+        reason="requires the 'postgres' extra (asyncpg) to import the adapter",
+    )
+    def test_postgresql_uri_resolves_to_postgres_store(self, tmp_path):
+        """PostgresURIResolution: with the postgres extra installed, a postgresql:// URI
+        resolves to PostgresMetadataStore. Construction must not open a connection."""
+        from vfs.stores.postgres_metadata import PostgresMetadataStore
+
+        config = VFSConfig(
+            metadata_store_uri="postgresql://localhost/aifs",
+            blob_store_uri=f"file:///{tmp_path}/blobs/",
+        )
+        vfs = VFS(config)
+        assert isinstance(vfs._meta, PostgresMetadataStore)
+        # No connection opened at construction time.
+        assert vfs._meta._conn is None
 
 
 class TestProcessIdentification:

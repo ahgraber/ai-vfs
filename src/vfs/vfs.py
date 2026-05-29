@@ -738,8 +738,11 @@ class VFS:
             created_at=datetime.now(timezone.utc),
             created_by=created_by,
         )
-        await self._meta.put_namespace(ns)
-        await self._meta.set_name("namespace", ns.id, display_name)
+        # Atomic so a duplicate display_name (ConflictError from set_name) rolls back the
+        # namespace row rather than leaving an entity with no resolvable name.
+        async with self._meta.transaction():
+            await self._meta.put_namespace(ns)
+            await self._meta.set_name("namespace", ns.id, display_name)
         return ns
 
     async def create_principal(self, display_name: str, principal_type: str = "agent") -> Principal:
@@ -752,8 +755,11 @@ class VFS:
             principal_type=principal_type,
             created_at=datetime.now(timezone.utc),
         )
-        await self._meta.put_principal(p)
-        await self._meta.set_name("principal", p.id, display_name)
+        # Atomic so a duplicate display_name (ConflictError from set_name) rolls back the
+        # principal row rather than leaving an entity with no resolvable name.
+        async with self._meta.transaction():
+            await self._meta.put_principal(p)
+            await self._meta.set_name("principal", p.id, display_name)
         return p
 
     async def resolve_name(self, entity_type: str, display_name: str) -> str | None:
