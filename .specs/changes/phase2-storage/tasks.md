@@ -35,12 +35,12 @@
 
 ## S3 Blob Adapter & Cache
 
-- [ ] Implement `S3BlobStore` with `aiobotocore`: `put`/`get`/`delete`/`exists`/`list_hashes`, content-hash keys under `{prefix}/{hash[0:2]}/{hash[2:4]}/{hash}`, idempotent `put`, streaming methods raising `NotImplementedError`
-- [ ] Auto-enable the `diskcache` wrapper for `s3://` and disable it for `file:///` when `blob_cache_enabled` is unset
-- [ ] Test (integration, MinIO fixture): `put` then `get` returns equal bytes; duplicate `put` is a no-op (`BlobStoreProtocol`/`S3AdapterRoundTrip`)
-- [ ] Test (integration): a stored blob's object key is `{prefix}/ab/cd/<hash>` (`BlobPrefixDirectoryStructure`/`S3KeyStructure`)
-- [ ] Test: auto mode wraps `s3://` in the cache and leaves `file:///` unwrapped (`BlobCaching`/`RemoteAutoEnable`, `LocalAutoDisable`)
-- [ ] Test: with the `s3` extra installed, the VFS resolves `s3://` to `S3BlobStore` (`URIBasedStoreResolution`/`S3URIResolution`)
+- [x] Implement `S3BlobStore` with `aiobotocore`: `put`/`get`/`delete`/`exists`/`list_hashes`, content-hash keys under `{prefix}/{hash[0:2]}/{hash[2:4]}/{hash}`, idempotent `put`, streaming methods raising `NotImplementedError`
+- [x] Auto-enable the `diskcache` wrapper for `s3://` and disable it for `file:///` when `blob_cache_enabled` is unset
+- [x] Test (integration, MinIO fixture): `put` then `get` returns equal bytes; duplicate `put` is a no-op (`BlobStoreProtocol`/`S3AdapterRoundTrip`)
+- [x] Test (integration): a stored blob's object key is `{prefix}/ab/cd/<hash>` (`BlobPrefixDirectoryStructure`/`S3KeyStructure`)
+- [x] Test: auto mode wraps `s3://` in the cache and leaves `file:///` unwrapped (`BlobCaching`/`RemoteAutoEnable`, `LocalAutoDisable`)
+- [x] Test: with the `s3` extra installed, the VFS resolves `s3://` to `S3BlobStore` (`URIBasedStoreResolution`/`S3URIResolution`)
 
 ## Tier-Based Retention
 
@@ -56,5 +56,5 @@
 
 - [x] Add `sqlalchemy` and `alembic` to the **core** dependencies in `pyproject.toml` (the default SQLite profile runs on Core) — pulled forward; the foundation cannot compile without them
 - [x] Declare optional dependency extras in `pyproject.toml`: `postgres` (`asyncpg`), `mongo` (`motor`), `s3` (`aiobotocore`) — pulled forward so the resolver's "install extra X" remediation is real
-- [ ] Add Docker Compose fixtures for Postgres, MongoDB, and MinIO used by the integration tests
+- [x] Add Docker Compose fixtures for Postgres, MongoDB, and MinIO used by the integration tests
 - [ ] Update `CHANGELOG.md` under Unreleased with the new adapters and the `move()` ordering change

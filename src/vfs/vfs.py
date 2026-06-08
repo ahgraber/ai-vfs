@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import importlib
 import importlib.util
+import inspect
 import time
 
 import blake3
@@ -144,8 +145,22 @@ class VFS:
             setproctitle.setproctitle("ai-vfs: service")
 
     async def close(self) -> None:
-        """Close storage connections."""
+        """Close storage connections.
+
+        The inner blob store may expose either a synchronous or an asynchronous
+        ``close()``; both are handled. Adapters without any ``close()`` (e.g.
+        :class:`LocalFSBlobStore`) are tolerated via the ``getattr(..., None)`` guard.
+        The inner store is released BEFORE the disk-cache wrapper so a remote-adapter's
+        connection pool is torn down deterministically while the cache wrapper is still
+        intact.
+        """
         await self._meta.close()
+        inner = self._blob._inner if isinstance(self._blob, CachedBlobStore) else self._blob
+        closer = getattr(inner, "close", None)
+        if closer is not None:
+            result = closer()
+            if inspect.isawaitable(result):
+                await result
         if isinstance(self._blob, CachedBlobStore):
             self._blob.close()
 
