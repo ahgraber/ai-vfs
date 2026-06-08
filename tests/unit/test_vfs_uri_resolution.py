@@ -162,6 +162,47 @@ class TestOptionalAdapterResolution:
         # No client/connection opened at construction time.
         assert vfs._meta._client is None
 
+    @pytest.mark.skipif(
+        importlib.util.find_spec("aiobotocore") is None,
+        reason="requires the 's3' extra (aiobotocore) to import the adapter",
+    )
+    def test_s3_uri_resolves_to_s3_store(self, tmp_path):
+        """S3URIResolution: with the s3 extra installed, an s3:// URI resolves to
+        S3BlobStore. Construction must not open a client/connection, and with the cache
+        explicitly disabled the store is returned unwrapped."""
+        from vfs.stores.s3_blob import S3BlobStore
+
+        config = VFSConfig(
+            metadata_store_uri=f"sqlite:///{tmp_path}/test.db",
+            blob_store_uri="s3://test-bucket/aifs",
+            blob_cache_enabled=False,
+        )
+        vfs = VFS(config)
+        assert isinstance(vfs._blob, S3BlobStore)
+        assert not isinstance(vfs._blob, CachedBlobStore)
+        # No client/connection opened at construction time.
+        assert vfs._blob._client is None
+
+    @pytest.mark.skipif(
+        importlib.util.find_spec("aiobotocore") is None,
+        reason="requires the 's3' extra (aiobotocore) to import the adapter",
+    )
+    def test_cache_auto_enabled_for_s3(self, tmp_path):
+        """BlobCaching/RemoteAutoEnable: with ``blob_cache_enabled=None`` (auto) and an
+        ``s3://`` URI, the resolver wraps the S3BlobStore in a CachedBlobStore."""
+        from vfs.stores.s3_blob import S3BlobStore
+
+        config = VFSConfig(
+            metadata_store_uri=f"sqlite:///{tmp_path}/test.db",
+            blob_store_uri="s3://test-bucket/aifs",
+            blob_cache_enabled=None,
+        )
+        vfs = VFS(config)
+        assert isinstance(vfs._blob, CachedBlobStore)
+        assert isinstance(vfs._blob._inner, S3BlobStore)
+        # Cache wrapping must not open the inner store's connection at construction time.
+        assert vfs._blob._inner._client is None
+
 
 class TestProcessIdentification:
     """ProcessIdentification (design D11): VFS.initialize sets the process title when running as a service."""
@@ -201,3 +242,137 @@ class TestProcessIdentification:
         finally:
             await vfs.close()
         assert captured == []
+
+
+class _RecordingAsyncBlobStub:
+    """Fake blob store whose ``close()`` is async and records that it was awaited."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _RecordingSyncBlobStub:
+    """Fake blob store whose ``close()`` is sync and records that it was called."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestVFSCloseDispatches:
+    """``VFS.close()`` must release the inner blob store's resources regardless of
+    whether ``close()`` is sync or async, and whether the store is wrapped in a
+    ``CachedBlobStore``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_close_awaits_async_inner_close(self, tmp_path):
+        config = VFSConfig(
+            metadata_store_uri=f"sqlite:///{tmp_path}/test.db",
+            blob_store_uri=f"file:///{tmp_path}/blobs/",
+            blob_cache_enabled=False,
+            otel_enabled=False,
+        )
+        vfs = VFS(config)
+        fake = _RecordingAsyncBlobStub()
+        vfs._blob = fake
+        await vfs.initialize()
+        await vfs.close()
+        assert fake.closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_calls_sync_inner_close(self, tmp_path):
+        config = VFSConfig(
+            metadata_store_uri=f"sqlite:///{tmp_path}/test.db",
+            blob_store_uri=f"file:///{tmp_path}/blobs/",
+            blob_cache_enabled=False,
+            otel_enabled=False,
+        )
+        vfs = VFS(config)
+        fake = _RecordingSyncBlobStub()
+        vfs._blob = fake
+        await vfs.initialize()
+        await vfs.close()
+        assert fake.closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_releases_inner_and_cache_when_wrapped(self, tmp_path):
+        from unittest.mock import MagicMock
+
+        config = VFSConfig(
+            metadata_store_uri=f"sqlite:///{tmp_path}/test.db",
+            blob_store_uri=f"file:///{tmp_path}/blobs/",
+            blob_cache_enabled=False,
+            otel_enabled=False,
+        )
+        vfs = VFS(config)
+        fake = _RecordingAsyncBlobStub()
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        wrapper = CachedBlobStore(fake, str(cache_dir), 16)
+        # Wrap the bound sync close so we can assert it was called exactly once while still
+        # releasing the underlying diskcache resources.
+        original_close = wrapper.close
+        wrapper.close = MagicMock(wraps=original_close)
+        vfs._blob = wrapper
+        await vfs.initialize()
+        await vfs.close()
+        assert fake.closed is True
+        assert wrapper.close.call_count == 1
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("aiobotocore") is None,
+    reason="requires the 's3' extra (aiobotocore) to import the adapter",
+)
+def test_s3_key_no_prefix_omits_leading_slash():
+    """L5: ``_key`` with no prefix must produce no leading slash."""
+    from vfs.stores.s3_blob import S3BlobStore
+
+    store = S3BlobStore("s3://test-bucket")
+    h = "abcdef1234" + "0" * 54
+    key = store._key(h)
+    assert not key.startswith("/")
+    assert key == f"ab/cd/{h}"
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("aiobotocore") is None,
+    reason="requires the 's3' extra (aiobotocore) to import the adapter",
+)
+class TestS3PutPropagatesNon404HeadError:
+    """M5: a non-404 ``head_object`` error during ``put`` must propagate AND prevent the
+    ``put_object`` write — the idempotence short-circuit must not swallow real errors."""
+
+    @pytest.mark.asyncio
+    async def test_non_404_head_propagates_and_skips_put(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from botocore.exceptions import ClientError
+
+        from vfs.stores.s3_blob import S3BlobStore
+
+        store = S3BlobStore("s3://test-bucket/aifs")
+        fake_client = MagicMock()
+        fake_client.head_object = AsyncMock(
+            side_effect=ClientError(
+                {"Error": {"Code": "500", "Message": "Internal Server Error"}},
+                "HeadObject",
+            )
+        )
+        fake_client.put_object = AsyncMock()
+
+        async def _stub_ensure_client():
+            return fake_client
+
+        store._ensure_client = _stub_ensure_client  # type: ignore[assignment]
+
+        content_hash = "abcdef1234" + "0" * 54
+        with pytest.raises(ClientError):
+            await store.put(content_hash, b"data")
+        fake_client.put_object.assert_not_called()

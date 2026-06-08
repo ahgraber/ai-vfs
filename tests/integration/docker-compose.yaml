@@ -25,11 +25,30 @@
 # The tests provision a per-xdist-worker database (aivfs_test_<worker>) derived from the URI,
 # dropping it before and after each test, so parallel workers never clobber each other.
 #
+# MinIO backs tests/integration/test_s3_blob.py. Start it with:
+#
+#     docker compose -f tests/integration/docker-compose.yaml up -d minio
+#
+# then create the test bucket once (the tests do NOT auto-create it; they isolate by a
+# per-xdist-worker key prefix in a shared bucket):
+#
+#     docker compose -f tests/integration/docker-compose.yaml exec minio \
+#         mc alias set local http://localhost:9000 minioadmin minioadmin
+#     docker compose -f tests/integration/docker-compose.yaml exec minio \
+#         mc mb -p local/aivfs-test
+#
+# then point the test suite at it:
+#
+#     export AIVFS_TEST_S3_BUCKET=aivfs-test
+#     export AWS_ACCESS_KEY_ID=minioadmin
+#     export AWS_SECRET_ACCESS_KEY=minioadmin
+#     export AWS_ENDPOINT_URL_S3=http://localhost:9000
+#     export AWS_REGION=us-east-1
+#     uv run pytest tests/integration/test_s3_blob.py
+#
 # Tear down with:
 #
 #     docker compose -f tests/integration/docker-compose.yaml down -v
-#
-# MinIO is added by its adapter task group.
 services:
   postgres:
     image: postgres:17-alpine
@@ -50,6 +69,20 @@ services:
       - "27017:27017"
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 5
