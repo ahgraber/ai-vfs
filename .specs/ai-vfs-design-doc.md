@@ -2,6 +2,8 @@
 
 **Date:** 2026-04-04 **Status:** Draft **Authors:** ahgraber + Claude
 
+> Updated 2026-06-09: reflects phase2 search pivot — bloom superseded by native FTS. See §7.2, §7.4, §9.4.
+
 ---
 
 ## 1. Overview
@@ -172,11 +174,13 @@ For example, `Permission.id` is a ULID because the permission record is internal
 | Proto| Proto  | Protocol  | Protocol         |
 +------+--------+-----------+------------------+
 |SQLite| S3     | Glob/Grep | Monty            |
-|Postgr| MinIO  | Bloom     | Bashkit          |
+|Postgr| MinIO  | Native FTS| Bashkit          |
 |Mongo | Azure  | Semantic  | Eryx             |
 |      | LocalFS| (plugin)  | (plugin)         |
 +------+--------+-----------+------------------+
 ```
+
+† Native FTS (SQLite FTS5 / Postgres tsvector+pg_trgm) is a metadata-store capability, not a search provider; see §7.2.
 
 Between the Execution Provider and the VFS Layer sits the **Shell Operations Layer** —
 thin wrappers that expose a curated set of bash-familiar functions over VFS operations:
@@ -332,11 +336,13 @@ class SearchProvider(Protocol):
     def capabilities(self) -> set[SearchType]: ...
 ```
 
+> **Deferred (phase2-search):** `SearchLimits.cwd` (CWD-based scope narrowing) and the `SearchResponse` fields `scope_narrowed`, `actual_scope`, and `total_files_in_scope` are deferred. Whole-scope brute-force and CWD-expanding narrowing are not implemented this phase; a cold or unavailable index fails loud instead of producing a partial result.
+
 `SearchType` is an enum: `glob`, `find`, `regex`, `fulltext`, `semantic`.
 
 Multiple providers can be active simultaneously.
 The VFS dispatches a search to the provider that declares the matching capability.
-If multiple providers match, the VFS uses the most specific (e.g., bloom-accelerated regex over brute-force regex).
+If multiple providers match, the VFS uses the most specific (e.g., the metadata store's NativeTextSearch capability for regex/fulltext, the DefaultSearchProvider for glob/find).
 
 The VFS owns the safety boundary for every search request:
 
@@ -464,7 +470,7 @@ Relative paths resolve through the bound Session's `cwd`; the wrapper itself doe
 | -------------------------------------------------------------------------- | ----------------------------------- | -------------------------------------------------------------- |
 | `cd(path)`                                                                 | `cd /path/`                         | `session.cd(path)` (resolves, checks read perm, updates `cwd`) |
 | `pwd()`                                                                    | `pwd`                               | `session.pwd()`                                                |
-| `grep(pattern, path, recursive=True)`                                      | `grep -r "pattern" /path/`          | search provider (bloom/regex) or fallback to read + match      |
+| `grep(pattern, path, recursive=True)`                                      | `grep -r "pattern" /path/`          | native FTS capability (regex) or fallback to read + match      |
 | `find(path, name=None, size=None)`                                         | `find /path -name "*.py" -size +1k` | metadata store queries                                         |
 | `glob(pattern)`                                                            | `ls /path/*.py`                     | path-pattern match against metadata                            |
 | `cat(path)`                                                                | `cat /path/file`                    | `session.read(path)`                                           |
@@ -670,20 +676,21 @@ Handles path-based operations with no indexing overhead:
 Grep without an acceleration provider uses the default provider: the VFS enumerates the permission-pruned scope, injects `read_content`, and the provider reads and matches each file.
 Correct but O(n) in visible file count.
 
-### 7.2 Bloom Filter Provider (Plugin)
+### 7.2 Native Full-Text Search (metadata-store capability)
 
-- **On `index`**: Computes bloom filter hashes (xxhash-based) for file content.
-  Stores a ready `SearchArtifact` at a provider key such as `search_meta["bloom/default"]`.
-  The artifact uses the standard envelope; bloom hashes, masks, normalizer IDs, and similar details live in the provider-defined payload.
-- **On `search(regex)`**: Receives permission-pruned `SearchMetaEntry` values,
-  tests bloom filters across the visible files in scope, and treats missing or
-  corrupt bloom data as conservative candidates.
-- **Verification**: Calls `read_content` only for candidate files and verifies
-  actual content before returning matches.
-- Reduces grep from O(n) blob reads to O(k) where k \<< n.
+Native FTS is an optional capability the metadata store exposes (`meta.native_text_search()`) — not a search provider.
+The index owns DB schema, migrations, transactions, GC, and at-rest confidentiality (storage-lifecycle concerns), so it lives on the store, not the provider layer.
 
-Potential integration with [ahgraber/bloom-search](https://github.com/ahgraber/bloom-search) or
-a [Cursor-style bloom extension](https://cursor.com/blog/fast-regex-search) for regex-capable indexing.
+- **Content-addressed text artifact**: searchable text persisted in `search_text_artifacts`, keyed by `(provider_key, params_hash, content_hash)`.
+  A content match expands through visible versions referencing that content; results carry path/version of the occurrence.
+- **Backend implementations**: SQLite (FTS5 + trigram tokenizer) and Postgres (`tsvector` + `pg_trgm` GIN).
+  Verification runs against stored raw text — zero blob reads on the fresh path.
+- **Cold-index semantics**: a cold or unavailable index fails loud (`IndexUnavailableError` / `ReindexRequiredError`) rather than falling back to unindexed blob reads.
+- **MongoDB**: does not implement `NativeTextSearch`; accelerated regex/fulltext is deferred this phase (glob/find still work on all backends).
+
+Full design: [`.specs/changes/archive/2026-06-09-phase2-search/design.md`](.specs/changes/archive/2026-06-09-phase2-search/design.md).
+
+> Bloom filter indexing was benchmarked and superseded; see the superseded design at [`.specs/ai-vfs-bloom-provider-design.md`](.specs/ai-vfs-bloom-provider-design.md).
 
 ### 7.3 Semantic Search Provider (Future Plugin)
 
@@ -702,21 +709,22 @@ search(query, scope, type)
     |
     v
 VFS: authorize caller, resolve scope, enumerate visible current versions
+    permission-prune → SearchMetaEntry set; build SearchRequest(search_metas, read_content, limits)
+    |
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ store.native_text_search() for regex/fulltext?                  │ else
+    │ yes                                                             │
+    ▼                                                                 ▼
+nts.search_text(request, visible_version_ids)         DefaultSearchProvider
+  verify raw text in DB — NO blob read                  glob/find: metadata-only
+  expand content → visible occurrences                  Mongo regex/fulltext: deferred
+  stragglers ≤ max_content_reads → guarded reader
+  cold/unavailable OR over-budget → FAIL LOUD
+    |
+    +-- semantic provider: rank semantic SearchArtifact entries (future)
     |
     v
-VFS: select provider, build SearchRequest(search_metas, read_content, limits)
-    |
-    v
-provider.search(request)
-    |
-    +-- default provider: read_content for each visible file
-    |
-    +-- bloom provider: search_meta coarse filter, read_content verification
-    |
-    +-- semantic provider: rank semantic SearchArtifact entries
-    |
-    v
-SearchResponse(results, scope_narrowed, actual_scope, total_files_in_scope)
+SearchResponse(results, ...)
 ```
 
 The agent doesn't know or care which path was taken.
@@ -782,7 +790,7 @@ Monty sandbox --> shell_ops.grep("TODO", "/workspace/", recursive=True)
 VFS.search(query="TODO", scope="/workspace/", type=regex)
     |
     v
-SearchRequest(search_metas, read_content) --> BloomProvider.search() --> SearchResponse
+SearchRequest(search_metas, read_content) --> VFS dispatch --> NativeTextSearch.search_text() --> SearchResponse
 ```
 
 ### 8.3 Resource Limits
@@ -850,23 +858,30 @@ from ai_vfs import VFS
 # Minimal — SQLite + local filesystem, no plugins
 vfs = VFS()
 
-# Self-hosted — S3 + Postgres, bloom search, bashkit execution
+# Self-hosted — S3 + Postgres, native FTS, bashkit execution
 vfs = VFS(
     metadata_store="postgresql://localhost/aifs",
     blob_store="s3://my-bucket/aifs",
-    search_providers=["bloom"],
     execution_providers=["bashkit"],
 )
 ```
 
 ### 9.4 Deployment Profiles
 
-| Profile     | Metadata | Blobs    | Search              | Execution              |
-| ----------- | -------- | -------- | ------------------- | ---------------------- |
-| Local dev   | SQLite   | Local FS | Default (glob/grep) | None                   |
-| Self-hosted | Postgres | MinIO/S3 | Bloom               | Monty                  |
-| Production  | Postgres | S3       | Bloom + Semantic    | Monty + Bashkit + Eryx |
-| JS/TS agent | Postgres | S3       | Bloom + Semantic    | Monty + just-bash      |
+| Profile     | Metadata | Blobs    | Search                | Execution              |
+| ----------- | -------- | -------- | --------------------- | ---------------------- |
+| Local dev   | SQLite   | Local FS | Default (glob/grep)   | None                   |
+| Self-hosted | Postgres | MinIO/S3 | Native FTS            | Monty                  |
+| Production  | Postgres | S3       | Native FTS + Semantic | Monty + Bashkit + Eryx |
+| JS/TS agent | Postgres | S3       | Native FTS + Semantic | Monty + just-bash      |
+
+**Backend search capability matrix:**
+
+| Backend  | glob / find | regex / fulltext             |
+| -------- | ----------- | ---------------------------- |
+| SQLite   | ✓           | ✓ (FTS5 + trigram tokenizer) |
+| Postgres | ✓           | ✓ (tsvector + pg_trgm GIN)   |
+| Mongo    | ✓           | deferred this phase          |
 
 ### 9.5 Secrets
 
@@ -919,7 +934,7 @@ result = await vfs.execute(
 gc_result = await vfs.run_gc()
 
 # Reindex (backfill search metadata for a provider added after files were written)
-await vfs.reindex(namespace=ns.id, provider="bloom", scope="/src/")
+await vfs.reindex(namespace=ns.id, provider="semantic", scope="/src/")
 ```
 
 ---
@@ -977,6 +992,15 @@ await vfs.reindex(namespace=ns.id, provider="bloom", scope="/src/")
    Each `execute()` call gets a fresh sandbox.
    State persistence (snapshot/restore) is a future addition via two optional protocol methods (`async def snapshot() → bytes`, `async def restore(bytes)`) that existing stateless providers simply don't implement.
    No VFS changes needed.
+
+6. **Known deferrals**:
+
+   - **Audit log archival**: the audit log is append-only with no archival or rotation mechanism; under agent write loads the table grows unbounded.
+     Archival strategy is deferred.
+   - **Batch permission filtering**: `list` and `search` pruning call `check_permission` per path — O(n) round-trips on networked metadata backends (Postgres, Mongo).
+     Batch permission lookup is deferred.
+   - **Content-addressed cross-namespace existence oracle**: blobs and `search_text_artifacts` are content-addressed and shared across namespaces at rest; a successful idempotent `put`'s timing is observable as a cross-namespace existence signal.
+     This is accepted at the same level as the shared-at-rest text artifact model; physical-row namespace isolation is deferred.
 
 ---
 

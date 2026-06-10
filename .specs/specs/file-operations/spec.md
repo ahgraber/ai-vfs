@@ -142,26 +142,45 @@ Because blobs are content-addressed, no additional blob storage is consumed when
 
 ### Requirement: MoveFile
 
-The system SHALL move (rename) a file to a new path within the same namespace as an atomic operation: the source receives a tombstone and the destination is created at version 1 with the same content hash.
+The system SHALL move (rename) a file to a new path within the same namespace: the destination is created with the source's current content hash and the source receives a tombstone.
 Version history is not transferred; the destination begins a new version chain.
+
+On metadata stores providing atomic multi-document transactions (SQLite, Postgres, MongoDB replica sets) the move SHALL be fully atomic — neither a partial destination nor an unintended source tombstone is observable after a mid-operation failure.
+
+On stores without atomic multi-document transactions (standalone MongoDB) the move SHALL order its writes destination-before-source.
+A mid-operation failure on such a store is non-destructive in that **no version is ever lost** — history is append-only, so any prior destination content remains retrievable as a non-current version — but the move MAY be left **partially applied**: the destination's current version may already be advanced to the source's content while the source remains live.
+For a new destination this manifests as a duplicate (both paths resolve to the source content); for an existing destination the destination's current pointer may advance without the source being tombstoned.
+Callers SHALL treat move as non-atomic on best-effort stores and re-resolve on failure.
 
 #### Scenario: MoveToNewPath
 
 - **GIVEN** a file at /src/a.py at version 5
 - **WHEN** a principal moves /src/a.py to /dst/a.py
-- **THEN** /dst/a.py exists at version 1 with the same content hash, and /src/a.py has a tombstone (is_deleted=True)
+- **THEN** /dst/a.py exists with the same content hash, and /src/a.py has a tombstone (is_deleted=True)
 
-#### Scenario: MoveTombstoneAndCreateAreAtomic
+#### Scenario: MoveAtomicOnTransactionalStore
 
-- **GIVEN** a move operation is in progress
+- **GIVEN** a move in progress on a store with atomic transactions (SQL or Mongo replica set)
 - **WHEN** any failure occurs mid-operation
 - **THEN** the system leaves neither a partial destination nor an unintended tombstone on the source
+
+#### Scenario: MoveNonDestructiveOnBestEffortStore
+
+- **GIVEN** a move in progress on standalone MongoDB (best-effort `transaction()`)
+- **WHEN** a failure occurs after the destination is created but before the source is tombstoned
+- **THEN** the file remains readable at both source and destination — no version is lost
 
 #### Scenario: MoveToExistingPath
 
 - **GIVEN** a file already exists at the destination path
 - **WHEN** a principal moves to that path
-- **THEN** the destination is overwritten and the source receives a tombstone
+- **THEN** the destination is overwritten (a new destination version) and the source receives a tombstone
+
+#### Scenario: MoveToExistingPathPartialOnBestEffortStore
+
+- **GIVEN** a file already exists at the destination on standalone MongoDB (best-effort `transaction()`)
+- **WHEN** a failure occurs after the destination's new version is created but before the source is tombstoned
+- **THEN** the destination's current content is the source's content, the source remains live, and the destination's prior content is still retrievable as a non-current version — no version is lost, but the move is partially applied
 
 #### Scenario: MoveNonexistentSource
 
@@ -171,8 +190,11 @@ Version history is not transferred; the destination begins a new version chain.
 
 ### Requirement: OptimisticConcurrency
 
-The system SHALL support optimistic concurrency via an optional expected_version parameter on write.
-When provided, the write SHALL fail with ConflictError if the file's current version does not match.
+The system SHALL support optimistic concurrency via an optional `expected_version` parameter on write.
+When provided, the write SHALL fail with `ConflictError` if the file's current version does not match.
+
+When `expected_version` is **not** provided (last-writer-wins), two concurrent writers reading the same current version N and both attempting to write version N+1 SHALL both ultimately succeed, producing versions N+1 and N+2 respectively, because the VFS retries the read-compute-put loop on a version-number collision (`VersionCollisionError`), bounded at 5 attempts.
+If the retry budget is exhausted, `VersionCollisionError` is raised.
 
 #### Scenario: ConcurrentWriteConflict
 
@@ -191,6 +213,12 @@ When provided, the write SHALL fail with ConflictError if the file's current ver
 - **GIVEN** a file at any version
 - **WHEN** a principal writes without expected_version
 - **THEN** the write succeeds (last-writer-wins)
+
+#### Scenario: NoCASWriteCollisionBothSucceed
+
+- **GIVEN** two concurrent writers, both reading the file at version N before either writes
+- **WHEN** both write without expected_version
+- **THEN** both writes succeed: one lands as version N+1, the other retries and lands as N+2
 
 ### Requirement: NamespaceIsolation
 
@@ -241,8 +269,13 @@ caller, and use UUID4 if so.
 
 ### Requirement: AbsolutePathsOnly
 
-The VFS SHALL reject any path argument that is not absolute (does not begin with `"/"`), raising `ValueError` immediately, before any permission check or storage access.
-Relative path resolution is the responsibility of the caller (e.g., `Session`).
+The VFS SHALL reject any path argument that is not **canonical**: it must begin with `"/"` and, after stripping at most one trailing `"/"` (the root `"/"` is exempt from stripping), it must equal `posixpath.normpath(path)`.
+Any path containing `..`, `.` segments, or repeated slashes SHALL be rejected with `ValueError` immediately, before any permission check or storage access.
+
+A single trailing `"/"` is permitted so that directory-style arguments forwarded by
+`Session` (e.g. `cd` always appends `"/"`) are accepted.
+
+Relative path resolution remains the responsibility of the caller (e.g. `Session`).
 
 #### Scenario: RelativePathRejected
 
@@ -250,8 +283,26 @@ Relative path resolution is the responsibility of the caller (e.g., `Session`).
 - **WHEN** any operation is called with a path that does not begin with `"/"`
 - **THEN** a `ValueError` is raised with a message indicating the path must be absolute
 
+#### Scenario: DotDotPathRejected
+
+- **GIVEN** a VFS instance
+- **WHEN** any operation is called with a path containing `..` (e.g. `/public/../secret/x`)
+- **THEN** a `ValueError` is raised before any permission check or storage access
+
+#### Scenario: DoubleSlashRejected
+
+- **GIVEN** a VFS instance
+- **WHEN** any operation is called with a path containing repeated slashes (e.g. `/foo//bar`)
+- **THEN** a `ValueError` is raised before any permission check or storage access
+
+#### Scenario: TrailingSlashDirectoryArgAccepted
+
+- **GIVEN** a VFS instance
+- **WHEN** `list` or `search` is called with a directory-style path like `/src/`
+- **THEN** the operation proceeds normally (a single trailing slash is not rejected)
+
 #### Scenario: AbsolutePathAccepted
 
 - **GIVEN** a VFS instance
-- **WHEN** any operation is called with a path beginning with `"/"`
+- **WHEN** any operation is called with a clean absolute path beginning with `"/"`
 - **THEN** the operation proceeds normally (path is not rejected at the boundary)

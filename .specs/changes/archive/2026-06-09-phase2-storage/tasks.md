@@ -44,17 +44,18 @@
 
 ## Tier-Based Retention
 
-- [ ] Add `iter_versions_for_gc(namespace_id, file_path)` to the `MetadataStore` protocol and implement it on SQLite, Postgres, and Mongo (deterministic order: `created_at`, then `version_number`)
-- [ ] Implement the tier-window evaluator in `GarbageCollector`: newest-first tier banding, smallest-`created_at` survivor per `keep_every` window, always preserving first/current
-- [ ] Wire tier-aware reclamation to consume `iter_versions_for_gc`, retaining `list_reclaimable_versions` for the simple rules
-- [ ] Test: hourly tier keeps one version per hour window plus first/current (`TierBasedRetention`/`HourlyTierKeepsOnePerHour`)
-- [ ] Test: cascading tiers sample by band (all/hourly/daily/weekly) over a 60-day span (`TierBasedRetention`/`TiersCascadeNewestFirst`)
-- [ ] Test: within-window survivor is the smallest-`created_at` version regardless of enumeration order (`TierBasedRetention`/`FirstWithinWindowIsDeterministic`)
-- [ ] Test (integration): identical reclaimed version-ID set across SQLite, Postgres, and Mongo for one fixed version set + policy (`TierBasedRetention`/`ReclamationIdenticalAcrossAdapters`)
+- [x] Add `iter_versions_for_gc(namespace_id, file_path)` to the `MetadataStore` protocol and implement it on SQLite, Postgres, and Mongo (deterministic order: `created_at`, then `version_number`)
+- [x] Implement the tier-window evaluator in `GarbageCollector`: newest-first tier banding, smallest-`created_at` survivor per `keep_every` window, always preserving first/current
+- [x] Wire tier-aware reclamation into `GarbageCollector.run()`: when `VFSConfig.retention_tiers` is non-empty, `run()` calls `_tier_version_gc` (consuming `iter_versions_for_gc`); otherwise falls back to the Phase 1 simple path (`_version_gc` / `list_reclaimable_versions`).
+  Tier-aware-by-default was considered but rejected: the default `RetentionPolicy()` tiers keep all \<24h versions unconditionally, which contradicts the `max_recent_versions` contract tested by `test_version_gc_respects_max_recent` — see `design.md` tier-wiring decision for rationale.
+- [x] Test: hourly tier keeps one version per hour window plus first/current (`TierBasedRetention`/`HourlyTierKeepsOnePerHour`)
+- [x] Test: cascading tiers sample by band (all/hourly/daily/weekly) over a 60-day span (`TierBasedRetention`/`TiersCascadeNewestFirst`)
+- [x] Test: within-window survivor is the smallest-`created_at` version regardless of enumeration order (`TierBasedRetention`/`FirstWithinWindowIsDeterministic`)
+- [x] Test (integration): identical reclaimed version-ID set across SQLite, Postgres, and Mongo for one fixed version set + policy (`TierBasedRetention`/`ReclamationIdenticalAcrossAdapters`)
 
 ## Packaging
 
 - [x] Add `sqlalchemy` and `alembic` to the **core** dependencies in `pyproject.toml` (the default SQLite profile runs on Core) — pulled forward; the foundation cannot compile without them
 - [x] Declare optional dependency extras in `pyproject.toml`: `postgres` (`asyncpg`), `mongo` (`motor`), `s3` (`aiobotocore`) — pulled forward so the resolver's "install extra X" remediation is real
 - [x] Add Docker Compose fixtures for Postgres, MongoDB, and MinIO used by the integration tests
-- [ ] Update `CHANGELOG.md` under Unreleased with the new adapters and the `move()` ordering change
+- [x] Update `CHANGELOG.md` under Unreleased with the new adapters and the `move()` ordering change

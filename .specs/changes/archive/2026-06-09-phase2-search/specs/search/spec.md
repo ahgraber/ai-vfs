@@ -27,8 +27,16 @@ For regex and fulltext, when the active metadata store exposes the `NativeTextSe
 #### Scenario: MongoRegexDeferred
 
 - **GIVEN** a MongoDB metadata store (no `NativeTextSearch` capability)
-- **WHEN** a regex or fulltext search is requested
-- **THEN** the search is rejected as unsupported on this backend for this phase (glob/find remain available)
+
+- **WHEN** a **fulltext** search is requested
+
+- **THEN** the search raises `SearchTypeUnsupportedError` (glob/find remain available)
+
+- **GIVEN** a MongoDB metadata store (no `NativeTextSearch` capability)
+
+- **WHEN** a **regex** search is requested
+
+- **THEN** the VFS serves it via bounded brute-force through the `DefaultSearchProvider` + guarded reader; `max_content_reads` is enforced so large-scope regex fails loud (`ReadBudgetExceeded`) rather than issuing unbounded blob reads
 
 ### Requirement: SearchProviderProtocol
 
@@ -205,7 +213,9 @@ For the same exact query, the capability SHALL return the same set of matching p
 ### Requirement: ColdIndexFailsLoud
 
 The system SHALL serve searches over a fresh native index with complete results and no blob reads.
-A bounded set of stragglers — individual files whose artifact is missing, `failed`, `unsupported`, or stale — SHALL be verified individually via the guarded reader within `max_content_reads`, never excluded, so a fresh index produces no false negatives for what is searched.
+A bounded set of stragglers — individual files whose artifact is missing, `failed`, or stale — SHALL be verified individually via the guarded reader within `max_content_reads`, never excluded, so a fresh index produces no false negatives for what is searched.
+**Exception — identity-matched `unsupported` artifact**: a file whose `unsupported` artifact has the same `content_hash` and `params_hash` as the current version IS a confirmed non-match (binary content cannot satisfy any text predicate); it SHALL be excluded from results and SHALL NOT consume straggler budget.
+All other `unsupported` entries (hash drift) are treated as stragglers and verified.
 A cold or unavailable index — the index store errors, or the straggler set exceeds `max_content_reads` — SHALL fail loud with an actionable error (index-unavailable or reindex-required); the system SHALL NOT silently return partial results or read content for an unbounded scope.
 During `index_text`, content-level errors (undecodable, oversized) SHALL produce a `failed`/`unsupported` artifact within the write transaction (the write succeeds); infrastructure errors SHALL abort the write transaction.
 
