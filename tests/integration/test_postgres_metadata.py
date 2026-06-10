@@ -16,15 +16,17 @@ server is unreachable, so the default test run stays green without a database.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import importlib.util
 import os
+import re
 
 import pytest
 import pytest_asyncio
 from ulid import ULID
 
 from vfs.errors import ConflictError
-from vfs.models import AuditEvent, FileMeta, Permission, VersionMeta
+from vfs.models import AuditEvent, FileMeta, Permission, SearchType, VersionMeta
 
 _DSN = os.environ.get("AIVFS_TEST_POSTGRES_DSN")
 
@@ -286,3 +288,213 @@ async def test_set_name_duplicate_raises_conflict_and_store_stays_usable(pg_stor
     # The legitimate same-entity rename still works.
     await pg_store.set_name("namespace", "id_A", "renamed")
     assert await pg_store.resolve_name("namespace", "renamed") == "id_A"
+
+
+# ---------------------------------------------------------------------------
+# NativeTextSearch (pg_trgm + tsvector) tests
+# ---------------------------------------------------------------------------
+
+
+def _ch(text: str) -> str:
+    """Deterministic content-hash for test text (SHA-256 hex)."""
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _search_meta_entry(path: str, content_hash: str):
+    """Build a minimal SearchMetaEntry for use in SearchRequest.search_metas."""
+    from vfs.protocols.search import SearchMetaEntry
+
+    return SearchMetaEntry(
+        version_id=str(ULID()),
+        path=path,
+        content_hash=content_hash,
+        size=len(content_hash),
+        updated_at=_now(),
+    )
+
+
+def _req(query: str, search_type: SearchType, entries: list):
+    """Build a SearchRequest; read_content is None (Postgres NTS never calls it)."""
+    from vfs.protocols.search import SearchRequest
+
+    return SearchRequest(
+        query=query,
+        scope="/",
+        search_type=search_type,
+        search_metas=entries,
+        read_content=None,  # type: ignore[arg-type]
+    )
+
+
+class TestPostgresNativeTextSearch:
+    """NativeTextSearch capability integration tests for PostgreSQL.
+
+    Covers regex (pg_trgm), fulltext (tsvector + ts_rank), delete_text_artifacts,
+    has_text_artifacts (S2), and the brute-force equivalence contract (including
+    trigram-unfriendly ``[0-9]+`` and alternation patterns).
+
+    All tests skip cleanly when ``asyncpg`` is missing, ``AIVFS_TEST_POSTGRES_DSN`` is
+    unset, or the server is unreachable (inherited from the module-level ``pytestmark``).
+    """
+
+    @pytest.mark.asyncio
+    async def test_index_produces_ready_external_artifact(self, pg_store):
+        """IndexOnWriteProducesExternalArtifact (Postgres): index_text returns a ready external artifact."""
+        nts = pg_store.native_text_search()
+        ch = _ch("hello postgres world")
+        artifact = await nts.index_text(str(ULID()), ch, nts.params_hash, "hello postgres world")
+
+        assert artifact.status == "ready"
+        assert artifact.storage == "external"
+        assert artifact.provider_key == nts.provider_key
+        assert artifact.content_hash == ch
+        assert artifact.artifact_ref is not None
+
+    @pytest.mark.asyncio
+    async def test_regex_round_trip(self, pg_store):
+        """AcceleratedRegexAvoidsBlobReads (Postgres): regex search returns matching paths, no blob reads."""
+        nts = pg_store.native_text_search()
+        ch_a = _ch("foo bar baz unique")
+        ch_b = _ch("hello world test")
+        ch_c = _ch("no numbers here at all")
+
+        await nts.index_text(str(ULID()), ch_a, nts.params_hash, "foo bar baz unique")
+        await nts.index_text(str(ULID()), ch_b, nts.params_hash, "hello world test")
+        await nts.index_text(str(ULID()), ch_c, nts.params_hash, "no numbers here at all")
+
+        entries = [
+            _search_meta_entry("/a.txt", ch_a),
+            _search_meta_entry("/b.txt", ch_b),
+            _search_meta_entry("/c.txt", ch_c),
+        ]
+        response = await nts.search_text(_req("foo", SearchType.REGEX, entries), [])
+
+        assert {r.path for r in response.results} == {"/a.txt"}
+
+    @pytest.mark.asyncio
+    async def test_fulltext_ranked_results(self, pg_store):
+        """RankedFulltext (Postgres): ts_rank orders higher-frequency matches above lower-frequency ones."""
+        nts = pg_store.native_text_search()
+        ch_high = _ch("python python python python high frequency")
+        ch_low = _ch("python appears once only here low")
+        ch_none = _ch("java scala kotlin no python")
+
+        await nts.index_text(str(ULID()), ch_high, nts.params_hash, "python python python python high frequency")
+        await nts.index_text(str(ULID()), ch_low, nts.params_hash, "python appears once only here low")
+        await nts.index_text(str(ULID()), ch_none, nts.params_hash, "java scala kotlin no python")
+
+        entries = [
+            _search_meta_entry("/high.txt", ch_high),
+            _search_meta_entry("/low.txt", ch_low),
+            _search_meta_entry("/none.txt", ch_none),
+        ]
+        response = await nts.search_text(_req("python", SearchType.FULLTEXT, entries), [])
+
+        paths = {r.path for r in response.results}
+        assert "/none.txt" not in paths, "document without 'python' after stemming must be excluded"
+        assert {"/high.txt", "/low.txt"} <= paths
+
+        scores = {r.path: r.score for r in response.results}
+        if "/high.txt" in scores and "/low.txt" in scores:
+            assert scores["/high.txt"] >= scores["/low.txt"], (
+                f"high-frequency doc score {scores['/high.txt']:.4f} must be >= "
+                f"low-frequency doc score {scores['/low.txt']:.4f}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_delete_text_artifacts_by_content_hash(self, pg_store):
+        """delete_text_artifacts(content_hashes) removes indexed content so subsequent search returns nothing."""
+        nts = pg_store.native_text_search()
+        ch = _ch("delete me postgres content")
+        await nts.index_text(str(ULID()), ch, nts.params_hash, "delete me postgres content")
+
+        entries = [_search_meta_entry("/del.txt", ch)]
+
+        before = await nts.search_text(_req("delete", SearchType.REGEX, entries), [])
+        assert {r.path for r in before.results} == {"/del.txt"}, "must match before deletion"
+
+        await nts.delete_text_artifacts([ch], [])
+
+        after = await nts.search_text(_req("delete", SearchType.REGEX, entries), [])
+        assert after.results == [], "must return nothing after content-hash deletion"
+
+    @pytest.mark.asyncio
+    async def test_delete_text_artifacts_retired_params_hash(self, pg_store):
+        """delete_text_artifacts(retired_params_hashes=[...]) sweeps all records with that params_hash."""
+        nts = pg_store.native_text_search()
+        old_params = "oldparamshash1234"
+        ch = _ch("retiring this profile content")
+
+        # Index under a synthetic old params_hash.
+        await nts.index_text(str(ULID()), ch, old_params, "retiring this profile content")
+
+        # The entry was indexed under old_params — visible when queried with old_params manually.
+        # Retire the old params_hash.
+        await nts.delete_text_artifacts([], [old_params])
+
+        # After retirement, querying the NTS (which uses nts.params_hash) returns nothing for this ch.
+        entries = [_search_meta_entry("/retired.txt", ch)]
+        after = await nts.search_text(_req("retiring", SearchType.REGEX, entries), [])
+        assert after.results == [], "retired-params records must be deleted"
+
+    @pytest.mark.asyncio
+    async def test_has_text_artifacts(self, pg_store):
+        """S2 (Postgres): has_text_artifacts returns only the subset of hashes that exist in the store."""
+        nts = pg_store.native_text_search()
+        ch_present = _ch("this is present in store")
+        ch_absent = _ch("this was never indexed")
+
+        await nts.index_text(str(ULID()), ch_present, nts.params_hash, "this is present in store")
+
+        found = await nts.has_text_artifacts([ch_present, ch_absent], nts.params_hash)
+        assert found == {ch_present}
+
+        # Empty input returns empty set.
+        assert await nts.has_text_artifacts([], nts.params_hash) == set()
+
+    @pytest.mark.asyncio
+    async def test_result_set_equivalent_to_brute_force(self, pg_store):
+        """ResultSetEquivalentToBruteForce (Postgres leg): NTS and Python brute-force agree.
+
+        Patterns include:
+        - ``[0-9]+``: trigram-unfriendly — exercises sequential-scan fallback.
+        - ``foo|barbaz``: alternation — GIN trigram index must not prune one branch.
+        - ``cat|dogs``: two-branch alternation.
+        - ``\\|``: escaped pipe matches literal ``|`` character.
+        - ``order``: ordinary literal.
+        """
+        nts = pg_store.native_text_search()
+
+        documents = {
+            "/digits.txt": "order 42 received on day 7",
+            "/nodigits.txt": "no numbers here",
+            "/mixed.txt": "version 3 of the spec has 12 items",
+            "/alpha.txt": "only alphabetic content here",
+            "/has_foo.txt": "this document contains foo only",
+            "/has_barbaz.txt": "this document contains barbaz only",
+            "/has_cat.txt": "the cat sat on the mat",
+            "/has_dogs.txt": "dogs are friendly animals",
+            "/has_pipe.txt": "a|b pipe character present",
+        }
+
+        entries = []
+        for path, text in documents.items():
+            ch = _ch(text)
+            await nts.index_text(str(ULID()), ch, nts.params_hash, text)
+            entries.append(_search_meta_entry(path, ch))
+
+        patterns = [
+            r"[0-9]+",  # trigram-unfriendly: no extractable literal trigrams
+            r"order",  # plain literal
+            r"foo|barbaz",  # alternation: must not false-negative foo-only documents
+            r"cat|dogs",  # alternation: two branches
+            r"\|",  # escaped pipe: literal '|', not alternation
+        ]
+
+        for pattern in patterns:
+            response = await nts.search_text(_req(pattern, SearchType.REGEX, entries), [])
+            pg_paths = {r.path for r in response.results}
+
+            brute_paths = {p for p, text in documents.items() if re.search(pattern, text)}
+
+            assert pg_paths == brute_paths, f"pattern {pattern!r}: Postgres={pg_paths} != brute-force={brute_paths}"

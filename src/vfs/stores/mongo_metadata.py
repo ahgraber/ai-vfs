@@ -32,13 +32,14 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime
+import posixpath
 import re
 from typing import Any, AsyncIterator
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError
 
-from vfs.errors import ConflictError
+from vfs.errors import ConflictError, VersionCollisionError
 from vfs.models import (
     AuditEvent,
     FileMeta,
@@ -46,11 +47,36 @@ from vfs.models import (
     Permission,
     Principal,
     RetentionPolicy,
+    SearchArtifact,
     VersionMeta,
 )
 
 #: Database name used when the URI path is empty (e.g. ``mongodb://localhost``).
 _DEFAULT_DB_NAME = "aifs"
+
+
+def _require_canonical(path: str) -> None:
+    """Raise ValueError if path is not absolute or not canonical (no '..' / '.' / '//')."""
+    if not path.startswith("/"):
+        raise ValueError(f"path_prefix must be absolute, got {path!r}")
+    check = path[:-1] if (path.endswith("/") and path != "/") else path
+    if check != posixpath.normpath(check):
+        raise ValueError(f"path_prefix must be canonical (no '..' or '.' segments, no repeated slashes); got {path!r}")
+
+
+def _prefix_matches(path_prefix: str, path: str) -> bool:
+    """Return True if path falls under path_prefix at a segment boundary.
+
+    A prefix P matches path X when:
+      - X == P (exact match — single-file grant), or
+      - X starts with P + "/" when P does not end with "/", or
+      - X starts with P when P already ends with "/".
+    This prevents "/work" from matching "/workspace/file".
+    """
+    if path == path_prefix:
+        return True
+    dir_prefix = path_prefix if path_prefix.endswith("/") else path_prefix + "/"
+    return path.startswith(dir_prefix)
 
 
 class MongoMetadataStore:
@@ -202,7 +228,16 @@ class MongoMetadataStore:
 
         if expected_version is None:
             # New file or unconditional upsert: insert the version, then upsert the pointer.
-            await self._db.versions.insert_one(version_doc)
+            # A DuplicateKeyError on the unique (namespace_id, file_path, version_number) index
+            # means a concurrent no-CAS writer took the same version number; translate to
+            # VersionCollisionError so the VFS retry loop can recover.
+            try:
+                await self._db.versions.insert_one(version_doc)
+            except DuplicateKeyError as exc:
+                raise VersionCollisionError(
+                    f"version_number collision: {version.namespace_id}:{version.file_path} "
+                    f"version {version.version_number}"
+                ) from exc
             now = version.created_at.isoformat()
             await self._db.files.update_one(
                 {"namespace_id": version.namespace_id, "path": version.file_path},
@@ -219,7 +254,14 @@ class MongoMetadataStore:
         else:
             # Insert the version first so the pointer can never reference a missing version
             # (there is no transaction to roll back a failed insert on standalone MongoDB).
-            await self._db.versions.insert_one(version_doc)
+            # A DuplicateKeyError here is also a version_number collision; translate it.
+            try:
+                await self._db.versions.insert_one(version_doc)
+            except DuplicateKeyError as exc:
+                raise VersionCollisionError(
+                    f"version_number collision: {version.namespace_id}:{version.file_path} "
+                    f"version {version.version_number}"
+                ) from exc
             # Compare-and-swap: advance the pointer only while the file is still at
             # expected_version. No matching document => conflict.
             updated = await self._db.files.find_one_and_update(
@@ -276,15 +318,20 @@ class MongoMetadataStore:
         rows = [doc async for doc in cursor]
         if not rows:
             return False
+        # The VFS boundary (_require_canonical) already rejects non-canonical paths before
+        # any store call, so no normpath is applied here.  Applying normpath would strip a
+        # trailing slash from the requested path (e.g. "/team/" → "/team"), breaking exact
+        # matches against trailing-slash grants ("/team/") used by VFS.grant().
         # Most-specific (longest prefix) first.
         rows.sort(key=lambda r: len(r["path_prefix"]), reverse=True)
         for row in rows:
-            if path.startswith(row["path_prefix"]):
+            if _prefix_matches(row["path_prefix"], path):
                 return operation in set(row["operations"])
         return False
 
     async def set_permission(self, permission: Permission) -> None:
         """Insert or replace the permission entry for the (principal, namespace, path_prefix) scope."""
+        _require_canonical(permission.path_prefix)
         await self._db.permissions.update_one(
             {
                 "principal_id": permission.principal_id,
@@ -329,9 +376,43 @@ class MongoMetadataStore:
 
     # --- Search metadata ---
 
+    def native_text_search(self):
+        """Return None; MongoDB does not expose the NativeTextSearch capability.
+
+        MongoDB has no native FTS5/tsvector equivalent accessible through this adapter.
+        Regex and fulltext searches on a MongoDB backend are permanently deferred for this
+        phase: fulltext is rejected as unsupported; regex is unavailable via the
+        accelerated path and no brute-force fallback is provided for Mongo this phase.
+        """
+        return None
+
     async def update_search_meta(self, version_id: str, search_meta: dict) -> None:
         """Update the search_meta field on a version record."""
         await self._db.versions.update_one({"id": version_id}, {"$set": {"search_meta": search_meta}})
+
+    async def get_search_meta_batch(self, version_ids: list[str]) -> dict[str, dict]:
+        """Return the search_meta manifest for each of the given version IDs.
+
+        Version IDs with no matching record are omitted from the result.
+        """
+        if not version_ids:
+            return {}
+        cursor = self._db.versions.find(
+            {"id": {"$in": version_ids}},
+            projection={"id": 1, "search_meta": 1},
+        )
+        return {doc["id"]: (doc.get("search_meta") or {}) async for doc in cursor}
+
+    async def update_search_artifact(self, version_id: str, provider_key: str, artifact: SearchArtifact) -> None:
+        """Merge a single provider artifact into the search_meta manifest.
+
+        Uses ``$set`` with a dotted key so only the named provider key is
+        overwritten; other provider keys in the manifest are preserved.
+        """
+        await self._db.versions.update_one(
+            {"id": version_id},
+            {"$set": {f"search_meta.{provider_key}": artifact.to_dict()}},
+        )
 
     # --- Name resolution ---
 
@@ -392,6 +473,22 @@ class MongoMetadataStore:
                     continue
                 reclaimable.append(ver)
         return reclaimable
+
+    async def iter_versions_for_gc(self, namespace_id: str, file_path: str) -> AsyncIterator[VersionMeta]:
+        """Yield all non-tombstone versions for a file ordered by (created_at, version_number).
+
+        Designed as a coarse enumerator for the tier-window evaluator in
+        :class:`~vfs.gc.GarbageCollector`; adapters stay agnostic about tier semantics.
+        """
+        cursor = self._db.versions.find(
+            {
+                "namespace_id": namespace_id,
+                "file_path": file_path,
+                "is_tombstone": False,
+            }
+        ).sort([("created_at", 1), ("version_number", 1)])
+        async for doc in cursor:
+            yield self._doc_to_version(doc)
 
     async def delete_versions(self, version_ids: list[str]) -> None:
         """Hard-delete version records by ID."""

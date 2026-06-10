@@ -6,19 +6,30 @@ from datetime import datetime, timezone
 import importlib
 import importlib.util
 import inspect
+import logging
+import posixpath
+import re
 import time
 
 import blake3
 from ulid import ULID
 
 from vfs.config import VFSConfig
-from vfs.errors import NotFoundError, PermissionDeniedError
+from vfs.errors import (
+    IndexUnavailableError,
+    NotFoundError,
+    PermissionDeniedError,
+    ReindexRequiredError,
+    SearchTypeUnsupportedError,
+    VersionCollisionError,
+)
 from vfs.models import (
     AuditEvent,
     FileMeta,
     Namespace,
     Permission,
     Principal,
+    SearchArtifact,
     SearchResult,
     SearchType,
     VersionMeta,
@@ -38,10 +49,14 @@ from vfs.observability.tracing import (
     record_search_candidates,
     vfs_span,
 )
+from vfs.protocols.search import FindPredicates, SearchLimits, SearchMetaEntry, SearchRequest
 from vfs.search.default import DefaultSearchProvider
+from vfs.search.reader import ContentReader
 from vfs.stores.cached_blob import CachedBlobStore
 from vfs.stores.local_blob import LocalFSBlobStore
 from vfs.stores.sqlite_metadata import SQLiteMetadataStore
+
+_log = logging.getLogger(__name__)
 
 #: Built-in adapters with no optional dependency, mapping URI scheme to class.
 _METADATA_SCHEMES = {
@@ -84,10 +99,26 @@ def _load_optional_adapter(scheme: str, spec: tuple[str, str, str, str]) -> type
     return getattr(module, class_name)
 
 
-def _require_absolute(path: str) -> None:
-    """Reject any path that is not absolute. Relative-path resolution is the caller's job."""
+_MAX_WRITE_RETRIES: int = 5
+"""Maximum number of times VFS write/copy/move retries on a version-number collision."""
+
+
+def _require_canonical(path: str) -> None:
+    """Reject paths that are not absolute or not in canonical form.
+
+    A canonical path starts with ``/`` and, after stripping at most one trailing ``/``
+    (the root ``/`` is exempt from stripping), equals ``posixpath.normpath(path)``.
+    This accepts the root ``/``, bare absolute paths like ``/foo``, and directory-style
+    paths like ``/foo/``.  It rejects paths with ``..``, ``.`` segments, or repeated
+    slashes anywhere in the path.
+
+    Raises ValueError immediately, before any permission check or storage access.
+    """
     if not path.startswith("/"):
         raise ValueError(f"path must be absolute, got {path!r}")
+    check = path[:-1] if (path.endswith("/") and path != "/") else path
+    if check != posixpath.normpath(check):
+        raise ValueError(f"path must be canonical (no '..' or '.' segments, no repeated slashes); got {path!r}")
 
 
 class VFS:
@@ -174,7 +205,7 @@ class VFS:
 
     async def stat(self, namespace_id: str, path: str, *, principal_id: str) -> FileMeta:
         """Return file metadata. Raises PermissionDeniedError or NotFoundError."""
-        _require_absolute(path)
+        _require_canonical(path)
         t0 = time.monotonic()
         with vfs_span(
             "stat",
@@ -202,7 +233,7 @@ class VFS:
         recursive: bool = False,
     ) -> list[FileMeta]:
         """List files under path_prefix, silently pruning entries the principal cannot read."""
-        _require_absolute(path_prefix)
+        _require_canonical(path_prefix)
         t0 = time.monotonic()
         with vfs_span(
             "list",
@@ -235,7 +266,7 @@ class VFS:
         expected_version: int | None = None,
     ) -> VersionMeta:
         """Write content and create a new immutable version. Raises ConflictError on CAS mismatch."""
-        _require_absolute(path)
+        _require_canonical(path)
         await self._check_perm(principal_id, namespace_id, path, "write")
         t0 = time.monotonic()
 
@@ -248,11 +279,9 @@ class VFS:
             await self._blob.put(content_hash, content)
             record_blob_size(len(content), otel_enabled=self._config.otel_enabled)
 
-            # Determine version number
+            # Non-native provider indexing (DefaultSearchProvider returns None; kept for
+            # future custom providers that implement index() without NativeTextSearch).
             existing = await self._meta.get_file(namespace_id, path)
-            version_number = 1 if existing is None else existing.current_version_number + 1
-
-            # Index for search
             file_meta = existing or FileMeta(
                 namespace_id=namespace_id,
                 path=path,
@@ -261,22 +290,90 @@ class VFS:
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )
-            search_meta = await self._search.index(path, content, file_meta)
+            _artifact = await self._search.index(path, content, file_meta)
+            base_search_meta: dict = {}
+            if _artifact is not None:
+                base_search_meta = {_artifact.provider_key: _artifact.to_dict()}
 
-            now = datetime.now(timezone.utc)
-            version = VersionMeta(
-                id=str(ULID()),
-                file_path=path,
-                namespace_id=namespace_id,
-                version_number=version_number,
-                content_hash=content_hash,
-                size=len(content),
-                created_at=now,
-                created_by=principal_id,
-                search_meta=search_meta,
-            )
+            # Native text search: decode content once (content is immutable across retries).
+            nts = self._meta.native_text_search()
+            nts_text: str | None = None
+            nts_unsupported_meta: dict | None = None
+            if nts is not None:
+                try:
+                    nts_text = content.decode("utf-8")
+                except UnicodeDecodeError:
+                    # Content-level failure: record an unsupported artifact; write succeeds.
+                    _unsupported = SearchArtifact(
+                        status="unsupported",
+                        schema_version=1,
+                        provider_key=nts.provider_key,
+                        provider_version="1",
+                        params_hash=nts.params_hash,
+                        content_hash=content_hash,
+                        created_at=datetime.now(timezone.utc),
+                        storage="inline",
+                        error_code="decode_error",
+                        error_message="content is not valid UTF-8",
+                    )
+                    nts_unsupported_meta = {nts.provider_key: _unsupported.to_dict()}
 
-            await self._meta.put_version(version, expected_version=expected_version)
+            # Retry on VersionCollisionError (concurrent no-CAS write took the same
+            # version_number). Re-read current state each attempt so the next try uses N+2
+            # when N+1 was taken by a racing writer. CAS writes (expected_version set) are
+            # not retried — the caller owns the conflict semantics.
+            version: VersionMeta | None = None
+            for attempt in range(_MAX_WRITE_RETRIES):
+                if attempt > 0:
+                    existing = await self._meta.get_file(namespace_id, path)
+                version_number = 1 if existing is None else existing.current_version_number + 1
+                now = datetime.now(timezone.utc)
+                version_id = str(ULID())
+
+                try:
+                    if nts is not None:
+                        # index_text and put_version share one transaction so a rollback
+                        # of either leaves no orphan text artifact or version row.
+                        async with self._meta.transaction():
+                            if nts_text is not None:
+                                nts_artifact = await nts.index_text(
+                                    version_id, content_hash, nts.params_hash, nts_text
+                                )
+                                version_search_meta = {
+                                    **base_search_meta,
+                                    nts.provider_key: nts_artifact.to_dict(),
+                                }
+                            else:
+                                version_search_meta = {**base_search_meta, **(nts_unsupported_meta or {})}
+                            version = VersionMeta(
+                                id=version_id,
+                                file_path=path,
+                                namespace_id=namespace_id,
+                                version_number=version_number,
+                                content_hash=content_hash,
+                                size=len(content),
+                                created_at=now,
+                                created_by=principal_id,
+                                search_meta=version_search_meta,
+                            )
+                            await self._meta.put_version(version, expected_version=expected_version)
+                    else:
+                        version = VersionMeta(
+                            id=version_id,
+                            file_path=path,
+                            namespace_id=namespace_id,
+                            version_number=version_number,
+                            content_hash=content_hash,
+                            size=len(content),
+                            created_at=now,
+                            created_by=principal_id,
+                            search_meta=base_search_meta,
+                        )
+                        await self._meta.put_version(version, expected_version=expected_version)
+                    break
+                except VersionCollisionError:
+                    if expected_version is not None or attempt == _MAX_WRITE_RETRIES - 1:
+                        raise
 
             await audit_write(
                 self._meta,
@@ -308,7 +405,7 @@ class VFS:
         version_number: int | None = None,
     ) -> bytes:
         """Return blob content for the current version, or a specific version if version_number is given."""
-        _require_absolute(path)
+        _require_canonical(path)
         t0 = time.monotonic()
         with vfs_span(
             "read",
@@ -332,7 +429,7 @@ class VFS:
 
     async def delete(self, namespace_id: str, path: str, *, principal_id: str) -> VersionMeta:
         """Create a tombstone version marking the file deleted; preserves prior versions."""
-        _require_absolute(path)
+        _require_canonical(path)
         t0 = time.monotonic()
         with vfs_span(
             "delete",
@@ -386,8 +483,8 @@ class VFS:
         expected_version: int | None = None,
     ) -> VersionMeta:
         """Copy src to dst within the same namespace, sharing the underlying blob."""
-        _require_absolute(src)
-        _require_absolute(dst)
+        _require_canonical(src)
+        _require_canonical(dst)
         t0 = time.monotonic()
         with vfs_span(
             "copy",
@@ -401,21 +498,27 @@ class VFS:
             if src_version is None or src_version.is_tombstone:
                 raise NotFoundError(f"Source not found: {namespace_id}:{src}")
 
-            dst_file = await self._meta.get_file(namespace_id, dst)
-            dst_version_number = (dst_file.current_version_number + 1) if dst_file else 1
-
-            now = datetime.now(timezone.utc)
-            new_version = VersionMeta(
-                id=str(ULID()),
-                file_path=dst,
-                namespace_id=namespace_id,
-                version_number=dst_version_number,
-                content_hash=src_version.content_hash,
-                size=src_version.size,
-                created_at=now,
-                created_by=principal_id,
-            )
-            await self._meta.put_version(new_version, expected_version=expected_version)
+            new_version: VersionMeta | None = None
+            for attempt in range(_MAX_WRITE_RETRIES):
+                dst_file = await self._meta.get_file(namespace_id, dst)
+                dst_version_number = (dst_file.current_version_number + 1) if dst_file else 1
+                now = datetime.now(timezone.utc)
+                new_version = VersionMeta(
+                    id=str(ULID()),
+                    file_path=dst,
+                    namespace_id=namespace_id,
+                    version_number=dst_version_number,
+                    content_hash=src_version.content_hash,
+                    size=src_version.size,
+                    created_at=now,
+                    created_by=principal_id,
+                )
+                try:
+                    await self._meta.put_version(new_version, expected_version=expected_version)
+                    break
+                except VersionCollisionError:
+                    if expected_version is not None or attempt == _MAX_WRITE_RETRIES - 1:
+                        raise
 
             await audit_copy(
                 self._meta,
@@ -445,8 +548,8 @@ class VFS:
         principal_id: str,
     ) -> VersionMeta:
         """Atomically tombstone src and create dst with the same content hash."""
-        _require_absolute(src)
-        _require_absolute(dst)
+        _require_canonical(src)
+        _require_canonical(dst)
         t0 = time.monotonic()
         with vfs_span(
             "move",
@@ -461,32 +564,46 @@ class VFS:
             if src_version is None or src_version.is_tombstone:
                 raise NotFoundError(f"Source not found: {namespace_id}:{src}")
 
-            src_file = await self._meta.get_file(namespace_id, src)
-            dst_file = await self._meta.get_file(namespace_id, dst)
-            dst_version_number = (dst_file.current_version_number + 1) if dst_file else 1
+            new_version: VersionMeta | None = None
+            _new: VersionMeta | None = None
+            # Tracks the dst version_number we attempted on the last iteration so we can
+            # detect whether dst committed on a best-effort (Mongo) store before the
+            # tombstone write failed — avoiding a double-insert of the destination on retry.
+            _last_dst_attempt: int | None = None
 
-            now = datetime.now(timezone.utc)
+            for attempt in range(_MAX_WRITE_RETRIES):
+                # Re-read src_file inside the loop so the tombstone version_number is always
+                # fresh.  Without this, a collision on the tombstone write causes every
+                # subsequent attempt to re-use the same stale version_number and re-collide.
+                src_file = await self._meta.get_file(namespace_id, src)
+                dst_file = await self._meta.get_file(namespace_id, dst)
 
-            async with self._meta.transaction():
-                # Create at destination FIRST. On a best-effort no-op transaction()
-                # (standalone Mongo) each put_version commits on its own, so writing the
-                # destination before the source tombstone makes a mid-move failure
-                # non-destructive (a duplicate, never a loss) per the MoveFile spec; on a
-                # transactional store the whole block still rolls back atomically.
-                new_version = VersionMeta(
-                    id=str(ULID()),
-                    file_path=dst,
-                    namespace_id=namespace_id,
-                    version_number=dst_version_number,
-                    content_hash=src_version.content_hash,
-                    size=src_version.size,
-                    created_at=now,
-                    created_by=principal_id,
+                # On best-effort stores (standalone Mongo) dst may have committed on a prior
+                # attempt while the tombstone write collided.  Detect this by checking whether
+                # dst advanced to the version_number we last tried; if so, skip re-inserting it.
+                dst_committed = (
+                    _last_dst_attempt is not None
+                    and dst_file is not None
+                    and dst_file.current_version_number >= _last_dst_attempt
                 )
-                await self._meta.put_version(new_version)
+                if not dst_committed:
+                    dst_version_number = (dst_file.current_version_number + 1) if dst_file else 1
+                    _last_dst_attempt = dst_version_number
+                    now = datetime.now(timezone.utc)
+                    _new = VersionMeta(
+                        id=str(ULID()),
+                        file_path=dst,
+                        namespace_id=namespace_id,
+                        version_number=dst_version_number,
+                        content_hash=src_version.content_hash,
+                        size=src_version.size,
+                        created_at=now,
+                        created_by=principal_id,
+                    )
+                else:
+                    now = datetime.now(timezone.utc)
 
-                # Tombstone source second.
-                tombstone = VersionMeta(
+                _tombstone = VersionMeta(
                     id=str(ULID()),
                     file_path=src,
                     namespace_id=namespace_id,
@@ -497,7 +614,21 @@ class VFS:
                     created_by=principal_id,
                     is_tombstone=True,
                 )
-                await self._meta.put_version(tombstone)
+                try:
+                    async with self._meta.transaction():
+                        # Create at destination FIRST. On a best-effort no-op transaction()
+                        # (standalone Mongo) each put_version commits on its own, so writing the
+                        # destination before the source tombstone makes a mid-move failure
+                        # non-destructive (a duplicate, never a loss) per the MoveFile spec; on a
+                        # transactional store the whole block still rolls back atomically.
+                        if not dst_committed:
+                            await self._meta.put_version(_new)
+                        await self._meta.put_version(_tombstone)
+                    new_version = _new
+                    break
+                except VersionCollisionError:
+                    if attempt == _MAX_WRITE_RETRIES - 1:
+                        raise
 
             await audit_move(
                 self._meta,
@@ -528,7 +659,7 @@ class VFS:
         before: int | None = None,
     ) -> list[VersionMeta]:
         """Return version history for path, newest-first."""
-        _require_absolute(path)
+        _require_canonical(path)
         t0 = time.monotonic()
         with vfs_span(
             "versions",
@@ -554,7 +685,7 @@ class VFS:
         principal_id: str,
     ) -> VersionMeta:
         """Create a new version restoring target_version's content."""
-        _require_absolute(path)
+        _require_canonical(path)
         t0 = time.monotonic()
         with vfs_span(
             "rollback",
@@ -580,6 +711,10 @@ class VFS:
                 created_at=now,
                 created_by=principal_id,
                 parent_version_id=target.id,
+                # Copy search_meta from target: content-addressed external artifacts
+                # still resolve because the text record is keyed by content_hash, not
+                # version_id — so the copied artifact_ref remains valid after rollback.
+                search_meta=target.search_meta,
             )
             await self._meta.put_version(new_version)
 
@@ -610,49 +745,316 @@ class VFS:
         search_type: SearchType,
         *,
         principal_id: str,
+        find_predicates: FindPredicates | None = None,
     ) -> list[SearchResult]:
-        """Search files in scope, silently pruning results the principal cannot read."""
-        _require_absolute(scope)
+        """Search files in scope, silently pruning results the principal cannot read.
+
+        Dispatch rules
+        --------------
+        - ``GLOB`` / ``FIND``: always served by :class:`~vfs.search.default.DefaultSearchProvider`
+          from metadata (no blob reads).
+        - ``REGEX`` / ``FULLTEXT``: routed to :meth:`~vfs.protocols.metadata.MetadataStore.native_text_search`
+          when the active store exposes it.  When the capability is absent:
+
+          - ``REGEX``: falls back to the ``DefaultSearchProvider`` brute-force path, which
+            uses the guarded reader and enforces ``max_content_reads`` (large-scope regex
+            fails loud via :class:`~vfs.errors.ReadBudgetExceededError`).
+          - ``FULLTEXT``: raises :class:`~vfs.errors.SearchTypeUnsupportedError` — no
+            brute-force equivalent exists for unranked full-text search.
+
+        Dispatch rules
+        --------------
+        - ``GLOB`` / ``FIND``: always served by :class:`~vfs.search.default.DefaultSearchProvider`
+          from metadata (no blob reads).
+        - ``REGEX`` / ``FULLTEXT``: routed to :meth:`~vfs.protocols.metadata.MetadataStore.native_text_search`
+          when the active store exposes it (SQLite FTS5, PostgreSQL pg_trgm + tsvector).
+          When absent:
+
+          - ``REGEX``: falls back to the ``DefaultSearchProvider`` brute-force path via
+            the guarded reader (budget-bounded; may raise ``ReadBudgetExceededError``).
+          - ``FULLTEXT``: raises :class:`~vfs.errors.SearchTypeUnsupportedError`.
+
+        Tension with delta spec MongoRegexDeferred scenario
+        ---------------------------------------------------
+        The delta spec ``MongoRegexDeferred`` scenario states that both regex *and* fulltext
+        are rejected as unsupported for MongoDB.  The dispatch rule implemented here is more
+        permissive for regex: absent a native capability, regex falls back to
+        ``DefaultSearchProvider`` brute-force for any backend.  The dispatch cannot
+        currently distinguish Mongo from SQLite at the VFS level — both return ``None``
+        from ``native_text_search()``.  The MongoRegexDeferred test encodes the rule as
+        implemented: fulltext → unsupported; regex → brute-force.
+        """
+        _require_canonical(scope)
         t0 = time.monotonic()
         with vfs_span(
             "search",
             {"vfs.namespace": namespace_id, "vfs.path": scope, "vfs.principal_id": principal_id},
             otel_enabled=self._config.otel_enabled,
         ):
-            # Capability validation
-            if search_type not in self._search.capabilities():
+            # Early rejection of truly unsupported search types (e.g. SEMANTIC) before
+            # any storage work, preserving the pre-existing ValueError contract.
+            _supported = {SearchType.GLOB, SearchType.FIND, SearchType.REGEX, SearchType.FULLTEXT}
+            if search_type not in _supported:
                 raise ValueError(
                     f"No search provider supports {search_type.value!r}. "
-                    f"Available: {sorted(t.value for t in self._search.capabilities())}"
+                    f"Available: {sorted(t.value for t in _supported)}"
                 )
 
-            # List all files in scope
+            # List all files in scope and permission-prune (invisible)
             all_files = await self._meta.list_dir(namespace_id, scope, recursive=True)
-            # Invisible pruning
-            candidates = [
+            pruned_files = [
                 f for f in all_files if await self._meta.check_permission(principal_id, namespace_id, f.path, "read")
             ]
             record_search_candidates(
-                len(candidates),
+                len(pruned_files),
                 {"vfs.namespace": namespace_id, "vfs.search_type": search_type.value},
                 otel_enabled=self._config.otel_enabled,
             )
 
-            # Content fetcher closure — provider calls on demand
-            async def _fetch_content(path: str) -> bytes:
-                ver = await self._meta.get_version(namespace_id, path)
+            # Build permission-pruned SearchMetaEntry list.
+            # Each entry carries the current version's content_hash (for the guarded
+            # reader) and its search_meta manifest (for artifact usability checks).
+            entries: list[SearchMetaEntry] = []
+            for f in pruned_files:
+                ver = await self._meta.get_version(namespace_id, f.path)
                 if ver is None or ver.is_tombstone:
-                    return b""
-                return await self._blob.get(ver.content_hash)
+                    continue
+                entries.append(
+                    SearchMetaEntry(
+                        version_id=ver.id,
+                        path=f.path,
+                        content_hash=ver.content_hash,
+                        size=ver.size,
+                        updated_at=f.updated_at,
+                        is_deleted=f.is_deleted,
+                        search_meta=ver.search_meta,
+                    )
+                )
 
-            results = await self._search.search(query, scope, search_type, candidates, _fetch_content)
+            # Guarded reader — resolves paths to enumerated content_hash, enforces budget
+            limits = SearchLimits()
+            reader = ContentReader(entries=entries, blob=self._blob, max_reads=limits.max_content_reads)
+
+            request = SearchRequest(
+                query=query,
+                scope=scope,
+                search_type=search_type,
+                search_metas=entries,
+                read_content=reader,
+                limits=limits,
+                find_predicates=find_predicates,
+            )
+
+            # Dispatch: route by search type and available capability
+            if search_type in (SearchType.GLOB, SearchType.FIND):
+                # Metadata-only; always via DefaultSearchProvider, no blob reads
+                response = await self._search.search(request)
+            else:
+                # REGEX or FULLTEXT: prefer the native capability; fall back otherwise
+                nts = self._meta.native_text_search()
+                if nts is not None:
+                    response = await self._native_search(
+                        nts=nts,
+                        entries=entries,
+                        request=request,
+                        reader=reader,
+                        namespace_id=namespace_id,
+                        search_type=search_type,
+                        query=query,
+                        limits=limits,
+                    )
+                elif search_type == SearchType.FULLTEXT:
+                    raise SearchTypeUnsupportedError(
+                        f"fulltext search requires the NativeTextSearch capability; "
+                        f"the active metadata store ({type(self._meta).__name__}) does not "
+                        f"expose it. Use a SQLite or PostgreSQL store for fulltext support."
+                    )
+                else:
+                    # REGEX without native capability: brute-force via DefaultSearchProvider.
+                    # The guarded reader enforces max_content_reads so large-scope regex
+                    # fails loud via ReadBudgetExceededError rather than issuing unbounded reads.
+                    response = await self._search.search(request)
+
             record_op(
                 "search",
                 (time.monotonic() - t0) * 1000,
                 {"vfs.namespace": namespace_id},
                 otel_enabled=self._config.otel_enabled,
             )
-            return results
+            return response.results
+
+    # --- Native search (straggler path) ---
+
+    async def _native_search(
+        self,
+        *,
+        nts,
+        entries,
+        request,
+        reader,
+        namespace_id: str,
+        search_type,
+        query: str,
+        limits,
+    ):
+        """Serve a REGEX/FULLTEXT search via the NativeTextSearch capability.
+
+        Classifies each visible entry as *fresh* (usable artifact), *confirmed non-match*
+        (identity-matched ``unsupported`` artifact — binary content), or *straggler*
+        (missing, failed, or stale artifact).  Fresh entries are served by the capability
+        without any blob read.  Confirmed non-matches are skipped entirely and do not
+        count against the straggler budget.  Stragglers are verified individually via the
+        guarded reader up to ``limits.max_content_reads``.
+
+        Fresh entries whose external text record has been deleted out-of-band (detected
+        via ``nts.has_text_artifacts``) are reclassified as stragglers so they are
+        verified individually rather than silently missed.
+
+        Raises
+        ------
+        ReindexRequiredError
+            When the straggler count exceeds ``limits.max_content_reads`` — serving
+            the search would require unbounded blob reads.  Run ``vfs.reindex()``
+            to rebuild the index.
+        IndexUnavailableError
+            When the index store raises during the capability search call.  Run
+            ``vfs.reindex()`` after the store issue is resolved.
+
+        Note on fulltext straggler scores
+        ----------------------------------
+        Fresh fulltext results are ranked by the native BM25/ts_rank score.  Straggler
+        fulltext results use a naive token-AND match and are appended with score=1.0
+        after the ranked fresh results.  The merged list is therefore not globally
+        sorted by relevance when stragglers are present.
+        """
+        # Classify entries: fresh (usable), confirmed non-match (binary), or straggler
+        fresh_entries = []
+        straggler_entries = []
+        for entry in entries:
+            artifact_dict = entry.search_meta.get(nts.provider_key)
+            if artifact_dict is None:
+                straggler_entries.append(entry)
+                continue
+            try:
+                artifact = SearchArtifact.from_dict(artifact_dict)
+                # B2: An identity-matched 'unsupported' artifact (content_hash and
+                # params_hash current) is a confirmed non-match for text predicates —
+                # binary content cannot satisfy any regex or fulltext query.  Skip it
+                # without counting against the straggler budget.
+                if (
+                    artifact.status == "unsupported"
+                    and artifact.content_hash == entry.content_hash
+                    and artifact.params_hash == nts.params_hash
+                ):
+                    continue  # confirmed non-match — excluded from budget
+                if artifact.is_usable(
+                    current_content_hash=entry.content_hash,
+                    active_params_hash=nts.params_hash,
+                ):
+                    fresh_entries.append(entry)
+                else:
+                    straggler_entries.append(entry)
+            except Exception:  # noqa: BLE001 — malformed artifact treated as straggler
+                straggler_entries.append(entry)
+
+        # S2: Verify that external text records exist for fresh entries (detects out-of-band
+        # deletes from search_text_artifacts).  Entries whose record is missing are
+        # reclassified as stragglers so they are verified via the guarded reader rather than
+        # silently missed.  All current NTS implementations use 'external' storage, so this
+        # check covers all fresh entries.
+        if fresh_entries:
+            unique_fresh_hashes = list({e.content_hash for e in fresh_entries})
+            found_hashes = await nts.has_text_artifacts(unique_fresh_hashes, nts.params_hash)
+            still_fresh = []
+            for entry in fresh_entries:
+                if entry.content_hash in found_hashes:
+                    still_fresh.append(entry)
+                else:
+                    straggler_entries.append(entry)
+            fresh_entries = still_fresh
+
+        # Fail loud when straggler count would require unbounded reads
+        if len(straggler_entries) > limits.max_content_reads:
+            raise ReindexRequiredError(
+                f"{len(straggler_entries)} file(s) in the search scope lack a fresh "
+                f"index artifact (budget: {limits.max_content_reads}). "
+                f"Run vfs.reindex({namespace_id!r}) to rebuild the index."
+            )
+
+        # Search fresh entries via native capability (zero blob reads)
+        fresh_request = SearchRequest(
+            query=request.query,
+            scope=request.scope,
+            search_type=request.search_type,
+            search_metas=fresh_entries,
+            read_content=request.read_content,
+            limits=request.limits,
+            find_predicates=request.find_predicates,
+        )
+        fresh_version_ids = [e.version_id for e in fresh_entries]
+        try:
+            response = await nts.search_text(fresh_request, fresh_version_ids)
+        except Exception as exc:
+            raise IndexUnavailableError(
+                f"The native search index is unavailable. "
+                f"Run vfs.reindex({namespace_id!r}) after resolving the store issue. "
+                f"Cause: {exc}"
+            ) from exc
+
+        # Verify stragglers via guarded reader; backfill index after verification
+        for entry in straggler_entries:
+            content = await reader.read(entry.path)
+            # Strict UTF-8: binary content cannot be regex/fulltext searched
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                # B2: binary straggler — best-effort backfill an 'unsupported' artifact so
+                # future searches skip it without counting it against the budget.
+                try:
+                    _unsupported = SearchArtifact(
+                        status="unsupported",
+                        schema_version=1,
+                        provider_key=nts.provider_key,
+                        provider_version="1",
+                        params_hash=nts.params_hash,
+                        content_hash=entry.content_hash,
+                        created_at=datetime.now(timezone.utc),
+                        storage="inline",
+                        error_code="decode_error",
+                        error_message="content is not valid UTF-8",
+                    )
+                    await self._meta.update_search_artifact(entry.version_id, nts.provider_key, _unsupported)
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    _log.debug("Failed to record unsupported artifact for %s: %s", entry.path, exc)
+                continue
+
+            # Apply predicate against decoded text
+            matched = False
+            if search_type == SearchType.REGEX:
+                try:
+                    matched = bool(re.search(query, text))
+                except re.error:
+                    pass
+            else:  # FULLTEXT: all query tokens must appear in the text (best-effort)
+                tokens = query.lower().split()
+                text_lower = text.lower()
+                matched = bool(tokens) and all(tok in text_lower for tok in tokens)
+
+            if matched:
+                response.results.append(SearchResult(path=entry.path))
+
+            # Lazy backfill: persist the verified text so future searches are fresh.
+            # Best-effort — a failure here must not fail the search.
+            try:
+                async with self._meta.transaction():
+                    backfill_artifact = await nts.index_text(
+                        entry.version_id, entry.content_hash, nts.params_hash, text
+                    )
+                    await self._meta.update_search_artifact(entry.version_id, nts.provider_key, backfill_artifact)
+            except Exception as exc:  # noqa: BLE001 — best-effort backfill
+                _log.debug("Lazy backfill failed for %s: %s", entry.path, exc)
+
+        return response
 
     # --- GC / reindex ---
 
@@ -664,17 +1066,53 @@ class VFS:
         return await gc.run(namespace_id)
 
     async def reindex(self, namespace_id: str, provider_name: str = "default", scope: str = "/") -> int:
-        """Backfill search metadata for files in scope; returns the count of versions updated."""
-        _require_absolute(scope)
+        """Backfill search metadata for files in scope; returns the count of versions updated.
+
+        When the metadata store exposes the ``NativeTextSearch`` capability,
+        ``index_text`` is called for each file inside a transaction so the text
+        artifact and the updated ``search_meta`` are committed atomically.
+        Binary (non-UTF-8) files receive an ``unsupported`` artifact.
+
+        Falls back to ``DefaultSearchProvider.index()`` when the native
+        capability is absent (which always returns ``None`` for the default
+        provider, so ``count`` only increments on non-default providers).
+        """
+        _require_canonical(scope)
+        nts = self._meta.native_text_search()
         files = await self._meta.list_dir(namespace_id, scope, recursive=True)
         count = 0
         for f in files:
             ver = await self._meta.get_version(namespace_id, f.path)
-            if ver and not ver.is_tombstone:
-                content = await self._blob.get(ver.content_hash)
-                search_meta = await self._search.index(f.path, content, f)
-                if search_meta:
-                    await self._meta.update_search_meta(ver.id, search_meta)
+            if ver is None or ver.is_tombstone:
+                continue
+            content = await self._blob.get(ver.content_hash)
+            if nts is not None:
+                try:
+                    text = content.decode("utf-8")
+                    async with self._meta.transaction():
+                        artifact = await nts.index_text(ver.id, ver.content_hash, nts.params_hash, text)
+                        await self._meta.update_search_artifact(ver.id, nts.provider_key, artifact)
+                except UnicodeDecodeError:
+                    # Content-level: persist an unsupported artifact so future searches
+                    # know this file cannot be text-indexed.
+                    unsupported = SearchArtifact(
+                        status="unsupported",
+                        schema_version=1,
+                        provider_key=nts.provider_key,
+                        provider_version="1",
+                        params_hash=nts.params_hash,
+                        content_hash=ver.content_hash,
+                        created_at=datetime.now(timezone.utc),
+                        storage="inline",
+                        error_code="decode_error",
+                        error_message="content is not valid UTF-8",
+                    )
+                    await self._meta.update_search_artifact(ver.id, nts.provider_key, unsupported)
+                count += 1
+            else:
+                artifact = await self._search.index(f.path, content, f)
+                if artifact is not None:
+                    await self._meta.update_search_artifact(ver.id, artifact.provider_key, artifact)
                     count += 1
         return count
 
@@ -695,6 +1133,7 @@ class VFS:
         namespace; otherwise `PermissionDeniedError` is raised and no permission
         row is written.
         """
+        _require_canonical(path_prefix)
         if not await self._meta.check_permission(granter_id, namespace_id, path_prefix, "admin"):
             raise PermissionDeniedError(
                 f"principal {granter_id!r} lacks admin on {path_prefix!r} in namespace {namespace_id!r}"

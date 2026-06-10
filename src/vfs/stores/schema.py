@@ -118,3 +118,29 @@ sa.Index("idx_versions_ns_path", versions.c.namespace_id, versions.c.file_path, 
 sa.Index("idx_permissions_principal", permissions.c.principal_id, permissions.c.namespace_id)
 sa.Index("idx_audit_ns_time", audit_events.c.namespace_id, audit_events.c.timestamp.desc())
 sa.Index("idx_versions_hash", versions.c.content_hash)
+
+# --- Native full-text search index ---
+#
+# CONFIDENTIALITY (classification change): this table stores decoded file content (raw
+# text), making the metadata database content-bearing at the same sensitivity tier as the
+# blob store.  Protect accordingly: encryption at rest, least-privilege DB roles, restricted
+# backups/replicas/analytics access.  Text artifacts are content-addressed and therefore
+# shared across namespaces at rest (like blobs); namespace isolation is enforced at the
+# query boundary only.  GC MUST delete text artifacts when their content is reclaimed
+# (retention/erasure compliance).
+
+search_text_artifacts = sa.Table(
+    "search_text_artifacts",
+    metadata,
+    sa.Column("provider_key", sa.Text, nullable=False),
+    sa.Column("params_hash", sa.Text, nullable=False),
+    sa.Column("content_hash", sa.Text, nullable=False),
+    sa.Column("raw_text", sa.Text, nullable=False),  # decoded file content; content-bearing
+    sa.Column("status", sa.Text, nullable=False),  # "ready" | "failed" | "unsupported"
+    sa.Column("created_at", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("provider_key", "params_hash", "content_hash"),
+)
+# GC orphan check by content_hash (join with blob-GC pass)
+sa.Index("idx_sta_content_hash", search_text_artifacts.c.content_hash)
+# Retired-params_hash profile sweep
+sa.Index("idx_sta_params_hash", search_text_artifacts.c.params_hash)
