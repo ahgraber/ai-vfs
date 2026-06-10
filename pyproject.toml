@@ -36,6 +36,7 @@ dependencies = [
 postgres = ["asyncpg>=0.30.0"]
 mongo = ["motor>=3.6.0"]
 s3 = ["aiobotocore>=2.15.0"]
+monty = ["pydantic-monty>=0.0.18,<0.1"]
 
 [dependency-groups]
 # for local development groups;
