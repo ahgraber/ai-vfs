@@ -119,7 +119,10 @@ accelerated content search rides the store that can do it without blob reads.
 
 - **Fresh index** (artifact `ready`, `content_hash`/`params_hash` current, record present) →
   complete results, **zero blob reads**.
-- **A bounded set of stragglers** (individual unindexed/stale/`unsupported`/missing-record files,
+- **Identity-matched `unsupported` artifact** (same `content_hash` and `params_hash` as the current version) → confirmed non-match; excluded from results and **not counted against straggler budget**.
+  Binary content cannot satisfy any text predicate; the `unsupported` status was written at index time with the current content hash, so no further verification is needed.
+  An `unsupported` artifact whose hash has drifted is treated as a straggler (verified) to avoid false negatives after rollback.
+- **A bounded set of stragglers** (individual unindexed/stale/missing-record files, or `unsupported` with hash drift,
   ≤ `max_content_reads`) → verified individually via the guarded reader; the VFS MAY backfill.
 - **A cold or unavailable index** (the index store errors, or stragglers exceed `max_content_reads`) → **fail loud** with an actionable error (`IndexUnavailableError` / `ReindexRequiredError`).
   Never a silent partial result, never an unbounded blob-read storm.
@@ -206,9 +209,8 @@ The `VFS` is the single consumer: it dispatches to the store capability when pre
               retired params_hash sweep — derived, no eager refcount
 ```
 
-The `NativeTextSearch` _protocol_ is defined in this change; its SQLite/Postgres _implementations_
-(tables, migrations, GC, plaintext-at-rest handling) land in `phase2-storage` — so this change has
-a build dependency on `phase2-storage`.
+The `NativeTextSearch` _protocol_ and its SQLite/Postgres _implementations_ (tables, migrations, GC, plaintext-at-rest handling) are both introduced by this change — added onto the store classes that `phase2-storage` builds.
+The build dependency on `phase2-storage` is for the Core schema and store classes existing first; `phase2-storage` itself contains no search code.
 
 ## Risks
 
@@ -223,6 +225,12 @@ a build dependency on `phase2-storage`.
   _Mitigation:_ content-addressed (stored once per content), GC'd with blob orphans.
 - **Breaking protocol change**: `search()`/`index()` signatures change.
   _Mitigation:_ one in-tree implementor migrated here; no third-party providers exist pre-1.0.
+- **Regexes without extractable literal trigrams** (e.g. `[0-9]+`, sub-3-char literals) cannot be trigram-pruned — Postgres falls back to a sequential scan of the text table, SQLite to scanning stored text in-process.
+  Correctness and the zero-blob-read invariant hold; the sub-millisecond latency claim does not.
+  _Mitigation:_ the cross-backend contract test includes a non-prunable pattern so the fallback path is exercised deliberately.
+- **pg_trgm requires superuser (or delegated privilege) to install**: `CREATE EXTENSION pg_trgm` fails if the connected role lacks the privilege; `initialize()` logs a warning and continues without the GIN index, so regex searches fall back to a sequential scan.
+  _Mitigation:_ see migration `0002` docstring — run the migration as a superuser or grant `pg_extension_owner_transfer` out-of-band before connecting with the application role.
+  The sequential-scan fallback means correctness is preserved; only accelerated regex throughput is degraded until the extension is installed.
 
 ## Verification Notes
 

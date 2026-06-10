@@ -103,6 +103,15 @@ The tier-window math lives once in `GarbageCollector`: walk a file's versions, a
 **Rationale:** Time-window arithmetic in SQL and Mongo would be divergent implementations that must produce byte-identical reclamation sets — a correctness and test burden.
 A single client-side evaluator over a coarse enumerator keeps adapters agnostic and guarantees identical decisions across backends (the cross-adapter test asserts this).
 
+**Tier GC activation:** `GarbageCollector.run()` uses the tier path only when `VFSConfig.retention_tiers` is explicitly set (non-None, non-empty list of tier dicts).
+When `retention_tiers` is `None` (the default), `run()` falls back to the Phase 1 simple path (`_version_gc` / `list_reclaimable_versions` / `max_recent_versions`).
+Tier-aware-by-default was evaluated but rejected: `RetentionPolicy()`'s default first tier (`max_age=24h, keep_every=None`) keeps all versions under 24 hours old unconditionally, which contradicts the `max_recent_versions` contract that existing deployments rely on.
+Per-namespace `Namespace.retention_policy` overrides are not yet wired (no `get_namespace` on `MetadataStore`); a future extension can add that without changing the public API.
+
+**Tombstone exclusion:** `iter_versions_for_gc` filters out tombstone versions (`is_tombstone=True`), so tombstones are never enumerated by the tier evaluator and are never reclaimed by the tier path.
+For files that have been soft-deleted, the last content version (highest non-tombstone `version_number`) is treated as current by `_tier_version_gc` — meaning it is always retained by `keep_current_version=True`.
+This produces over-retention for deleted files (the final content version is kept indefinitely), never under-retention or data loss.
+
 **Alternatives considered:**
 
 - Per-adapter tier SQL/aggregation: divergent implementations, hard to keep identical,
