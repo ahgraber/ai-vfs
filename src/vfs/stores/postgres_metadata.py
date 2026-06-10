@@ -6,13 +6,245 @@ guards the import and raises an actionable error otherwise.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from datetime import datetime, timezone
+import hashlib
+import logging
+from typing import TYPE_CHECKING, Any, Callable
 
+import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from vfs.models import SearchArtifact, SearchResult, SearchType
+from vfs.protocols.search import SearchResponse
 from vfs.stores.sql_metadata import BaseSqlMetadataStore
+
+if TYPE_CHECKING:
+    from vfs.protocols.search import SearchRequest
+
+_log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# PostgreSQL NativeTextSearch constants
+# ---------------------------------------------------------------------------
+
+#: Stable provider key stored in ``search_meta`` manifests and ``search_text_artifacts``.
+_PG_PROVIDER_KEY: str = "vfs.postgres_fts"
+
+#: Short hex digest of the tokenizer/index configuration — bump when config changes.
+_PG_PARAMS_HASH: str = hashlib.sha256(b"postgres:tsvector+trgm:english:v1").hexdigest()[:16]
+
+
+class _PostgresNativeTextSearch:
+    """NativeTextSearch capability backed by PostgreSQL ``pg_trgm`` (regex) and ``to_tsvector`` / ``ts_rank`` (fulltext).
+
+    CONFIDENTIALITY: ``search_text_artifacts`` stores decoded file content (raw text),
+    making the metadata database content-bearing at the same sensitivity tier as the blob
+    store.  Protect accordingly: encryption at rest, least-privilege DB roles, restricted
+    backups/replicas/analytics access.  Text artifacts are content-addressed (shared across
+    namespaces at rest); namespace isolation is enforced at the query boundary only.
+    GC deletes text artifacts when their content hash is orphaned (no remaining version
+    references) or when a params_hash profile is retired.
+
+    Regex path: ``WHERE raw_text ~ :pattern`` evaluated in-engine; the ``gin_trgm_ops``
+    GIN index on ``raw_text`` (created in the migration) lets Postgres prune candidate rows
+    using extracted trigrams.  Trigram-unfriendly patterns (e.g. ``[0-9]+``) fall back to
+    a sequential scan of ``search_text_artifacts`` — correctness and zero-blob-read
+    invariant hold; the sub-millisecond latency claim does not.
+
+    Fulltext path: ``plainto_tsquery('english', :query)`` matched against
+    ``to_tsvector('english', raw_text)``; results ranked by ``ts_rank``.
+    """
+
+    provider_key: str = _PG_PROVIDER_KEY
+    params_hash: str = _PG_PARAMS_HASH
+
+    def __init__(self, store: "PostgresMetadataStore") -> None:
+        self._store = store
+
+    async def index_text(
+        self,
+        version_id: str,
+        content_hash: str,
+        params_hash: str,
+        text: str,
+    ) -> SearchArtifact:
+        """Upsert a content-addressed text record inside the caller's version transaction.
+
+        Returns a ``ready`` ``external`` ``SearchArtifact`` referencing the text record.
+        Infrastructure failures propagate as exceptions and abort the enclosing transaction.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._store._operation():
+            await self._store._db.execute(
+                sa.text(
+                    """
+                    INSERT INTO search_text_artifacts
+                        (provider_key, params_hash, content_hash, raw_text, status, created_at)
+                    VALUES (:pk, :ph, :ch, :rt, 'ready', :ca)
+                    ON CONFLICT (provider_key, params_hash, content_hash)
+                    DO UPDATE SET raw_text   = EXCLUDED.raw_text,
+                                  status     = EXCLUDED.status,
+                                  created_at = EXCLUDED.created_at
+                    """
+                ).bindparams(pk=self.provider_key, ph=params_hash, ch=content_hash, rt=text, ca=now)
+            )
+
+        artifact_ref = f"{self.provider_key}:{params_hash}:{content_hash}"
+        return SearchArtifact(
+            status="ready",
+            schema_version=1,
+            provider_key=self.provider_key,
+            provider_version="1",
+            params_hash=params_hash,
+            content_hash=content_hash,
+            created_at=datetime.now(timezone.utc),
+            storage="external",
+            artifact_ref=artifact_ref,
+        )
+
+    async def search_text(
+        self,
+        request: "SearchRequest",
+        visible_version_ids: list[str],
+    ) -> SearchResponse:
+        """Match content and expand results to visible occurrences.
+
+        Regex: ``text ~ :pattern`` evaluated in-engine (trigram-pruned when extractable
+        literals exist); no blob reads for fresh records.
+        Fulltext: ``plainto_tsquery`` match ranked by ``ts_rank``.
+        """
+        from vfs.protocols.search import SearchMetaEntry  # avoid circular at module level
+
+        ch_to_entries: dict[str, list[SearchMetaEntry]] = {}
+        for e in request.search_metas:
+            ch_to_entries.setdefault(e.content_hash, []).append(e)
+
+        if not ch_to_entries:
+            return SearchResponse()
+
+        if request.search_type == SearchType.FULLTEXT:
+            return await self._fulltext_search(request.query, ch_to_entries)
+        else:
+            return await self._regex_search(request.query, ch_to_entries)
+
+    async def _regex_search(self, pattern: str, ch_to_entries: dict[str, list[Any]]) -> SearchResponse:
+        """In-engine regex via ``text ~ :pattern``; GIN index prunes trigram candidates."""
+        visible_hashes = list(ch_to_entries.keys())
+        results: list[SearchResult] = []
+
+        async with self._store._operation():
+            rows = (
+                await self._store._db.execute(
+                    sa.text(
+                        """
+                        SELECT content_hash
+                        FROM search_text_artifacts
+                        WHERE provider_key = :pk
+                          AND params_hash  = :ph
+                          AND content_hash = ANY(:hashes)
+                          AND raw_text ~ :pattern
+                        """
+                    ).bindparams(
+                        pk=self.provider_key,
+                        ph=self.params_hash,
+                        hashes=visible_hashes,
+                        pattern=pattern,
+                    )
+                )
+            ).fetchall()
+
+        for row in rows:
+            ch = row[0]
+            if ch in ch_to_entries:
+                for entry in ch_to_entries[ch]:
+                    results.append(SearchResult(path=entry.path))
+
+        return SearchResponse(results=results)
+
+    async def _fulltext_search(self, query: str, ch_to_entries: dict[str, list[Any]]) -> SearchResponse:
+        """``ts_rank`` ranked fulltext search via ``plainto_tsquery``."""
+        visible_hashes = list(ch_to_entries.keys())
+        results: list[SearchResult] = []
+
+        async with self._store._operation():
+            rows = (
+                await self._store._db.execute(
+                    sa.text(
+                        """
+                        SELECT content_hash,
+                               ts_rank(to_tsvector('english', raw_text),
+                                       plainto_tsquery('english', :query)) AS score
+                        FROM search_text_artifacts
+                        WHERE provider_key = :pk
+                          AND params_hash  = :ph
+                          AND content_hash = ANY(:hashes)
+                          AND to_tsvector('english', raw_text)
+                              @@ plainto_tsquery('english', :query)
+                        ORDER BY score DESC
+                        """
+                    ).bindparams(
+                        pk=self.provider_key,
+                        ph=self.params_hash,
+                        hashes=visible_hashes,
+                        query=query,
+                    )
+                )
+            ).fetchall()
+
+        for row in rows:
+            ch, score = row[0], float(row[1]) if row[1] is not None else 0.0
+            if ch in ch_to_entries:
+                for entry in ch_to_entries[ch]:
+                    results.append(SearchResult(path=entry.path, score=score))
+
+        return SearchResponse(results=results)
+
+    async def delete_text_artifacts(
+        self,
+        content_hashes: list[str],
+        retired_params_hashes: list[str],
+    ) -> None:
+        """Delete text artifacts for orphaned content hashes or retired params profiles."""
+        async with self._store._operation():
+            if content_hashes:
+                await self._store._db.execute(
+                    sa.text(
+                        "DELETE FROM search_text_artifacts WHERE provider_key = :pk AND content_hash = ANY(:hashes)"
+                    ).bindparams(pk=self.provider_key, hashes=content_hashes)
+                )
+            if retired_params_hashes:
+                await self._store._db.execute(
+                    sa.text(
+                        "DELETE FROM search_text_artifacts WHERE provider_key = :pk AND params_hash = ANY(:hashes)"
+                    ).bindparams(pk=self.provider_key, hashes=retired_params_hashes)
+                )
+
+    async def has_text_artifacts(self, content_hashes: list[str], params_hash: str) -> set[str]:
+        """Return the subset of content_hashes that have a text row in the store.
+
+        Used by the VFS straggler classifier to detect external records deleted
+        out-of-band: entries whose record is missing are reclassified as stragglers
+        and verified individually via the guarded reader rather than silently missed.
+        """
+        if not content_hashes:
+            return set()
+        async with self._store._operation():
+            rows = (
+                await self._store._db.execute(
+                    sa.text(
+                        "SELECT content_hash FROM search_text_artifacts "
+                        "WHERE provider_key = :pk AND params_hash = :ph AND content_hash = ANY(:hashes)"
+                    ).bindparams(pk=self.provider_key, ph=params_hash, hashes=content_hashes)
+                )
+            ).fetchall()
+        return {row[0] for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL metadata store
+# ---------------------------------------------------------------------------
 
 
 class PostgresMetadataStore(BaseSqlMetadataStore):
@@ -38,6 +270,10 @@ class PostgresMetadataStore(BaseSqlMetadataStore):
     Schema creation uses ``metadata.create_all`` (inherited :meth:`initialize`) so the
     store is self-contained for tests; production schema evolution is owned by the Alembic
     migrations.
+
+    :meth:`native_text_search` exposes the :class:`_PostgresNativeTextSearch` capability
+    (``pg_trgm`` GIN + ``to_tsvector`` fulltext) when asyncpg is present (always, since
+    this class is only importable when ``asyncpg`` is installed).
     """
 
     def __init__(self, uri: str) -> None:
@@ -53,6 +289,7 @@ class PostgresMetadataStore(BaseSqlMetadataStore):
         """
         super().__init__()
         self._url = make_url(uri).set(drivername="postgresql+asyncpg")
+        self._nts = _PostgresNativeTextSearch(self)
 
     def _create_engine(self) -> AsyncEngine:
         return create_async_engine(self._url)
@@ -60,3 +297,52 @@ class PostgresMetadataStore(BaseSqlMetadataStore):
     @property
     def _dialect_insert(self) -> Callable[..., Any]:
         return postgresql_insert
+
+    async def initialize(self) -> None:
+        """Initialize the base schema, then attempt to set up the pg_trgm GIN index.
+
+        After ``metadata.create_all`` the store tries to create the ``pg_trgm`` extension
+        and a GIN index on ``search_text_artifacts.raw_text`` (``gin_trgm_ops``).  Both
+        operations succeed when the connected role has ``CREATE EXTENSION`` and ``CREATE
+        INDEX`` privileges; if they fail (e.g. the role is unprivileged), a warning is
+        logged and the store remains functional — regex searches fall back to a sequential
+        scan of ``search_text_artifacts`` rather than the accelerated trigram path.
+
+        Note on schema drift: the Alembic migration 0002 creates the same extension and
+        GIN index; production deployments that apply migrations first will already have
+        them.  ``initialize()`` uses ``CREATE EXTENSION IF NOT EXISTS`` and
+        ``CREATE INDEX IF NOT EXISTS`` so duplicate creation is a no-op.
+
+        Superuser requirement: ``CREATE EXTENSION pg_trgm`` requires superuser or
+        ``pg_extension_owner_transfer`` privilege in standard PostgreSQL.  If the connected
+        role is unprivileged, grant the privilege out-of-band or accept the sequential-scan
+        fallback.  See also: migration 0002 docstring.
+        """
+        await super().initialize()
+        await self._setup_trgm()
+
+    async def _setup_trgm(self) -> None:
+        """Create the pg_trgm extension and GIN index; log and skip on privilege errors."""
+        async with self._lock:
+            try:
+                await self._conn.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                await self._conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS idx_sta_trgm ON search_text_artifacts USING gin(raw_text gin_trgm_ops)"
+                )
+                await self._conn.commit()
+            except Exception as exc:  # noqa: BLE001 — best-effort, privilege error is common
+                try:
+                    await self._conn.rollback()
+                except Exception as rollback_exc:
+                    _log.debug("Rollback after pg_trgm setup failure also failed: %s", rollback_exc)
+                _log.warning(
+                    "pg_trgm extension or GIN index creation failed (insufficient privilege?); "
+                    "regex searches will use a sequential scan. "
+                    "Grant CREATE EXTENSION privilege or run migration 0002 as a superuser. "
+                    "Error: %s",
+                    exc,
+                )
+
+    def native_text_search(self) -> _PostgresNativeTextSearch:
+        """Return the PostgreSQL NativeTextSearch capability (always available)."""
+        return self._nts

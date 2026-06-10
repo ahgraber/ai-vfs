@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, AsyncIterator, Protocol, runtime_checkable
 
 from vfs.models import (
     AuditEvent,
@@ -12,8 +12,12 @@ from vfs.models import (
     Permission,
     Principal,
     RetentionPolicy,
+    SearchArtifact,
     VersionMeta,
 )
+
+if TYPE_CHECKING:
+    from vfs.protocols.search import NativeTextSearch
 
 
 @runtime_checkable
@@ -89,6 +93,38 @@ class MetadataStore(Protocol):
         """Attach provider-returned search metadata to a version record."""
         ...
 
+    async def get_search_meta_batch(self, version_ids: list[str]) -> dict[str, dict]:
+        """Return the ``search_meta`` manifest for each of the given version IDs.
+
+        Keys in the returned dict are version IDs; values are the raw
+        ``search_meta`` dicts (provider key → serialized artifact dict).
+        Version IDs with no matching record are omitted from the result.
+        """
+        ...
+
+    async def update_search_artifact(self, version_id: str, provider_key: str, artifact: SearchArtifact) -> None:
+        """Set a single provider artifact in the ``search_meta`` manifest.
+
+        Merges ``{provider_key: artifact.to_dict()}`` into the existing manifest
+        for ``version_id``, preserving any other provider keys already present.
+        A no-op if ``version_id`` does not exist.
+        """
+        ...
+
+    def native_text_search(self) -> NativeTextSearch | None:
+        """Return the :class:`~vfs.protocols.search.NativeTextSearch` capability, or ``None``.
+
+        Stores that implement native text indexing (SQLite FTS5, PostgreSQL ``tsvector`` +
+        ``pg_trgm``) return the capability object; stores without it (MongoDB, and SQL
+        stores before the capability is activated) return ``None``.
+
+        Returning ``None`` means regex search falls back to the ``DefaultSearchProvider``
+        brute-force path (which uses the guarded reader budget and fails loud on
+        over-budget scope) and fulltext search is rejected with
+        :class:`~vfs.errors.SearchTypeUnsupportedError`.
+        """
+        ...
+
     # --- Name resolution ---
 
     async def set_name(self, entity_type: str, entity_id: str, display_name: str) -> None:
@@ -105,6 +141,10 @@ class MetadataStore(Protocol):
         self, policy: RetentionPolicy, namespace_id: str | None = None
     ) -> list[VersionMeta]:
         """Return versions eligible for garbage collection under the given policy."""
+        ...
+
+    def iter_versions_for_gc(self, namespace_id: str, file_path: str) -> AsyncIterator[VersionMeta]:
+        """Yield all non-tombstone versions for a file in deterministic order (created_at, version_number)."""
         ...
 
     async def delete_versions(self, version_ids: list[str]) -> None:

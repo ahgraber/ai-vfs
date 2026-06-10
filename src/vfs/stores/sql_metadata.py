@@ -21,13 +21,14 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime
 import json
+import posixpath
 from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
 import sqlalchemy as sa
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from vfs.errors import ConflictError
+from vfs.errors import ConflictError, VersionCollisionError
 from vfs.models import (
     AuditEvent,
     FileMeta,
@@ -35,6 +36,7 @@ from vfs.models import (
     Permission,
     Principal,
     RetentionPolicy,
+    SearchArtifact,
     VersionMeta,
 )
 from vfs.stores.schema import (
@@ -53,6 +55,40 @@ from vfs.stores.schema import (
 # task that has *not* entered transaction() could observe another task's True and wrongly
 # skip the lock/commit. ContextVar scopes the flag to the task that owns the transaction.
 _in_txn: ContextVar[bool] = ContextVar("aivfs_sql_in_txn", default=False)
+
+
+def _require_canonical(path: str) -> None:
+    """Raise ValueError if path is not absolute or not canonical (no '..' / '.' / '//')."""
+    if not path.startswith("/"):
+        raise ValueError(f"path_prefix must be absolute, got {path!r}")
+    check = path[:-1] if (path.endswith("/") and path != "/") else path
+    if check != posixpath.normpath(check):
+        raise ValueError(f"path_prefix must be canonical (no '..' or '.' segments, no repeated slashes); got {path!r}")
+
+
+def _prefix_matches(path_prefix: str, path: str) -> bool:
+    """Return True if path falls under path_prefix at a segment boundary.
+
+    A prefix P matches path X when:
+      - X == P (exact match — single-file grant), or
+      - X starts with P + "/" when P does not end with "/", or
+      - X starts with P when P already ends with "/".
+    This prevents "/work" from matching "/workspace/file".
+    """
+    if path == path_prefix:
+        return True
+    dir_prefix = path_prefix if path_prefix.endswith("/") else path_prefix + "/"
+    return path.startswith(dir_prefix)
+
+
+def _like_escape(value: str) -> str:
+    r"""Escape SQL LIKE special characters so the value is matched literally.
+
+    Escapes ``\``, ``%``, and ``_`` (in that order) so callers can safely pass arbitrary
+    path strings into a ``LIKE`` pattern without them acting as wildcards.  The returned
+    value must be paired with an ``ESCAPE '\\'`` clause.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class BaseSqlMetadataStore(abc.ABC):
@@ -218,7 +254,7 @@ class BaseSqlMetadataStore(abc.ABC):
                 await self._db.execute(
                     select(files).where(
                         files.c.namespace_id == namespace_id,
-                        files.c.path.like(path_prefix + "%"),
+                        files.c.path.like(_like_escape(path_prefix) + "%", escape="\\"),
                         files.c.is_deleted == False,  # noqa: E712 — SQL boolean comparison, not a Python identity check
                     )
                 )
@@ -264,7 +300,16 @@ class BaseSqlMetadataStore(abc.ABC):
         async with self._operation():
             if expected_version is None:
                 # New file or unconditional upsert: insert the version, then upsert the pointer.
-                await self._db.execute(insert(versions).values(**version_values))
+                # A UNIQUE constraint violation on (namespace_id, file_path, version_number) means
+                # a concurrent no-CAS writer took the same version number; translate to
+                # VersionCollisionError so the VFS retry loop can recover.
+                try:
+                    await self._db.execute(insert(versions).values(**version_values))
+                except sa.exc.IntegrityError as exc:
+                    raise VersionCollisionError(
+                        f"version_number collision: {version.namespace_id}:{version.file_path} "
+                        f"version {version.version_number}"
+                    ) from exc
                 await self._db.execute(
                     self._upsert(
                         files,
@@ -352,15 +397,20 @@ class BaseSqlMetadataStore(abc.ABC):
             ).fetchall()
         if not rows:
             return False
+        # The VFS boundary (_require_canonical) already rejects non-canonical paths before
+        # any store call, so no normpath is applied here.  Applying normpath would strip a
+        # trailing slash from the requested path (e.g. "/team/" → "/team"), breaking exact
+        # matches against trailing-slash grants ("/team/") used by VFS.grant().
         # Sort by path_prefix length descending (most-specific first)
         rows = sorted(rows, key=lambda r: len(r.path_prefix), reverse=True)
         for row in rows:
-            if path.startswith(row.path_prefix):
+            if _prefix_matches(row.path_prefix, path):
                 return operation in set(row.operations)
         return False
 
     async def set_permission(self, permission: Permission) -> None:
         """Insert or replace the permission entry for the given (principal, namespace, path_prefix) scope."""
+        _require_canonical(permission.path_prefix)
         async with self._operation():
             await self._db.execute(
                 self._upsert(
@@ -413,6 +463,49 @@ class BaseSqlMetadataStore(abc.ABC):
         """Update the search_meta field on a version record."""
         async with self._operation():
             await self._db.execute(update(versions).where(versions.c.id == version_id).values(search_meta=search_meta))
+
+    async def get_search_meta_batch(self, version_ids: list[str]) -> dict[str, dict]:
+        """Return the search_meta manifest for each of the given version IDs.
+
+        Version IDs with no matching record are omitted from the result.
+        """
+        if not version_ids:
+            return {}
+        async with self._operation():
+            rows = (
+                await self._db.execute(
+                    select(versions.c.id, versions.c.search_meta).where(versions.c.id.in_(version_ids))
+                )
+            ).fetchall()
+        return {row.id: (row.search_meta if row.search_meta else {}) for row in rows}
+
+    def native_text_search(self):
+        """Return None; this base class does not implement NativeTextSearch.
+
+        Concrete subclasses (:class:`~vfs.stores.sqlite_metadata.SQLiteMetadataStore`
+        and :class:`~vfs.stores.postgres_metadata.PostgresMetadataStore`) override this
+        to return a live capability when the backing store is ready.  Returning None
+        causes the VFS to fall back to brute-force regex (guarded reader) or reject
+        fulltext as unsupported.
+        """
+        return None
+
+    async def update_search_artifact(self, version_id: str, provider_key: str, artifact: SearchArtifact) -> None:
+        """Merge a single provider artifact into the search_meta manifest.
+
+        Reads the current manifest, sets the ``provider_key`` entry to the
+        serialized artifact, and writes the updated manifest back — all under
+        ``_operation()`` so the read-modify-write is serialized on the shared
+        connection.
+        """
+        async with self._operation():
+            row = (await self._db.execute(select(versions.c.search_meta).where(versions.c.id == version_id))).first()
+            if row is None:
+                return
+            current: dict = row.search_meta if row.search_meta else {}
+            current = dict(current)
+            current[provider_key] = artifact.to_dict()
+            await self._db.execute(update(versions).where(versions.c.id == version_id).values(search_meta=current))
 
     # --- Name resolution ---
 
@@ -497,6 +590,26 @@ class BaseSqlMetadataStore(abc.ABC):
                         continue
                     reclaimable.append(ver)
         return reclaimable
+
+    async def iter_versions_for_gc(self, namespace_id: str, file_path: str) -> AsyncIterator[VersionMeta]:
+        """Yield all non-tombstone versions for a file ordered by (created_at, version_number).
+
+        Designed as a coarse enumerator for the tier-window evaluator in
+        :class:`~vfs.gc.GarbageCollector`; adapters stay agnostic about tier semantics.
+        """
+        stmt = (
+            select(versions)
+            .where(
+                versions.c.namespace_id == namespace_id,
+                versions.c.file_path == file_path,
+                versions.c.is_tombstone == False,  # noqa: E712 — SQL boolean comparison
+            )
+            .order_by(versions.c.created_at, versions.c.version_number)
+        )
+        async with self._operation():
+            rows = (await self._db.execute(stmt)).fetchall()
+        for row in rows:
+            yield self._row_to_version(row)
 
     async def delete_versions(self, version_ids: list[str]) -> None:
         """Hard-delete version records by ID."""

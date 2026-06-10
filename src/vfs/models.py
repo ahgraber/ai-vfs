@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -130,3 +133,82 @@ class GCResult(BaseModel):
 
     versions_reclaimed: int
     blobs_reclaimed: int
+
+
+@dataclass(frozen=True)
+class SearchArtifact:
+    """Envelope representing one provider's search index artifact for a file version.
+
+    ``status`` is one of ``"ready"``, ``"failed"``, or ``"unsupported"``.
+    ``storage`` is one of ``"inline"``, ``"blob"``, or ``"external"``.
+
+    Usability check:
+    - ``status == "ready"`` AND ``content_hash`` matches the version's content hash AND
+      ``params_hash`` matches the active provider's config hash.
+    - For ``storage == "external"``: additionally the referenced record must be readable
+      and its recorded identity must match (``content_hash``/``params_hash``); a missing,
+      unreadable, or mismatched record is treated as a straggler, never a confirmed
+      non-match.
+
+    Serialization: use :meth:`to_dict` / :meth:`from_dict` at the store boundary.
+    The ``created_at`` datetime is stored as an ISO-8601 string in the serialized form.
+    """
+
+    status: str
+    schema_version: int
+    provider_key: str
+    provider_version: str
+    params_hash: str
+    content_hash: str
+    created_at: datetime
+    storage: str
+    payload: Any = None
+    artifact_ref: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+    def is_usable(
+        self,
+        *,
+        current_content_hash: str,
+        active_params_hash: str,
+        external_readable: bool = True,
+        external_identity_match: bool = True,
+    ) -> bool:
+        """Return True iff the artifact can answer a search without re-indexing.
+
+        For ``storage == "external"``, the caller must also supply the external record's
+        readability and identity-match status (``external_readable``,
+        ``external_identity_match``); a missing or mismatched record is a straggler.
+        """
+        if self.status != "ready":
+            return False
+        if self.content_hash != current_content_hash:
+            return False
+        if self.params_hash != active_params_hash:
+            return False
+        if self.storage == "external":
+            return external_readable and external_identity_match
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict for storage in the ``search_meta`` manifest.
+
+        ``created_at`` is stored as an ISO-8601 string; all other fields are
+        JSON-primitive or ``None``.
+        """
+        d = dataclasses.asdict(self)
+        d["created_at"] = self.created_at.isoformat()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> SearchArtifact:
+        """Reconstruct a :class:`SearchArtifact` from a serialized dict.
+
+        Accepts either an ISO-8601 string or an already-parsed ``datetime`` for
+        ``created_at`` so the method is idempotent across store round-trips.
+        """
+        d = dict(d)
+        if isinstance(d.get("created_at"), str):
+            d["created_at"] = datetime.fromisoformat(d["created_at"])
+        return cls(**d)
