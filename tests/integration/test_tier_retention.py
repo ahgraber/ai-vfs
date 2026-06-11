@@ -146,7 +146,9 @@ async def postgres_store():
     base_url = make_url(_POSTGRES_DSN)
     maint_url = base_url.set(database="postgres", drivername="postgresql+asyncpg")
     db_name = f"aivfs_tier_test_{worker}"
-    worker_dsn = str(base_url.set(database=db_name))
+    # str(URL) masks the password as "***"; render_as_string(hide_password=False) exposes it
+    # for the adapter so asyncpg does not receive a literal three-asterisk password string.
+    worker_dsn = base_url.set(database=db_name).render_as_string(hide_password=False)
 
     engine = create_async_engine(maint_url, isolation_level="AUTOCOMMIT")
     from sqlalchemy import text

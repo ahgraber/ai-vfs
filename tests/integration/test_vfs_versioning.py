@@ -112,8 +112,14 @@ class TestVFSVersionsPermissions:
 class TestVFSReindex:
     @pytest.mark.asyncio
     async def test_reindex_backfills_search_meta(self, vfs_instance):
-        """SearchMetaReindex: reindex() populates search_meta via the active provider."""
-        from vfs.models import SearchType
+        """SearchMetaReindex: reindex() populates search_meta via the active provider.
+
+        # phase2-search (archived change): when the metadata store exposes NativeTextSearch
+        # (SQLite FTS5 here), reindex() calls nts.index_text() directly and never calls
+        # self._search.index() — so search_meta carries the NTS key, not the stub's key.
+        # Assertions are subset checks (NTS key present and ready) rather than exact equality.
+        """
+        from vfs.models import SearchArtifact, SearchType
 
         ns, p, admin = await _setup(vfs_instance)
         # Write files BEFORE swapping the provider, so default provider records {} on disk.
@@ -122,7 +128,8 @@ class TestVFSReindex:
 
         class _StubProvider:
             async def index(self, path, content, meta):
-                return {"len": len(content)}
+                # reindex() with NTS active never calls this; return None per protocol
+                return None
 
             async def search(self, query, scope, search_type, candidates, fetch_content=None):
                 return []
@@ -134,7 +141,14 @@ class TestVFSReindex:
         updated = await vfs_instance.reindex(ns.id)
         assert updated == 2
 
+        nts = vfs_instance._meta.native_text_search()
+        nts_key = nts.provider_key  # "vfs.sqlite_fts5"
+
         ver_a = await vfs_instance._meta.get_version(ns.id, "/a.py")
         ver_b = await vfs_instance._meta.get_version(ns.id, "/b.py")
-        assert ver_a.search_meta == {"len": 5}
-        assert ver_b.search_meta == {"len": 4}
+        # NTS key must be present and ready; custom stub key absent because reindex()
+        # with NTS active routes through nts.index_text(), not self._search.index().
+        assert nts_key in ver_a.search_meta
+        assert SearchArtifact.from_dict(ver_a.search_meta[nts_key]).status == "ready"
+        assert nts_key in ver_b.search_meta
+        assert SearchArtifact.from_dict(ver_b.search_meta[nts_key]).status == "ready"
