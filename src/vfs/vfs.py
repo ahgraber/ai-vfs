@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import importlib
 import importlib.util
@@ -16,9 +17,13 @@ from ulid import ULID
 
 from vfs.config import VFSConfig
 from vfs.errors import (
+    AnchorConflictError,
+    ConflictError,
     IndexUnavailableError,
     NotFoundError,
+    OperationBudgetExceededError,
     PermissionDeniedError,
+    ReadBudgetExceededError,
     ReindexRequiredError,
     SearchTypeUnsupportedError,
     VersionCollisionError,
@@ -891,6 +896,135 @@ class VFS:
                 otel_enabled=self._config.otel_enabled,
             )
             return response.results
+
+    # --- execute ---
+
+    async def execute(
+        self,
+        code: str,
+        namespace_id: str,
+        principal_id: str,
+        provider_name: str,
+        *,
+        timeout: float | None = None,
+        resource_limits=None,
+        cwd: str = "/",
+    ):
+        """Execute ``code`` in a sandboxed provider, returning an ``ExecutionResult``.
+
+        Two-tier error contract
+        -----------------------
+        **Tier 1** — raises before any session, FsOperations, or provider is constructed:
+
+        - ``ValueError`` for malformed arguments (non-canonical ``cwd``) or unknown
+          provider name.
+        - ``ImportError`` (actionable "install ai-vfs[extra]") when the provider's
+          optional dependency is absent.
+        - ``PermissionDeniedError`` when the principal lacks ``execute`` permission on
+          ``cwd`` — consistent with every other VFS operation.
+
+        **Tier 2** — all exceptions arising *after* dispatch begins are translated to
+        ``ExecutionResult(success=False, ...)``; no raw traceback, host path, or
+        adapter-internal detail appears in ``error_message``.
+        """
+        from vfs.execution.anchors import AnchorMap
+        from vfs.execution.fs_ops import fs_operations_for
+        from vfs.execution.registry import resolve_execution_provider
+        from vfs.protocols.execution import ExecutionResult, ResourceLimits
+        from vfs.session import Session
+
+        # --- Tier 1: validate args and check permission (raises, never returns ExecutionResult) ---
+        _require_canonical(cwd)
+
+        # Resolve effective resource limits: config defaults → caller overrides.
+        effective_limits: ResourceLimits
+        if resource_limits is not None:
+            effective_limits = resource_limits
+        else:
+            effective_limits = ResourceLimits(
+                timeout_seconds=self._config.default_timeout_seconds,
+                max_operations=self._config.default_max_operations,
+            )
+
+        effective_timeout = timeout if timeout is not None else effective_limits.timeout_seconds
+
+        # Resolve provider early (raises ValueError / ImportError — Tier 1).
+        provider = resolve_execution_provider(provider_name, self._config)
+
+        # Permission check on cwd (raises PermissionDeniedError — Tier 1).
+        await self._check_perm(principal_id, namespace_id, cwd, "execute")
+
+        # --- Construct session, anchor map, and FsOperations ---
+        session = Session(self, namespace_id, principal_id)
+        # session.cd enforces read permission on cwd; permission denied here is a
+        # caller-side error, so let it propagate (Tier 1 boundary).
+        await session.cd(cwd)
+        anchor_map = AnchorMap()
+        fs_ops = fs_operations_for(session, effective_limits, anchor_map)
+
+        # --- Tier 2: wrap provider dispatch; translate all execution-time exceptions ---
+        try:
+            result = await asyncio.wait_for(
+                provider.execute(code, fs_ops, effective_limits),
+                timeout=effective_timeout,
+            )
+        except asyncio.TimeoutError:
+            return ExecutionResult(success=False, error_type="timeout", error_message="Execution timed out")
+        except PermissionDeniedError:
+            return ExecutionResult(
+                success=False,
+                error_type="permission_denied",
+                error_message="Access denied to path",
+            )
+        except NotFoundError:
+            return ExecutionResult(success=False, error_type="not_found", error_message="File not found")
+        except ConflictError:
+            return ExecutionResult(
+                success=False,
+                error_type="conflict",
+                error_message="Version conflict; re-read and retry",
+            )
+        except VersionCollisionError:
+            return ExecutionResult(
+                success=False,
+                error_type="conflict",
+                error_message="Concurrent write; retry",
+            )
+        except OperationBudgetExceededError:
+            return ExecutionResult(
+                success=False,
+                error_type="budget_exceeded",
+                error_message="Operation limit reached",
+            )
+        except AnchorConflictError:
+            return ExecutionResult(
+                success=False,
+                error_type="anchor_conflict",
+                error_message="Anchors stale; re-read file",
+            )
+        except ReadBudgetExceededError:
+            return ExecutionResult(
+                success=False,
+                error_type="search_unavailable",
+                error_message="Search read budget exhausted; reindex",
+            )
+        except ReindexRequiredError:
+            return ExecutionResult(
+                success=False,
+                error_type="search_unavailable",
+                error_message="Index cold; run vfs.reindex()",
+            )
+        except IndexUnavailableError:
+            return ExecutionResult(
+                success=False,
+                error_type="search_unavailable",
+                error_message="Search index unavailable",
+            )
+        except Exception:  # noqa: BLE001
+            _log.exception("Unexpected error during vfs.execute for principal %s", principal_id)
+            return ExecutionResult(success=False, error_type="internal_error", error_message="Execution error")
+        else:
+            return result
 
     # --- Native search (straggler path) ---
 
