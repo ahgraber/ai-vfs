@@ -291,6 +291,15 @@ class VFS:
                 updated_at=datetime.now(timezone.utc),
             )
             _artifact = await self._search.index(path, content, file_meta)
+            # External boundary: SearchProvider.index() must return SearchArtifact | None.
+            # A raw dict return is the pre-phase2-search protocol; raise a clear TypeError
+            # rather than letting the AttributeError surface deep in the call chain.
+            if _artifact is not None and not isinstance(_artifact, SearchArtifact):
+                raise TypeError(
+                    f"SearchProvider.index() must return SearchArtifact | None; "
+                    f"{type(self._search).__name__!r} returned {type(_artifact).__name__!r}. "
+                    "Update the provider to use SearchArtifact (phase2-search protocol change)."
+                )
             base_search_meta: dict = {}
             if _artifact is not None:
                 base_search_meta = {_artifact.provider_key: _artifact.to_dict()}

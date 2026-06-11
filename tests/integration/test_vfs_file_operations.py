@@ -157,12 +157,30 @@ class TestVFSWrite:
 
     @pytest.mark.asyncio
     async def test_write_updates_search_meta(self, vfs_instance):
-        """Search provider returning non-empty dict should populate version.search_meta."""
+        """Search provider returning SearchArtifact should populate version.search_meta.
+
+        # phase2-search (archived change): SearchProvider.index() now returns
+        # SearchArtifact | None, not a raw dict.  The stub below uses the current protocol.
+        """
+        from datetime import datetime, timezone
+
+        from vfs.models import SearchArtifact
+
         ns, p, admin = await _setup_ns_principal(vfs_instance)
 
         class MockSearchProvider:
             async def index(self, path, content, metadata):
-                return {"test_key": "test_value"}
+                # phase2-search protocol: return SearchArtifact, not a raw dict
+                return SearchArtifact(
+                    status="ready",
+                    schema_version=1,
+                    provider_key="test_provider",
+                    provider_version="1",
+                    params_hash="test_params",
+                    content_hash="test_hash",
+                    created_at=datetime.now(timezone.utc),
+                    storage="inline",
+                )
 
             async def search(self, query, scope, search_type, candidates, fetch_content=None):
                 return []
@@ -174,10 +192,12 @@ class TestVFSWrite:
 
         vfs_instance._search = MockSearchProvider()
         ver = await vfs_instance.write(ns.id, "/a.py", b"content", principal_id=p.id)
-        assert ver.search_meta == {"test_key": "test_value"}
+        # search_meta contains the custom provider key alongside any NTS key
+        assert "test_provider" in ver.search_meta
+        assert SearchArtifact.from_dict(ver.search_meta["test_provider"]).status == "ready"
         # Verify persisted in DB
         stored = await vfs_instance._meta.get_version(ns.id, "/a.py")
-        assert stored.search_meta == {"test_key": "test_value"}
+        assert "test_provider" in stored.search_meta
 
 
 # --- Task 16: read ---
