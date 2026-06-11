@@ -12,11 +12,42 @@ Ref: https://gist.github.com/mikeckennedy/de70ce13231b407a8dccea758f83a5cd
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import warnings
 
 import pytest
+
+
+def _find_workspace_root(start: Path) -> Path:
+    """Walk up from ``start`` to the nearest ancestor containing ``uv.lock``.
+
+    The audit targets the uv workspace's single shared lockfile (one ``uv.lock``,
+    one resolved environment for all members), so the test must resolve the
+    workspace root regardless of which member directory it lives in. The search is
+    bounded to the git repository: it never ascends past the directory holding
+    ``.git``, so a stray ``uv.lock`` outside the checkout can't be picked up. Falls
+    back to ``start`` when no lockfile is found within the repo (e.g. a non-workspace
+    checkout), letting the caller's own skip/fallback logic take over.
+    """
+    for directory in (start, *start.parents):
+        if (directory / "uv.lock").exists():
+            return directory
+        if (directory / ".git").exists():
+            break  # reached the repo root; do not search outside the checkout
+    return start
+
+
+def _uv_audit_available() -> bool:
+    """Return True when ``uv audit`` can run for this project (uv installed and a lockfile present).
+
+    pip-audit is the fallback auditor: when uv audit is available it runs instead
+    (see ``test_uv_security_audit.py``), so these tests skip to avoid auditing twice.
+    """
+    project_root = _find_workspace_root(Path(__file__).resolve().parent)
+    return shutil.which("uv") is not None and (project_root / "uv.lock").exists()
+
 
 # Map of CVE id -> reason for ignoring. Revisit periodically; remove entries
 # once an upstream fix is released or the risk assessment changes.
@@ -84,8 +115,11 @@ def test_pip_audit_no_vulnerabilities():
     To run this test specifically:
         pytest tests/test_pypi_security_audit.py -v
     """
-    # Get the project root directory
-    project_root = Path(__file__).parent.parent.parent
+    if _uv_audit_available():
+        pytest.skip("uv audit is available; using it instead of pip-audit")
+
+    # Audit the uv workspace root (the shared environment for all members).
+    project_root = _find_workspace_root(Path(__file__).resolve().parent)
 
     # Run pip-audit with JSON output for easier parsing
     try:
@@ -145,6 +179,9 @@ def test_pip_audit_runs_successfully():
 
     This is a smoke test to ensure pip-audit is properly installed and functional.
     """
+    if _uv_audit_available():
+        pytest.skip("uv audit is available; using it instead of pip-audit")
+
     try:
         result = subprocess.run(  # NOQA: S603
             [sys.executable, "-m", "pip_audit", "--version"],
