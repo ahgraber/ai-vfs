@@ -1,9 +1,6 @@
-# Execution — Delta Spec
+# Execution — Spec
 
-> Change: `phase3-execution`
-> Date: 2026-06-09
-
-## ADDED Requirements
+## Requirements
 
 ### Requirement: ExecutionProtocol
 
@@ -49,7 +46,7 @@ flagged on the result object.
 
 ### Requirement: FsOperationsFactory
 
-The system SHALL provide an `FsOperations` dataclass whose fields are async callables corresponding to the ten shell wrappers (`cd`, `pwd`, `cat`, `head`, `tail`, `ls`, `grep`, `find`, `glob`, `write`, `edit`) plus internal fields (`read`, `stat`, `delete`) for use within the execution layer.
+The system SHALL provide an `FsOperations` dataclass whose fields are async callables corresponding to the eleven shell wrappers (`cd`, `pwd`, `cat`, `head`, `tail`, `ls`, `grep`, `find`, `glob`, `write`, `edit`) plus internal fields (`read`, `stat`, `delete`) for use within the execution layer.
 The system SHALL provide a `fs_operations_for(session, resource_limits, anchor_map)` factory that constructs all wrappers bound to the session, wires the shared `OperationCounter`, and returns an `FsOperations` instance.
 All shell wrappers except `pwd` and `cd` SHALL resolve relative paths through `session.cwd` before invoking the underlying VFS operation.
 
@@ -80,18 +77,21 @@ The counter SHALL be scoped to a single `FsOperations` instance; separate calls 
 
 The `FsOperations` shell wrappers SHALL implement the following dispatch:
 
-- `grep(pattern, path, recursive=True)` → `session.search(query=pattern, scope=resolved_path, search_type=SearchType.REGEX, find_predicates=...)`, returning structured match dicts; re-raises `ReadBudgetExceededError`, `ReindexRequiredError`, and `IndexUnavailableError` unchanged.
+- `grep(pattern, path, recursive=True)` → `session.search(query=pattern, scope=resolved_path, search_type=SearchType.REGEX)`, returning structured match dicts; re-raises `ReadBudgetExceededError`, `ReindexRequiredError`, and `IndexUnavailableError` unchanged.
+  When `recursive=False`, results are post-filtered to depth-1 files only (files whose path has no additional `/` segment after the resolved scope); the underlying `session.search` always scans recursively.
 - `find(path, **predicates)` → `session.search(scope=path, search_type=FIND, find_predicates=FindPredicates(**predicates))`.
 - `glob(pattern)` → `session.search` with `search_type=GLOB`.
 - `cat(path)` → `session.read(path)` decoded as strict UTF-8; undecodable content yields a structured error and no anchors.
   Content split on `\n` only (`\r` kept in line content); trailing-newline presence preserved.
-  `anchor_map.allocate` on all lines; returns content with inline anchor tokens.
-  Raises a structured error (not host OOM) if content exceeds `resource_limits.max_read_bytes`.
+  `anchor_map.allocate` on all lines; returns content with a separate `anchors` dict mapping `line_index → anchor_token` (not inline tokens in the line text).
+  A path beginning with `//` is accepted as a canonical absolute path by the POSIX path resolver and is permission-checked like any other absolute path.
+  Raises a structured error (not host OOM) if content exceeds `resource_limits.max_read_bytes`; the size check is performed via `stat` before the blob is fetched when `max_read_bytes` is set.
 - `head(path, n)` / `tail(path, n)` → same UTF-8 decode and line model as `cat`; line slicing applied before anchor allocation; `anchor_map.allocate` on the sliced lines only.
-- `ls(path)` → `session.list(path)` mapped to a list of dicts with fields `name`, `path`, `is_dir` (synthesized for implicit directory prefixes in non-recursive listings), `version_number`, and `updated_at`.
+  For `tail`, anchor `line_index` values are file-absolute (offset from the start of the full file, not the slice).
+- `ls(path)` → `session.list(path)` mapped to a list of dicts with fields `name`, `path`, `is_dir` (synthesized for implicit directory prefixes via an internal recursive scan), `version_number`, and `updated_at`.
   `size` is included only when `ls(path, long=True)` is called, which performs a batched `VersionMeta` lookup (`size` lives on `VersionMeta`, not `FileMeta`).
   Result count is capped by `resource_limits.max_result_items` with a truncation flag when exceeded.
-- `write(path, data)` → `session.write(path, data)` followed by `anchor_map.invalidate(path)` on success.
+- `write(path, data)` → `session.write(path, data)` followed by `anchor_map.invalidate(path)` on success; returns `{"version_number": int, "size": int}` (a plain marshalable dict, not the raw `VersionMeta` model).
 - `edit(path, start_anchor, end_anchor, replacement, expected_version=None)` → anchor validation then `session.write`; see `AnchoredEditing` requirement.
 
 #### Scenario: GrepDispatchesToSearch
@@ -173,9 +173,9 @@ Line model: content is split on `\n` only; `\r` is kept as part of line content;
    If the caller supplies `expected_version` and it differs from the anchor's recorded `version_number`, raise `AnchorConflictError` immediately, before any write.
 2. **Write:** Construct replacement content; `edit()` SHALL always pass the anchor-validated `version_number` as `expected_version` to `session.write`.
    If `session.write` raises `ConflictError` or `VersionCollisionError`, surface it as `AnchorConflictError` — never retried.
-   On success, the path's anchor state is atomically REPLACED with the Myers-diff reconciliation result (no prior `invalidate` call).
+   On success, the path's anchor state is atomically REPLACED with the longest-common-block (`difflib.SequenceMatcher`) reconciliation result (no prior `invalidate` call).
 
-`reconcile` SHALL run a Myers diff; unchanged lines SHALL keep their existing anchor tokens with updated `line_index` and the new `version_number`; changed or inserted lines SHALL receive new tokens from the pool; dropped lines SHALL be removed from the map.
+`reconcile` SHALL run a longest-common-block diff (via `difflib.SequenceMatcher`); unchanged lines SHALL keep their existing anchor tokens with updated `line_index` and the new `version_number`; changed or inserted lines SHALL receive new tokens from the pool; dropped lines SHALL be removed from the map.
 A raw `write()` or `delete()` through `FsOperations` SHALL call `anchor_map.invalidate(path)`; a successful `edit()` SHALL call `anchor_map.reconcile(...)` without a prior invalidation.
 
 #### Scenario: SingleTokenPoolFirst
@@ -234,7 +234,7 @@ A raw `write()` or `delete()` through `FsOperations` SHALL call `anchor_map.inva
 - **THEN** the path's anchor state is replaced atomically (reconcile, no prior invalidate);
   unchanged-line anchors remain valid with updated `line_index` and the new `version_number`
 
-#### Scenario: MyersDiffPreservesUnchangedAnchors
+#### Scenario: DifflibReconcilePreservesUnchangedAnchors
 
 - **GIVEN** a 10-line file with anchors allocated for all lines
 - **WHEN** `reconcile` is called with lines 4–6 replaced by 2 new lines
