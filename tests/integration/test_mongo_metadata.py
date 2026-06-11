@@ -23,7 +23,7 @@ import pytest
 import pytest_asyncio
 from ulid import ULID
 
-from vfs.errors import ConflictError
+from vfs.errors import ConflictError, VersionCollisionError
 from vfs.models import AuditEvent, FileMeta, Permission, RetentionPolicy, VersionMeta
 
 _URI = os.environ.get("AIVFS_TEST_MONGO_URI")
@@ -203,10 +203,12 @@ async def test_cas_conflict_at_write_site(mongo_store):
 async def test_put_version_insert_failure_leaves_pointer_unadvanced(mongo_store):
     """A version-insert failure on the CAS branch must NOT advance the pointer (insert-first
     ordering). Pre-insert a version doc colliding on the unique
-    (namespace_id, file_path, version_number) index so the next real insert raises
-    DuplicateKeyError before any pointer move; the file must remain at version 1."""
-    import pymongo.errors
+    (namespace_id, file_path, version_number) index so the next real insert raises before
+    any pointer move; the file must remain at version 1.
 
+    # boundary-hardening (archived change): DuplicateKeyError is now translated to
+    # VersionCollisionError at the store boundary; callers must not catch the raw driver error.
+    """
     # Establish version 1.
     await mongo_store.put_version(_version("ns1", "/a.py", 1, content_hash="h1"), expected_version=None)
 
@@ -216,7 +218,8 @@ async def test_put_version_insert_failure_leaves_pointer_unadvanced(mongo_store)
     await mongo_store._db.versions.insert_one(mongo_store._version_to_doc(decoy))
 
     conflicting = _version("ns1", "/a.py", 2, content_hash="h2")
-    with pytest.raises(pymongo.errors.DuplicateKeyError):
+    # boundary-hardening translates DuplicateKeyError → VersionCollisionError
+    with pytest.raises(VersionCollisionError):
         await mongo_store.put_version(conflicting, expected_version=1)
 
     # The pointer never advanced: insert-first means the failed insert ran before the CAS.

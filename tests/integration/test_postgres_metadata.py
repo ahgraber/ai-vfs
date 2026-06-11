@@ -75,7 +75,9 @@ async def worker_dsn():
         await maint_engine.dispose()
         pytest.skip(f"PostgreSQL maintenance connection failed at AIVFS_TEST_POSTGRES_DSN: {exc}")
 
-    yield str(base_url.set(database=test_db))
+    # str(URL) masks the password as "***"; render_as_string(hide_password=False) exposes it
+    # for the adapter so asyncpg does not receive a literal three-asterisk password string.
+    yield base_url.set(database=test_db).render_as_string(hide_password=False)
 
     try:
         async with maint_engine.connect() as conn:
@@ -377,11 +379,13 @@ class TestPostgresNativeTextSearch:
         nts = pg_store.native_text_search()
         ch_high = _ch("python python python python high frequency")
         ch_low = _ch("python appears once only here low")
-        ch_none = _ch("java scala kotlin no python")
+        # Must not contain the query token at all — an earlier draft said
+        # "no python", which of course *contains* "python" and matched.
+        ch_none = _ch("java scala kotlin rust go")
 
         await nts.index_text(str(ULID()), ch_high, nts.params_hash, "python python python python high frequency")
         await nts.index_text(str(ULID()), ch_low, nts.params_hash, "python appears once only here low")
-        await nts.index_text(str(ULID()), ch_none, nts.params_hash, "java scala kotlin no python")
+        await nts.index_text(str(ULID()), ch_none, nts.params_hash, "java scala kotlin rust go")
 
         entries = [
             _search_meta_entry("/high.txt", ch_high),
