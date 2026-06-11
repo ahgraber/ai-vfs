@@ -223,7 +223,12 @@ class _SQLiteNativeTextSearch:
             return await self._regex_search(request.query, ch_to_entries)
 
     async def _regex_search(self, pattern: str, ch_to_entries: dict[str, list[Any]]) -> SearchResponse:
-        """In-process regex verification against DB-resident text (zero blob reads)."""
+        """In-process regex verification against DB-resident text (zero blob reads).
+
+        For each matched document, per-occurrence SearchResults are emitted — one per
+        matching line — with line_number and match_context populated.  Semantics mirror
+        DefaultSearchProvider._regex_search exactly (GrepMatchesContent spec contract).
+        """
         try:
             compiled = re.compile(pattern)
         except re.error:
@@ -241,14 +246,18 @@ class _SQLiteNativeTextSearch:
                     "WHERE raw_text MATCH ? AND provider_key=? AND params_hash=?",
                     (fts_query, self.provider_key, self.params_hash),
                 )
-                # Filter to visible hashes and re-verify (FTS5 prune may over-select).
+                # Filter to visible hashes, re-verify (FTS5 prune may over-select),
+                # then emit one result per matching line with line_number + match_context.
                 for row in rows:
                     ch, raw_text = row[0], row[1]
                     if ch not in ch_to_entries:
                         continue
-                    if compiled.search(raw_text):
-                        for entry in ch_to_entries[ch]:
-                            results.append(SearchResult(path=entry.path))
+                    for line_num, line in enumerate(raw_text.splitlines(), start=1):
+                        if compiled.search(line):
+                            for entry in ch_to_entries[ch]:
+                                results.append(
+                                    SearchResult(path=entry.path, line_number=line_num, match_context=line.strip())
+                                )
             else:
                 # No extractable literal (or literal contains '"') — scan the main table.
                 visible_hashes = list(ch_to_entries.keys())
@@ -260,9 +269,12 @@ class _SQLiteNativeTextSearch:
                 )
                 for row in rows:
                     ch, raw_text = row[0], row[1]
-                    if compiled.search(raw_text):
-                        for entry in ch_to_entries[ch]:
-                            results.append(SearchResult(path=entry.path))
+                    for line_num, line in enumerate(raw_text.splitlines(), start=1):
+                        if compiled.search(line):
+                            for entry in ch_to_entries[ch]:
+                                results.append(
+                                    SearchResult(path=entry.path, line_number=line_num, match_context=line.strip())
+                                )
 
         return SearchResponse(results=results)
 

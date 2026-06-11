@@ -403,6 +403,47 @@ class TestNativeTextSearchCapability:
             assert nts_paths == brute_paths, f"pattern {pattern!r}: NTS={nts_paths} != brute-force={brute_paths}"
 
     @pytest.mark.asyncio
+    async def test_regex_line_number_and_match_context(self, vfs_nts):
+        """GrepMatchesContent: regex results must carry line_number and match_context.
+
+        Each SearchResult from a REGEX search must have line_number (1-based) and
+        match_context (stripped matching line text) populated — fields verified against
+        the DefaultSearchProvider brute-force baseline.  This is the assertion gap that
+        previously let the missing-fields bug through unit testing.
+        """
+        ns, agent = await _setup_vfs(vfs_nts)
+        content = b"line one\n# TODO: something important\nline three\n"
+        await vfs_nts.write(ns.id, "/multi.txt", content, principal_id=agent.id)
+
+        results = await vfs_nts.search(ns.id, "TODO", "/", SearchType.REGEX, principal_id=agent.id)
+
+        assert len(results) == 1
+        r = results[0]
+        assert r.path == "/multi.txt"
+        assert r.line_number == 2, f"expected line 2, got {r.line_number}"
+        assert r.match_context == "# TODO: something important", f"unexpected match_context: {r.match_context!r}"
+
+    @pytest.mark.asyncio
+    async def test_regex_multiple_matching_lines(self, vfs_nts):
+        """GrepMatchesContent multi-line: each matching line produces one SearchResult.
+
+        Verified against the DefaultSearchProvider brute-force baseline: one result per
+        matching line, in document order.
+        """
+        ns, agent = await _setup_vfs(vfs_nts)
+        content = b"alpha TODO first\nbeta nothing\ngamma TODO second\n"
+        await vfs_nts.write(ns.id, "/two.txt", content, principal_id=agent.id)
+
+        results = await vfs_nts.search(ns.id, "TODO", "/", SearchType.REGEX, principal_id=agent.id)
+
+        assert len(results) == 2
+        by_line = sorted(results, key=lambda r: r.line_number or 0)
+        assert by_line[0].line_number == 1
+        assert by_line[0].match_context == "alpha TODO first"
+        assert by_line[1].line_number == 3
+        assert by_line[1].match_context == "gamma TODO second"
+
+    @pytest.mark.asyncio
     async def test_alternation_no_false_negatives(self, vfs_nts):
         """Regression: alternation in pattern must not cause false negatives.
 
