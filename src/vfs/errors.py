@@ -46,3 +46,29 @@ class ReindexRequiredError(VFSError):
     would require unbounded blob reads, which is never performed silently.
     Run ``vfs.reindex(namespace_id)`` to rebuild the index.
     """
+
+
+class OperationBudgetExceededError(VFSError):
+    """The shell-operations budget for a single execution was exhausted.
+
+    Raised by the ``OperationCounter`` wrapper inside ``fs_operations_for`` when
+    the number of VFS callback invocations reaches ``ResourceLimits.max_operations``.
+    The underlying VFS operation is NOT invoked when this error is raised.
+    """
+
+
+class AnchorConflictError(VFSError):
+    """An anchor token is stale or belongs to a different path.
+
+    Raised when:
+    - The file's current version number differs from the anchor's recorded version.
+    - The line content at the stored ``line_index`` no longer matches.
+    - The anchor token is unknown (was never allocated, or was invalidated by a
+      raw ``write``/``delete``).
+    - The anchor belongs to a different path than the one supplied.
+    - ``session.write`` raises ``ConflictError`` or ``VersionCollisionError`` during
+      an ``edit()`` call (always surfaced as ``AnchorConflictError`` — never retried).
+
+    The agent should re-read the file (``cat``/``head``/``tail``) to obtain fresh
+    anchors before retrying the edit.
+    """

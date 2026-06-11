@@ -6,7 +6,9 @@ import posixpath
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from vfs.models import FileMeta, SearchResult, SearchType, VersionMeta
+    from vfs.models import ExecutionResult, FileMeta, SearchResult, SearchType, VersionMeta
+    from vfs.protocols.execution import ResourceLimits
+    from vfs.protocols.search import FindPredicates
     from vfs.vfs import VFS
 
 
@@ -156,12 +158,47 @@ class Session:
             principal_id=self._principal_id,
         )
 
-    async def search(self, query: str, scope: str, search_type: SearchType) -> list[SearchResult]:
-        """Search ``scope`` (resolved through ``cwd``) for ``query``."""
+    async def search(
+        self,
+        query: str,
+        scope: str,
+        search_type: SearchType,
+        *,
+        find_predicates: FindPredicates | None = None,
+    ) -> list[SearchResult]:
+        """Search ``scope`` (resolved through ``cwd``) for ``query``.
+
+        ``find_predicates`` is forwarded to the underlying ``vfs.search`` call unchanged.
+        """
         return await self._vfs.search(
             self._namespace_id,
             query,
             resolve_path(self._cwd, scope),
             search_type,
             principal_id=self._principal_id,
+            find_predicates=find_predicates,
+        )
+
+    async def execute(
+        self,
+        code: str,
+        provider_name: str,
+        *,
+        timeout: float | None = None,
+        resource_limits: ResourceLimits | None = None,
+    ) -> ExecutionResult:
+        """Execute ``code`` in the sandbox bound to this session's namespace, principal, and cwd.
+
+        Delegates to :meth:`~vfs.vfs.VFS.execute` with the session's ``namespace_id``,
+        ``principal_id``, and current ``cwd``.  The ``execute`` permission check is
+        performed inside ``vfs.execute``, not here.
+        """
+        return await self._vfs.execute(
+            code,
+            self._namespace_id,
+            self._principal_id,
+            provider_name,
+            timeout=timeout,
+            resource_limits=resource_limits,
+            cwd=self._cwd,
         )
