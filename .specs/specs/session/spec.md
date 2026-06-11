@@ -103,9 +103,9 @@ The Session SHALL provide a `pwd()` operation that returns the current `cwd` str
 
 ### Requirement: SessionProxiesVFS
 
-The Session SHALL expose the same file operations as VFS (`read`, `write`, `delete`, `stat`,
-`list`, `search`, `versions`, `rollback`, `copy`, `move`), each resolving path arguments
-through `cwd` before delegating to the underlying VFS instance.
+The Session SHALL expose the same file operations as VFS (`read`, `write`, `delete`, `stat`, `list`, `search`, `versions`, `rollback`, `copy`, `move`, `execute`), each resolving path arguments through `cwd` before delegating to the underlying VFS instance.
+`session.execute(code, ...)` SHALL resolve the caller's namespace and principal from the session context and delegate to `vfs.execute` with the session's current `cwd` as the `cwd` argument.
+The `execute` permission check is performed inside `vfs.execute`, not on the `Session`; the `AnchorMap` and `FsOperations` instances are constructed inside `vfs.execute`, not on the `Session`.
 
 #### Scenario: AllPathArgsResolved
 
@@ -118,6 +118,23 @@ through `cwd` before delegating to the underlying VFS instance.
 - **GIVEN** `cwd` is `"/workspace/"`
 - **WHEN** a principal calls `session.copy("a.py", "../archive/a.py")`
 - **THEN** the VFS receives `copy("/workspace/a.py", "/archive/a.py")`
+
+#### Scenario: SessionExecuteProxiesToVfs
+
+- **GIVEN** a `Session` constructed with `namespace_id` and `principal_id`
+- **WHEN** `session.execute(code, provider_name="monty", ...)` is called
+- **THEN** `vfs.execute(code, namespace_id=session.namespace_id, principal_id=session.principal_id, cwd=session.cwd, ...)` is invoked
+
+### Requirement: SessionSearch
+
+The `Session.search` method SHALL accept a `find_predicates` passthrough parameter: `session.search(query, scope, search_type, find_predicates=None)`.
+The `find_predicates` value SHALL be forwarded to the underlying `vfs.search` call unchanged; all other parameters and behavior are unchanged.
+
+#### Scenario: FindPredicatesPassthrough
+
+- **GIVEN** a `Session` and a `FindPredicates` value
+- **WHEN** `session.search(query, scope, search_type, find_predicates=pred)` is called
+- **THEN** `vfs.search` is invoked with the same `find_predicates` value forwarded unchanged
 
 ### Requirement: PublicApiSurface
 

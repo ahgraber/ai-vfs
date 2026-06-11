@@ -92,13 +92,22 @@ Cross-namespace access requires an explicit permission entry for the foreign nam
 
 The system SHALL support the following operation types: read, write, delete, execute, and admin.
 The admin operation SHALL grant permission management on the associated subtree.
-The execute operation is defined in the permission model but is not enforced by any Phase 1 VFS method; it is reserved for Phase 3 execution providers.
+The system SHALL enforce the `execute` permission at the `vfs.execute` entry point.
+A principal that does not have `execute` permission on the provided `cwd` SHALL cause `vfs.execute` to raise `PermissionDeniedError` before any session, `FsOperations`, or provider is constructed — consistent with every other VFS operation.
+All other operation types (`read`, `write`, `delete`, `admin`) are unchanged.
 
 #### Scenario: ReadOnlyPrincipal
 
 - **GIVEN** a principal with only {read} operations
 - **WHEN** the principal attempts a write
 - **THEN** a PermissionDeniedError is raised
+
+#### Scenario: ExecutePermissionEnforced
+
+- **GIVEN** a principal with `{read, write}` but not `{execute}` on `/workspace/`
+- **WHEN** `vfs.execute(code, namespace_id, principal_id, ..., cwd="/workspace/")` is called
+- **THEN** `PermissionDeniedError` is raised immediately — no session is created, no FsOperations
+  is constructed, and no provider dispatch occurs
 
 #### Scenario: ExecutePermissionStorable
 

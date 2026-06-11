@@ -29,7 +29,7 @@ Each anchor entry binds `(path, version_number, line_index, line_content)`.
 Validation: resolve the anchor, check that the file's current version number equals the recorded `version_number`, then check that the line at `line_index` in the current content equals `line_content`.
 
 A raw `write()` or `delete()` through `FsOperations` invalidates all anchors for that path — after which existing anchor tokens raise `AnchorConflictError`.
-A successful `edit()` does NOT invalidate-then-reconcile; it atomically REPLACES the path's anchor state with the Myers-diff reconciliation result: unchanged lines keep their tokens with updated `line_index` and the new `version_number`; changed/inserted lines get new tokens; deleted lines are removed.
+A successful `edit()` does NOT invalidate-then-reconcile; it atomically REPLACES the path's anchor state with the longest-common-block (difflib) reconciliation result: unchanged lines keep their tokens with updated `line_index` and the new `version_number`; changed/inserted lines get new tokens; deleted lines are removed.
 The agent must re-read after a raw `write()` on a path; after `edit()`, the returned anchor set is already reconciled and valid.
 
 **Rationale:** Version metadata is VFS-owned and immutable; anchor tokens are a model-interface convenience with no value outside a single execution turn.
@@ -61,7 +61,7 @@ If `session.write` raises `ConflictError` (CAS mismatch) or `VersionCollisionErr
 write collision), surface it as `AnchorConflictError` — never retried, because a conflict means
 the current anchors are stale and the agent must re-read.
 
-After a successful write, the path's anchor state is atomically REPLACED with the Myers-diff reconciliation result: unchanged lines keep their tokens with updated `line_index` and the new `version_number`; changed/inserted lines get new tokens; deleted lines are removed.
+After a successful write, the path's anchor state is atomically REPLACED with the longest-common-block (difflib) reconciliation result: unchanged lines keep their tokens with updated `line_index` and the new `version_number`; changed/inserted lines get new tokens; deleted lines are removed.
 There is no separate `invalidate` call before `reconcile` — the replacement is atomic.
 
 **Rationale:** Separating validation from write keeps the conflict surface narrow.
@@ -234,7 +234,7 @@ FsOperations (shell wrappers, Session-bound):
     glob(pattern)    → session.search(path, pattern, GLOB)
     write(path, data)→ session.write(path, data)  + AnchorMap.invalidate(path)
     edit(...)        → anchor validation → session.write(expected_version=anchor_version)
-                       → AnchorMap atomic replace (Myers-diff reconciliation)
+                       → AnchorMap atomic replace (difflib reconciliation)
 
     All wrapped in OperationCounter (shared, increments on every call)
     max_read_bytes: cat/head/tail raise structured error for oversized content (no host OOM)
@@ -246,7 +246,7 @@ AnchorMap:
     validate(anchor, path)                 → (version_number, line_content) | AnchorConflictError
     invalidate(path)                       → drops all entries for path (raw write/delete path)
     reconcile(path, old_lines, new_lines, version_number)
-                                           → Myers diff → atomically replaces anchor state for path
+                                           → difflib longest-common-block → atomically replaces anchor state for path
                                              (edit() path — no prior invalidate call)
 
 MontyExecutionProvider (optional `monty` extra):
