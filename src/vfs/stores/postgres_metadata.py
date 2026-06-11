@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Callable
 
 import sqlalchemy as sa
@@ -130,7 +131,19 @@ class _PostgresNativeTextSearch:
             return await self._regex_search(request.query, ch_to_entries)
 
     async def _regex_search(self, pattern: str, ch_to_entries: dict[str, list[Any]]) -> SearchResponse:
-        """In-engine regex via ``text ~ :pattern``; GIN index prunes trigram candidates."""
+        """In-engine regex via ``text ~ :pattern``; GIN index prunes trigram candidates.
+
+        raw_text is fetched for matched rows so per-occurrence SearchResults can be emitted
+        — one per matching line — with line_number and match_context populated.  The in-engine
+        ``~`` operator still prunes/filters; line extraction is done in-process from the stored
+        text (preserves the zero-blob-read invariant).  Semantics mirror
+        DefaultSearchProvider._regex_search exactly (GrepMatchesContent spec contract).
+        """
+        try:
+            compiled = re.compile(pattern)
+        except re.error:
+            return SearchResponse()
+
         visible_hashes = list(ch_to_entries.keys())
         results: list[SearchResult] = []
 
@@ -139,7 +152,7 @@ class _PostgresNativeTextSearch:
                 await self._store._db.execute(
                     sa.text(
                         """
-                        SELECT content_hash
+                        SELECT content_hash, raw_text
                         FROM search_text_artifacts
                         WHERE provider_key = :pk
                           AND params_hash  = :ph
@@ -156,10 +169,14 @@ class _PostgresNativeTextSearch:
             ).fetchall()
 
         for row in rows:
-            ch = row[0]
+            ch, raw_text = row[0], row[1]
             if ch in ch_to_entries:
-                for entry in ch_to_entries[ch]:
-                    results.append(SearchResult(path=entry.path))
+                for line_num, line in enumerate(raw_text.splitlines(), start=1):
+                    if compiled.search(line):
+                        for entry in ch_to_entries[ch]:
+                            results.append(
+                                SearchResult(path=entry.path, line_number=line_num, match_context=line.strip())
+                            )
 
         return SearchResponse(results=results)
 
