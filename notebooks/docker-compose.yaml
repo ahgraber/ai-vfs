@@ -1,0 +1,87 @@
+# Demo stack for ai-vfs notebooks.
+#
+# Host ports are intentionally non-conflicting with tests/integration/docker-compose.yaml
+# (which uses 5432/27017/9000) so demo and test stacks can run side-by-side:
+#
+#   Service   Demo port   Test port
+#   --------  ----------  ---------
+#   postgres  55432       5432
+#   mongo     57017       27017
+#   minio     59000       9000
+#   minio UI  59001       9001
+#
+# Start the demo stack (podman-first devshell; `docker compose` also works once
+# DOCKER_HOST points at the podman/colima socket):
+#
+#   podman compose -f notebooks/docker-compose.yaml up -d postgres minio
+#
+# Bootstrap the MinIO bucket (run once after first `up`). The `mc` commands run
+# inside the container, where MinIO listens on 9000 — not the 59000 host port:
+#
+#   podman compose -f notebooks/docker-compose.yaml exec minio \
+#       mc alias set demo http://localhost:9000 minioadmin minioadmin
+#   podman compose -f notebooks/docker-compose.yaml exec minio \
+#       mc mb -p demo/aivfs-demo
+#
+# Enable the Postgres FTS extension (run once, requires superuser):
+#
+#   podman compose -f notebooks/docker-compose.yaml exec postgres \
+#       psql -U aivfs -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+#
+# Environment variables consumed by notebook 02:
+#
+#   AIFS_METADATA_STORE_URI=postgresql://aivfs:aivfs@localhost:55432/aivfs
+#   AIFS_BLOB_STORE_URI=s3://aivfs-demo
+#   AWS_ACCESS_KEY_ID=minioadmin
+#   AWS_SECRET_ACCESS_KEY=minioadmin
+#   AWS_ENDPOINT_URL_S3=http://localhost:59000
+#   AWS_REGION=us-east-1
+#
+# Tear down:
+#
+#   podman compose -f notebooks/docker-compose.yaml down -v
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: aivfs
+      POSTGRES_PASSWORD: aivfs
+      POSTGRES_DB: aivfs
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aivfs -d aivfs"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "59000:9000"
+      - "59001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # MongoDB is optional; demonstrates the MongoDB metadata adapter.
+  # Start with: podman compose -f notebooks/docker-compose.yaml up -d mongo
+  # Then set: AIFS_METADATA_STORE_URI=mongodb://localhost:57017/aivfs-demo
+  mongo:
+    image: mongo:7
+    ports:
+      - "57017:27017"
+    profiles:
+      - mongo
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5

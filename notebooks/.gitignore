@@ -1,0 +1,11 @@
+# Demo artifacts created by notebooks/01_vfs_tour.py
+vfs-demo-*/
+*.db
+blobs/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
