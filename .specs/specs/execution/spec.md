@@ -94,6 +94,10 @@ The `FsOperations` shell wrappers SHALL implement the following dispatch:
 - `write(path, data)` → `session.write(path, data)` followed by `anchor_map.invalidate(path)` on success; returns `{"version_number": int, "size": int}` (a plain marshalable dict, not the raw `VersionMeta` model).
 - `edit(path, start_anchor, end_anchor, replacement, expected_version=None)` → anchor validation then `session.write`; see `AnchoredEditing` requirement.
 
+**Budget independence:** `grep` and `find` each count as ONE operation against `ResourceLimits.max_operations`.
+Their internal blob I/O is governed exclusively by the search layer's own `SearchLimits` budget (per the design's budget-independence decision); it does not draw from `max_read_bytes`.
+`max_read_bytes` governs only direct content reads (`cat`/`head`/`tail`), not search-internal reads.
+
 #### Scenario: GrepDispatchesToSearch
 
 - **GIVEN** a session-backed `FsOperations` with `NativeTextSearch` active

@@ -589,3 +589,102 @@ class TestTailAnchorAbsoluteIndex:
         assert "REPLACED_ZETA" in new_text
         assert "alpha" in new_text  # untouched
         assert "zeta" not in new_text  # replaced
+
+
+# ---------------------------------------------------------------------------
+# Fix 5 regression: reconcile must fully replace path's anchor state
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileDropsOrphanTokens:
+    """Regression: reconcile must remove ALL tokens for a path, including duplicates.
+
+    When allocate() is called multiple times for the same path (e.g. tail then cat),
+    both token sets live in _entries simultaneously.  Before the fix, the atomic
+    removal step only removed tokens reachable via the line_index→token reverse dict,
+    leaving the earlier (duplicate-index) tokens as orphans.  After a reconcile, all
+    such tokens should be gone — validate on any of them should raise AnchorConflictError.
+    """
+
+    def test_reconcile_drops_duplicate_allocation_orphans(self):
+        """tail then cat: reconcile must remove all tokens for the path, not just one-per-index."""
+        amap = AnchorMap()
+        lines = ["line0", "line1", "line2"]
+
+        # First allocation (simulates tail): allocates tokens for lines 1–2 (absolute indices 1, 2)
+        tail_anchors = amap.allocate("/f.txt", 1, ["line1", "line2"], start_index=1)
+        tail_tok_1 = tail_anchors[1]  # token for line index 1 from tail
+        tail_tok_2 = tail_anchors[2]  # token for line index 2 from tail
+
+        # Second allocation (simulates cat): allocates new tokens for ALL lines (indices 0, 1, 2).
+        # The return value is intentionally discarded; we only need the side effect on _entries.
+        amap.allocate("/f.txt", 1, lines, start_index=0)
+        # Both tail tokens and cat tokens coexist in _entries before reconcile
+        assert tail_tok_1 in amap._entries
+        assert tail_tok_2 in amap._entries
+
+        # Reconcile with a simple replacement (line 2 → "new_line")
+        new_lines = ["line0", "line1", "new_line"]
+        amap.reconcile("/f.txt", lines, new_lines, version_number=2)
+
+        # After reconcile, ALL prior tokens for the path must be gone
+        assert tail_tok_1 not in amap._entries, "orphan tail token at index 1 must be removed by reconcile"
+        assert tail_tok_2 not in amap._entries, "orphan tail token at index 2 must be removed by reconcile"
+
+        # Validate on the orphan tokens must raise AnchorConflictError
+        with pytest.raises(AnchorConflictError):
+            amap.validate(tail_tok_1, "/f.txt")
+        with pytest.raises(AnchorConflictError):
+            amap.validate(tail_tok_2, "/f.txt")
+
+    def test_reconcile_entry_count_equals_new_line_count(self):
+        """After reconcile, the number of entries for the path equals len(new_lines)."""
+        amap = AnchorMap()
+        lines = ["a", "b", "c", "d"]
+
+        # Allocate twice (simulates tail then cat overlap)
+        amap.allocate("/g.txt", 1, ["c", "d"], start_index=2)  # tail: 2 tokens
+        amap.allocate("/g.txt", 1, lines, start_index=0)  # cat: 4 tokens (re-covers c, d)
+        # 6 tokens in _entries for /g.txt before reconcile
+
+        # Reconcile replaces all 4 lines with 3
+        new_lines = ["a", "b", "X"]
+        amap.reconcile("/g.txt", lines, new_lines, version_number=2)
+
+        # Count entries remaining for /g.txt — must equal len(new_lines) = 3
+        remaining = [tok for tok, entry in amap._entries.items() if entry.path == "/g.txt"]
+        assert len(remaining) == 3, f"expected 3 entries for /g.txt after reconcile, got {len(remaining)}: {remaining}"
+
+    @pytest.mark.asyncio
+    async def test_tail_then_cat_then_edit_no_stale_tokens(self, env):
+        """Integration: tail then cat then edit leaves no stale (orphan) tokens in the map."""
+        vfs_obj, session, ns, agent, amap, fs_ops = env
+
+        lines = ["line0", "line1", "line2", "line3", "line4"]
+        content = "\n".join(lines)
+        await vfs_obj.write(ns.id, "/overlap.txt", content.encode(), principal_id=agent.id)
+
+        # Step 1: tail (allocates tokens for lines 3, 4)
+        tail_result = await fs_ops.tail("/overlap.txt", 2)
+        assert tail_result["error"] is None
+        tail_toks = list(tail_result["anchors"].values())
+
+        # Step 2: cat (allocates new tokens for all 5 lines; tail tokens are orphan duplicates)
+        cat_result = await fs_ops.cat("/overlap.txt")
+        assert cat_result["error"] is None
+        cat_anchors = cat_result["anchors"]  # {line_index: token}
+
+        # Step 3: edit line 0 via a cat anchor
+        start_tok = cat_anchors[0]
+        edit_result = await fs_ops.edit("/overlap.txt", start_tok, start_tok, ["REPLACED"])
+
+        # All tail tokens must now be gone from _entries
+        for tok in tail_toks:
+            assert tok not in amap._entries, (
+                f"Stale tail token {tok!r} still present after reconcile — orphan not removed"
+            )
+
+        # Entry count for the path must equal new_lines count
+        remaining = [tok for tok, entry in amap._entries.items() if entry.path == "/overlap.txt"]
+        expected_count = len(edit_result["lines"])
+        assert len(remaining) == expected_count, f"expected {expected_count} entries for path, got {len(remaining)}"

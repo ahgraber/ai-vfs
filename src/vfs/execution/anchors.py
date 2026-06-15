@@ -239,7 +239,15 @@ class AnchorMap:
 
         Returns the new ``line_index`` → ``token`` mapping for ``path``.
         """
-        # Build reverse index: old_line_index -> token (for this path only)
+        # Collect ALL tokens bound to this path (not just the last-wins per line_index).
+        # When allocate() was called multiple times for the same path (e.g. tail then cat),
+        # duplicate tokens sharing a line_index are present; the reverse-index dict only
+        # keeps one per index, leaving the others as orphans unless we track all tokens here.
+        all_path_tokens: list[str] = [tok for tok, entry in self._entries.items() if entry.path == path]
+
+        # Build reverse index: old_line_index -> token (for this path only).
+        # When two tokens share the same line_index, the last one wins (arbitrary but
+        # deterministic); all tokens are removed in the atomic-replacement step below.
         old_idx_to_token: dict[int, str] = {
             entry.line_index: tok for tok, entry in self._entries.items() if entry.path == path
         }
@@ -280,8 +288,9 @@ class AnchorMap:
                     new_idx_to_token[new_pos] = tok
             # tag == "delete": old lines removed; their tokens are dropped (not added to new_entries).
 
-        # Atomic replacement: remove all old entries for this path, install new ones.
-        for tok in list(old_idx_to_token.values()):
+        # Atomic replacement: remove ALL old entries for this path (including duplicates
+        # from overlapping allocations), then install the reconciled set.
+        for tok in all_path_tokens:
             self._entries.pop(tok, None)
         self._entries.update(new_entries)
 

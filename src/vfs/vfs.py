@@ -108,6 +108,26 @@ _MAX_WRITE_RETRIES: int = 5
 """Maximum number of times VFS write/copy/move retries on a version-number collision."""
 
 
+def _straggler_regex_results(path: str, text: str, query: str) -> list:
+    """Return per-line SearchResult entries for ``text`` matching ``query`` (REGEX).
+
+    Mirrors ``DefaultSearchProvider._regex_search`` semantics: one result per
+    matching line, ``line_number`` 1-based, ``match_context`` is the stripped line.
+    Returns an empty list when ``query`` is not a valid regex.
+    """
+    from vfs.models import SearchResult
+
+    try:
+        compiled = re.compile(query)
+    except re.error:
+        return []
+    results = []
+    for line_num, line in enumerate(text.splitlines(), start=1):
+        if compiled.search(line):
+            results.append(SearchResult(path=path, line_number=line_num, match_context=line.strip()))
+    return results
+
+
 def _require_canonical(path: str) -> None:
     """Reject paths that are not absolute or not in canonical form.
 
@@ -948,11 +968,13 @@ class VFS:
 
         effective_timeout = timeout if timeout is not None else effective_limits.timeout_seconds
 
-        # Resolve provider early (raises ValueError / ImportError — Tier 1).
-        provider = resolve_execution_provider(provider_name, self._config)
-
         # Permission check on cwd (raises PermissionDeniedError — Tier 1).
+        # Must precede provider construction so that no provider is instantiated
+        # when the principal lacks execute permission (per ExecuteRequiresPermission spec).
         await self._check_perm(principal_id, namespace_id, cwd, "execute")
+
+        # Resolve provider after permission check (raises ValueError / ImportError — Tier 1).
+        provider = resolve_execution_provider(provider_name, self._config)
 
         # --- Construct session, anchor map, and FsOperations ---
         session = Session(self, namespace_id, principal_id)
@@ -1171,20 +1193,17 @@ class VFS:
                     _log.debug("Failed to record unsupported artifact for %s: %s", entry.path, exc)
                 continue
 
-            # Apply predicate against decoded text
-            matched = False
+            # Apply predicate against decoded text.
+            # REGEX: per-line results (line_number, match_context) via helper.
+            # FULLTEXT: whole-text predicate; single path-only result (no per-line
+            # context for fulltext stragglers — documented behaviour).
             if search_type == SearchType.REGEX:
-                try:
-                    matched = bool(re.search(query, text))
-                except re.error:
-                    pass
+                response.results.extend(_straggler_regex_results(entry.path, text, query))
             else:  # FULLTEXT: all query tokens must appear in the text (best-effort)
                 tokens = query.lower().split()
                 text_lower = text.lower()
-                matched = bool(tokens) and all(tok in text_lower for tok in tokens)
-
-            if matched:
-                response.results.append(SearchResult(path=entry.path))
+                if bool(tokens) and all(tok in text_lower for tok in tokens):
+                    response.results.append(SearchResult(path=entry.path))
 
             # Lazy backfill: persist the verified text so future searches are fresh.
             # Best-effort — a failure here must not fail the search.

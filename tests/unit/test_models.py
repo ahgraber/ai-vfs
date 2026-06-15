@@ -229,3 +229,39 @@ class TestPrincipal:
             created_at=now,
         )
         assert p.principal_type == "agent"
+
+
+class TestPublicContractSurface:
+    """Fix 4: all names callers must catch/use are importable directly from ``vfs``."""
+
+    def test_error_types_importable_from_vfs(self):
+        import vfs
+
+        names = [
+            "AnchorConflictError",
+            "ConflictError",
+            "IndexUnavailableError",
+            "NotFoundError",
+            "OperationBudgetExceededError",
+            "PermissionDeniedError",
+            "ReadBudgetExceededError",
+            "ReindexRequiredError",
+            "SearchTypeUnsupportedError",
+            "VFSError",
+            "VersionCollisionError",
+        ]
+        for name in names:
+            assert hasattr(vfs, name), f"vfs.{name} is not importable"
+
+    def test_execution_types_importable_from_vfs(self):
+        import vfs
+
+        names = ["AnchorMap", "resolve_execution_provider"]
+        for name in names:
+            assert hasattr(vfs, name), f"vfs.{name} is not importable"
+
+    def test_names_in_all(self):
+        import vfs
+
+        for name in ["AnchorMap", "resolve_execution_provider", "AnchorConflictError", "VersionCollisionError"]:
+            assert name in vfs.__all__, f"{name!r} missing from vfs.__all__"
