@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 from vfs.errors import AnchorConflictError, ConflictError, OperationBudgetExceededError, VersionCollisionError
 from vfs.models import SearchType
 from vfs.protocols.search import FindPredicates
+from vfs.session import resolve_path
 
 if TYPE_CHECKING:
     from vfs.protocols.execution import ResourceLimits
@@ -99,15 +100,6 @@ class FsOperations:
 # ---------------------------------------------------------------------------
 # Module-level helpers (used both directly and by closure wrappers below)
 # ---------------------------------------------------------------------------
-
-
-def _resolve(cwd: str, path: str) -> str:
-    """Resolve ``path`` against ``cwd`` using POSIX semantics."""
-    joined = path if posixpath.isabs(path) else posixpath.join(cwd, path)
-    result = posixpath.normpath(joined)
-    if joined.endswith("/") and result != "/":
-        result += "/"
-    return result
 
 
 def _error_response(code: str, message: str) -> dict:
@@ -255,7 +247,7 @@ async def _op_cat(
     ``_decode_raw`` provides a belt-and-braces post-read size check.
     """
     counter.check_and_increment()
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
     early_error = await _check_size_before_read(session, resource_limits, resolved)
     if early_error is not None:
         return early_error
@@ -281,7 +273,7 @@ async def _op_head(
     Stats before reading when ``max_read_bytes`` is set (same guard as ``cat``).
     """
     counter.check_and_increment()
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
     early_error = await _check_size_before_read(session, resource_limits, resolved)
     if early_error is not None:
         return early_error
@@ -313,7 +305,7 @@ async def _op_tail(
     Stats before reading when ``max_read_bytes`` is set (same guard as ``cat``).
     """
     counter.check_and_increment()
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
     early_error = await _check_size_before_read(session, resource_limits, resolved)
     if early_error is not None:
         return early_error
@@ -370,7 +362,7 @@ async def _op_ls(
     single query.
     """
     counter.check_and_increment()
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
 
     # Recursive listing to discover all descendant paths for directory synthesis.
     all_file_metas = await session.list(resolved, recursive=True)
@@ -426,7 +418,7 @@ async def _op_grep(
     ``IndexUnavailableError`` unchanged; they propagate to the sandbox.
     """
     counter.check_and_increment()
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
     results = await session.search(pattern, resolved, SearchType.REGEX)
     items = [
         {"path": r.path, "line_number": r.line_number, "match_context": r.match_context, "score": r.score}
@@ -454,7 +446,7 @@ async def _op_find(
     ``mtime_before``, ``type``.
     """
     counter.check_and_increment()
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
     find_preds = FindPredicates(**predicates)
     # ``DefaultSearchProvider._find_search`` uses the primary ``query`` as a
     # name-glob filter (Phase 1 behavior).  Use ``find_predicates.name`` as the
@@ -501,7 +493,7 @@ async def _op_write(
     write side-effect has already committed at that point.
     """
     counter.check_and_increment()
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
     version_meta = await session.write(resolved, content)
     if anchor_map is not None:
         anchor_map.invalidate(resolved)
@@ -510,19 +502,19 @@ async def _op_write(
 
 async def _op_read(session: Session, path: str, *, version_number: int | None = None) -> bytes:
     """read: raw byte read; no anchor allocation, no budget counter."""
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
     return await session.read(resolved, version_number=version_number)
 
 
 async def _op_stat(session: Session, path: str) -> Any:
     """stat: return FileMeta for path; no budget counter."""
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
     return await session.stat(resolved)
 
 
 async def _op_delete(session: Session, anchor_map: Any, path: str) -> Any:
     """delete: tombstone path and invalidate anchors; no budget counter (internal)."""
-    resolved = _resolve(session.pwd(), path)
+    resolved = resolve_path(session.pwd(), path)
     result = await session.delete(resolved)
     if anchor_map is not None:
         anchor_map.invalidate(resolved)
@@ -590,7 +582,7 @@ def fs_operations_for(
             raise AnchorConflictError("No anchor map available; cannot perform anchored edit.")
 
         counter.check_and_increment()
-        resolved = _resolve(session.pwd(), path)
+        resolved = resolve_path(session.pwd(), path)
 
         # Stage 1: resolve anchors (raises AnchorConflictError on unknown/wrong-path)
         anchor_version_start, line_content_start = anchor_map.validate(start_anchor, resolved)

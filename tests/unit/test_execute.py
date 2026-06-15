@@ -187,6 +187,42 @@ class TestExecuteRequiresPermission:
         assert provider.execute_calls == []
 
     @pytest.mark.asyncio
+    async def test_provider_not_constructed_on_denied(self, env):
+        """Permission denial must prevent provider construction entirely.
+
+        Uses a factory that records instantiation so we can assert the
+        provider was never constructed (not just never *called*).
+        """
+        vfs, ns, admin, agent = env
+        # agent has read/write/delete but NOT execute on '/'
+
+        construction_calls: list = []
+
+        class RecordingProvider(FakeProvider):
+            def __init__(self):
+                construction_calls.append(True)
+                super().__init__()
+
+        from vfs.execution import registry
+
+        def _factory(name, config):  # noqa: ARG001
+            return RecordingProvider()
+
+        with (
+            patch.object(registry, "resolve_execution_provider", side_effect=_factory),
+            pytest.raises(PermissionDeniedError),
+        ):
+            await vfs.execute(
+                "pass",
+                ns.id,
+                agent.id,
+                "fake",
+                resource_limits=ResourceLimits(timeout_seconds=5.0),
+            )
+
+        assert construction_calls == [], "Provider must NOT be constructed when permission is denied"
+
+    @pytest.mark.asyncio
     async def test_session_not_constructed_on_denied(self, env):
         """Instrument Session.__init__ to verify it is never called on permission denial."""
         vfs, ns, admin, agent = env
@@ -322,14 +358,18 @@ class TestExecuteGrantedAllowsFakeProvider:
 class TestUnknownProviderRejected:
     """ExecutionProviderRegistry/UnknownProviderRejected.
 
-    ValueError raised BEFORE session construction.
+    ValueError raised BEFORE session construction (but AFTER the permission check).
+    A principal with execute permission on the cwd gets ValueError for an unknown
+    provider.  A principal WITHOUT execute permission gets PermissionDeniedError
+    (permission check precedes provider resolution per the spec).
     """
 
     @pytest.mark.asyncio
     async def test_unknown_provider_raises_value_error(self, env):
         vfs, ns, admin, agent = env
-        # Provider resolution happens before permission check (Tier 1);
-        # no grant needed for this test — the ValueError fires first.
+        # Grant execute so the permission check passes; then the unknown provider
+        # name triggers ValueError (correct Tier 1 ordering).
+        await vfs.grant(admin.id, agent.id, ns.id, "/", {"execute"})
 
         with pytest.raises(ValueError, match="nonexistent"):
             await vfs.execute(
@@ -344,8 +384,9 @@ class TestUnknownProviderRejected:
     async def test_unknown_provider_raised_before_session(self, env):
         """ValueError from unknown provider fires before Session is constructed."""
         vfs, ns, admin, agent = env
-        # Provider resolution is Tier 1 and fires before session construction;
-        # no execute grant needed.
+        # Grant execute so the permission check passes; then the unknown provider
+        # name triggers ValueError before any Session is constructed.
+        await vfs.grant(admin.id, agent.id, ns.id, "/", {"execute"})
 
         session_inits: list = []
         original_init = Session.__init__
@@ -364,6 +405,25 @@ class TestUnknownProviderRejected:
             )
 
         assert session_inits == [], "Session must not be constructed before provider resolution"
+
+    @pytest.mark.asyncio
+    async def test_no_execute_perm_raises_permission_denied_before_value_error(self, env):
+        """PermissionDeniedError fires before ValueError for unknown provider.
+
+        Per the spec, permission check precedes provider construction.
+        An unprivileged caller gets PermissionDeniedError, not ValueError,
+        even if the provider name is invalid.
+        """
+        vfs, ns, admin, agent = env
+        # agent has read/write/delete but NOT execute — permission check fires first.
+        with pytest.raises(PermissionDeniedError):
+            await vfs.execute(
+                "pass",
+                ns.id,
+                agent.id,
+                "nonexistent",
+                resource_limits=ResourceLimits(timeout_seconds=5.0),
+            )
 
 
 # ---------------------------------------------------------------------------

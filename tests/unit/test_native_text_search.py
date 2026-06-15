@@ -492,3 +492,52 @@ class TestNativeTextSearchCapability:
         # Neither file contains all three tokens "foo", "OR", and "barbaz" together.
         assert "/foo.txt" not in or_paths, "OR must be treated as a literal token, not a boolean operator"
         assert "/barbaz.txt" not in or_paths
+
+    @pytest.mark.asyncio
+    async def test_straggler_regex_emits_per_line_results(self, vfs_nts):
+        """Regression: straggler REGEX path must emit one SearchResult per matching line.
+
+        Forces an artifact into the straggler path by updating its params_hash to a
+        value that does not match the active NTS params_hash.  The straggler reader then
+        verifies content via blob read.  The resulting SearchResult objects must carry
+        line_number (1-based) and match_context, matching the shape produced by the
+        fresh path (DefaultSearchProvider._regex_search).
+        """
+        from datetime import datetime, timezone
+
+        from vfs.models import SearchArtifact
+
+        ns, agent = await _setup_vfs(vfs_nts)
+        # Three-line file; line 1 and line 3 match "TODO".
+        content = b"TODO first action\nnothing here\nTODO second action\n"
+        ver = await vfs_nts.write(ns.id, "/strag.txt", content, principal_id=agent.id)
+
+        nts = vfs_nts._meta.native_text_search()
+
+        # Corrupt the artifact's params_hash to force the straggler path.
+        stale_artifact = SearchArtifact(
+            status="ready",
+            schema_version=1,
+            provider_key=nts.provider_key,
+            provider_version="1",
+            params_hash="STALE_HASH_DOES_NOT_MATCH",
+            content_hash=ver.content_hash,
+            created_at=datetime.now(timezone.utc),
+            storage="external",
+            artifact_ref=None,
+        )
+        async with vfs_nts._meta.transaction():
+            await vfs_nts._meta.update_search_artifact(ver.id, nts.provider_key, stale_artifact)
+
+        # Now search; the file must be verified via the straggler path.
+        results = await vfs_nts.search(ns.id, "TODO", "/", SearchType.REGEX, principal_id=agent.id)
+
+        # Must produce per-line results matching both occurrences.
+        assert len(results) == 2, f"expected 2 results (one per matching line), got {len(results)}"
+        by_line = sorted(results, key=lambda r: r.line_number or 0)
+        assert by_line[0].line_number == 1
+        assert by_line[0].match_context == "TODO first action"
+        assert by_line[0].path == "/strag.txt"
+        assert by_line[1].line_number == 3
+        assert by_line[1].match_context == "TODO second action"
+        assert by_line[1].path == "/strag.txt"
