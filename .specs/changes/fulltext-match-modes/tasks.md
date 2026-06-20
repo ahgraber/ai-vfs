@@ -1,121 +1,192 @@
 # Tasks: fulltext-match-modes
 
-> Build-dependency order: model/enum → SearchRequest field → VFS/session threading →
-> SQLite ANY → Postgres ANY → dispatch/validation → cross-backend contract test extension
-> → notebook demo.
-> Every SHALL is paired with at least one evidence-producing test; foreseeable write-sites
-> for the match-mode dispatch are the SQLite ANY path, the Postgres ANY path, the ALL
-> default path (both backends), and the non-FULLTEXT ignore path.
+> Build-dependency order: word representation + Postgres `simple` + migration (the
+> substrate) → match-mode enum/field → VFS/session threading → ANY construction on the word
+> representation (both backends) → boundary term cap → dispatch/validation → cross-backend
+> contract tests → notebook demo.
+>
+> Every SHALL is paired with at least one evidence-producing test. Foreseeable write-sites
+> for the match-mode dispatch: the SQLite ANY path, the Postgres ANY path, the ALL default
+> path (both backends), and the non-FULLTEXT ignore path. The in-process straggler FULLTEXT
+> path is **removed** (see §12): stale fulltext fails loud, so `match_mode` does not thread
+> through any straggler path.
+>
+> **Implementation status:** sections 3–5 and 7–10 were implemented against the prior
+> trigram-fulltext substrate during initial work. The substrate change in sections 1–2
+> supersedes them: the SQLite fulltext path must be re-pointed from the trigram table to the
+> new word table, the Postgres path from `'english'` to `'simple'`, and the affected tests
+> re-grounded on real terms (e.g. `s3`). Treat previously-implemented items as drafts to
+> rebase onto the word representation, not as done.
 
-## 1. Model — `FullTextMatchMode` enum (`FulltextMatchMode`)
+## 1. Word representation — substrate (`FulltextWordRepresentation`)
 
-- [ ] Add `FullTextMatchMode(Enum)` with members `ALL = "all"` and `ANY = "any"` to
-  `src/vfs/models.py`, alongside `SearchType`
-- [ ] Test: `FullTextMatchMode.ALL` and `FullTextMatchMode.ANY` are importable from
-  `vfs.models` and compare equal to themselves (`FulltextMatchMode` — enum definition)
-- [ ] Test: a `FullTextMatchMode` round-trips through `SearchRequest.match_mode` (import
-  and field access confirm the type is the enum, not a string)
+- [ ] SQLite: add a second FTS5 virtual table (e.g. `search_fts_words`) with
+  `tokenize='unicode61'` in `_setup_fts5`, keyed by `(provider_key, params_hash, content_hash)`
+  like `search_fts`; have `index_text` write the decoded text into it alongside the trigram
+  table, and `delete_text_artifacts` prune it
+- [ ] Do NOT bump `params_hash` on either backend — it keys the tokenizer-independent `raw_text` and is shared with REGEX (bumping invalidates regex artifacts and exposes the shared `raw_text` to the retired-`params_hash` GC sweep).
+  Bump the informational `SearchArtifact.provider_version` (from `"1"`) at all five construction sites — `sqlite_metadata.index_text`, `postgres_metadata.index_text`, and the three `vfs.py` artifact builders — as a forward marker only (it is not used in `is_usable` and does not retroactively re-tag existing records)
+- [ ] Postgres: switch fulltext from `'english'` to `'simple'` at ALL FOUR sites — the `to_tsvector(...)` in both the `@@` predicate and the `ts_rank` score in `_fulltext_search`, AND the two `plainto_tsquery('english', …)` calls in `_build_fulltext_tsquery` (ALL and ANY paths).
+  No `params_hash` change and no migration (tsvector is inline); leave the `pg_trgm` regex path unchanged
+- [ ] Test (`ShortTermFulltextIsRepresentable`): a FULLTEXT search for `s3` over
+  "deploy to s3" / "deploy to archive" returns only the `s3` document on each backend
+- [ ] Test (`FulltextMatchesWholeWordsNotSubstrings`): FULLTEXT `cat` does NOT match a
+  document containing only "category" (word-token semantics)
+- [ ] Test (`RegexStillMatchesSubstrings`): REGEX `cat` DOES match "category" (trigram
+  representation unaffected by the fulltext change)
+- [ ] Test (provider_version evidence): a newly written `SearchArtifact` carries the bumped
+  `provider_version` at all five construction sites (assert the value at
+  `sqlite_metadata.index_text`, `postgres_metadata.index_text`, and the three `vfs.py`
+  builders), and `is_usable` is unaffected by the change (a record with the old
+  `provider_version` but matching `params_hash` is still usable)
 
-## 2. Protocol — `match_mode` field on `SearchRequest`
+## 2. Migration — backfill word index from `raw_text` at init (`DerivedIndexRebuild`)
 
-- [ ] Add `match_mode: FullTextMatchMode = FullTextMatchMode.ALL` to `SearchRequest` in
-  `src/vfs/protocols/search.py`; document that it applies only to FULLTEXT searches and
-  is ignored for other types
-- [ ] Test: constructing `SearchRequest` without a `match_mode` argument yields
-  `request.match_mode == FullTextMatchMode.ALL` (`FulltextMatchModeDefaultIsAll` —
-  default-value path)
-- [ ] Test: constructing `SearchRequest` with `match_mode=FullTextMatchMode.ANY` yields
-  `request.match_mode == FullTextMatchMode.ANY`
+- [ ] On SQLite store init, backfill `search_fts_words` from existing `search_text_artifacts.raw_text` with an **anti-join** insert keyed on the full `(provider_key, params_hash, content_hash)` identity scoped to the active provider profile (NOT `content_hash` alone — an old/partial row under a different key could otherwise mask a missing current row); insert only rows absent from the word table, under the store lock in a transaction — no blob reads, no content re-decode.
+  This is idempotent AND crash-resumable.
+  Do NOT use a "count check / run-once-if-empty" guard: it leaves a partial backfill permanently partial, and FTS5 has no unique constraint on `(provider_key, params_hash, content_hash)`, so a naive re-run would double-insert → duplicate `SearchResult`s
+- [ ] Document/encode the freshness blind spot: `has_text_artifacts` queries
+  `search_text_artifacts` only and cannot see a missing word-table row, so fresh-FULLTEXT
+  correctness depends on the backfill completing before serving; an interrupted backfill is
+  completed by the resumable anti-join on the next init (the straggler path does NOT cover it)
+- [ ] Confirm content whose `raw_text` row is ABSENT falls to the existing straggler/
+  `reindex` path (which may blob-read) — unchanged from today; do NOT special-case it
+- [ ] Confirm no retired-`params_hash` GC sweep is triggered (params_hash unchanged) and the
+  trigram regex artifacts + `raw_text` rows are untouched
+- [ ] Test (`WordIndexBackfilledFromRawTextWithoutBlobReads`): given `raw_text` rows from
+  before the word index existed, after SQLite init a FULLTEXT search over that content
+  returns correct results with zero blob reads (guarded-reader read count == 0)
+- [ ] Test (`DerivedIndexRebuildIsIdempotentAndResumable`): a second init does not duplicate
+  word-table rows (no duplicate `SearchResult`s), and an init after a simulated partial
+  backfill fills only the missing rows
 
-## 3. VFS & Session threading
+## 3. Model — `FullTextMatchMode` enum (`FulltextMatchMode`) — _implemented; verify_
 
-- [ ] Add `match_mode: FullTextMatchMode = FullTextMatchMode.ALL` kwarg to
-  `vfs.VFS.search`; forward it into `SearchRequest` construction
-- [ ] Add `match_mode: FullTextMatchMode = FullTextMatchMode.ALL` kwarg to
-  `session.Session.search`; forward it into the `vfs.search` call unchanged
-- [ ] Test: calling `vfs.search(..., search_type=FULLTEXT, match_mode=ANY)` produces a
-  `SearchRequest` with `match_mode=ANY` that reaches `NativeTextSearch.search_text`
-  (verified via a minimal stub/mock of the NativeTextSearch capability that captures the
-  received request)
-- [ ] Test: calling `vfs.search` without `match_mode` produces a request with
-  `match_mode=ALL` (`FulltextMatchModeDefaultIsAll` — threading path, canonical call site)
-- [ ] Test (write-site: session threading): calling `session.search(..., match_mode=ANY)` delegates to `vfs.search` with `match_mode=ANY` intact
+- [ ] `FullTextMatchMode(Enum)` with `ALL = "all"`, `ANY = "any"` in `src/vfs/models.py`,
+  beside `SearchType`
+- [ ] Test: members importable from `vfs.models`, equal to themselves; round-trip through
+  `SearchRequest.match_mode` confirms the type is the enum, not a string
 
-## 4. SQLite ANY construction
+## 4. Protocol — `match_mode` field on `SearchRequest` — _implemented; verify_
 
-- [ ] In `SQLiteNativeTextSearch._fulltext_search`, accept `mode: FullTextMatchMode` (read
-  from `request.match_mode`) and, when `mode=ANY`, OR-join the double-quoted token phrases
-  (`"tok1" OR "tok2"`) instead of AND-joining them; the double-quoting rule (internal `"`
-  → `""`) is unchanged
-- [ ] Test (write-site: SQLite ANY path): a FULLTEXT search with mode=ANY on an SQLite
-  store returns every document matching at least one query term, including a document that
-  would be excluded in ALL mode (`FulltextMatchAnyRanksUnion` — SQLite)
-- [ ] Test (write-site: SQLite ALL path): a FULLTEXT search with mode=ALL on an SQLite
-  store returns only documents containing every query term (`FulltextMatchAllRequiresEveryTerm`
-  — SQLite)
-- [ ] Test: SQLite ANY mode returns results ordered by descending BM25 relevance; a
-  document matching both query terms ranks above a document matching only one
-  (`RankedFulltextAnyMode` — SQLite)
-- [ ] Test: a query token containing a double-quote character is correctly escaped (`""`)
-  in SQLite ANY mode — the injection-safe quoting applies in OR mode as in AND mode
+- [ ] `match_mode: FullTextMatchMode = FullTextMatchMode.ALL` on `SearchRequest`; documented
+  as FULLTEXT-only, ignored for other types
+- [ ] Test (`FulltextMatchModeDefaultIsAll` — default path): no `match_mode` →
+  `request.match_mode == ALL`; explicit `ANY` → `ANY`
 
-## 5. Postgres ANY construction
+## 5. VFS & Session threading — _implemented; verify_
 
-> Integration tests in this group require the Docker-compose Postgres stack
-> (`pytest -m integration_lifecycle` or the `docker` marker per repo convention).
+- [ ] `match_mode` keyword-only param (default `ALL`) on `vfs.VFS.search` and
+  `session.Session.search`, forwarded into `SearchRequest` construction — including the
+  `fresh_request` reconstruction in `vfs._native_search`
+- [ ] Test: `vfs.search(..., FULLTEXT, match_mode=ANY)` reaches `search_text` with
+  `match_mode=ANY` (captured via stub capability, exercising the `fresh_request` path)
+- [ ] Test: `vfs.search` without `match_mode` → `ALL`; `session.search(..., match_mode=ANY)`
+  delegates with `ANY` intact
 
-- [ ] In `PostgresNativeTextSearch._fulltext_search`, accept `mode: FullTextMatchMode`
-  and, when `mode=ANY`, split the query on whitespace, call
-  `plainto_tsquery('english', :tN)` for each term, and combine them with `||`; the `@@`
-  match operator and `ts_rank` scoring are unchanged; for a single-term query the
-  construction reduces to one `plainto_tsquery` call
-- [ ] Test (write-site: Postgres ANY path, integration): a FULLTEXT search with mode=ANY
-  on a Postgres store returns every document matching at least one query term, including a
-  document that would be excluded in ALL mode (`FulltextMatchAnyRanksUnion` — Postgres;
-  requires Docker)
-- [ ] Test (write-site: Postgres ALL path, integration): a FULLTEXT search with mode=ALL
-  on a Postgres store returns only documents containing every query term
-  (`FulltextMatchAllRequiresEveryTerm` — Postgres; requires Docker)
-- [ ] Test (integration): Postgres ANY mode returns results ordered by descending ts_rank;
-  a document matching both terms ranks above a document matching only one
-  (`RankedFulltextAnyMode` — Postgres; requires Docker)
-- [ ] Test (integration): a single-term query in ANY mode produces the same result set as
-  in ALL mode (single-term degenerate case; requires Docker)
+## 6. Boundary term-count cap
 
-## 6. Dispatch / validation
+- [ ] In `vfs.VFS.search`, reject a FULLTEXT query whose whitespace-split term count exceeds
+  the maximum (128) with a clear error, before backend query construction (covers SQLite and
+  Postgres; 128 is well below the PostgreSQL ~32767 bind-parameter ceiling that ANY approaches)
+- [ ] Test (`FulltextRejectsTooManyTerms`): a FULLTEXT query above 128 terms raises the
+  boundary error; a query at/below 128 succeeds
 
-- [ ] Confirm that `NativeTextSearch.search_text` implementations read `request.match_mode`
-  only inside the FULLTEXT branch of their dispatch; GLOB, FIND, and REGEX branches are
-  unaffected (read the field but never act on it, or simply do not read it)
-- [ ] Test (write-site: non-FULLTEXT ignore path): calling `vfs.search` with
-  `search_type=GLOB` (or FIND or REGEX) and `match_mode=ANY` raises no error and returns
-  the same results as the same search without a `match_mode` argument
-  (`MatchModeIgnoredForNonFulltext`)
+## 7. SQLite ANY construction — on the word table (_rebase from trigram draft_)
 
-## 7. Cross-backend contract test extension
+- [ ] `SQLiteNativeTextSearch._fulltext_search` queries the **word** table, accepts
+  `mode: FullTextMatchMode`, and OR-joins double-quoted word tokens (`"tok1" OR "tok2"`) for
+  ANY vs AND-join for ALL; double-quote escaping (`"`→`""`) unchanged; empty-query guard
+  retained
+- [ ] In `vfs._native_search`, **remove** the inline straggler FULLTEXT predicate (see §12):
+  a stale/missing FULLTEXT artifact fails loud (`reindex`-required) rather than being
+  approximated, so `match_mode` does NOT thread through any straggler path
+- [ ] Test (`FulltextMatchAnyRanksUnion` — SQLite): mode=ANY returns the union incl. a
+  one-term doc excluded under ALL; both-terms doc ranks first
+- [ ] Test (`FulltextMatchAllRequiresEveryTerm` — SQLite): mode=ALL returns only docs with
+  every term
+- [ ] Test (`RankedFulltextAnyMode` — SQLite): both-terms doc outranks one-term doc (BM25)
+- [ ] Test: a query token containing `"` is escaped (`""`) in ANY mode and exercises the
+  escaping (only the quoted term can match the asserted doc)
+- [ ] Test (straggler fulltext fails loud): a FULLTEXT search whose scope contains any
+  stale/missing artifact fails loud with `reindex`-required — no inline approximation for
+  either `ALL` or `ANY` (replaces the former inline-straggler-ANY behavior; see §12)
+
+## 8. Postgres ANY construction — on `'simple'` (rebase from the `'english'` draft)
 
 > Integration tests in this group require the Docker-compose Postgres stack.
 
-- [ ] Extend the existing `ResultSetEquivalentToBruteForce` contract test to also run the
-  same FULLTEXT query in mode=ALL and assert the same-path-set result across SQLite and
-  Postgres (this formalizes the existing scenario; no behavior change, just explicit mode
-  coverage)
-- [ ] Add a new contract test for mode=ANY: run the same FULLTEXT query with mode=ANY
-  against the same corpus on both the SQLite and Postgres backends; assert that the set of
-  returned paths is identical across both backends (`AnyModeResultSetEquivalentAcrossBackends`)
-- [ ] In the ANY-mode contract test, assert that a document matching both query terms has
-  a higher rank position than a document matching only one on each backend independently
-  (monotonic ordering check; score values not compared across backends)
-- [ ] Wrap the contract test with `pyleak` `no_task_leaks` per project testing policy
+- [ ] `PostgresNativeTextSearch._fulltext_search` accepts `mode`; for ANY splits on
+  whitespace and OR-combines per-term `plainto_tsquery('simple', :tN)` with `||`, reused in
+  both the `@@` predicate and `ts_rank`; single-term reduces to one call; zero-term returns
+  empty (parity with SQLite)
+- [ ] Static (in-sandbox) test: the constructed tsquery fragment + bound params are
+  well-formed for 0 / 1 / N terms and carry terms only as bind parameters
+- [ ] Test (`FulltextMatchAnyRanksUnion` — Postgres; Docker): union incl. a one-term doc
+  excluded under ALL; both-terms doc ranks first
+- [ ] Test (`FulltextMatchAllRequiresEveryTerm` — Postgres; Docker): only docs with every term
+- [ ] Test (`RankedFulltextAnyMode` — Postgres; Docker): both-terms doc outranks one-term doc
+  (`ts_rank`)
+- [ ] Test (Docker): single-term ANY == single-term ALL result set
 
-## 8. Notebook demo
+## 9. Dispatch / validation — _implemented; verify_
 
-- [ ] Update `notebooks/02` to demonstrate ALL vs ANY on the same corpus: index a small
-  document set, run the same multi-term FULLTEXT query in both modes, and display the
-  difference in result sets side-by-side
+- [ ] `search_text` reads `request.match_mode` only inside the FULLTEXT branch; GLOB/FIND/
+  REGEX unaffected
+- [ ] Test (`MatchModeIgnoredForNonFulltext`): `vfs.search` with GLOB/FIND/REGEX and
+  `match_mode=ANY` raises no error and returns the same (non-empty) result set as without it
+
+## 10. Cross-backend contract tests
+
+> Integration tests in this group require the Docker-compose Postgres stack and stand up an
+> in-memory SQLite word-index store alongside the Postgres store.
+
+- [ ] Keep the exact-REGEX `ResultSetEquivalentToBruteForce` test independent of the SQLite
+  fixture (do NOT couple the Postgres regex regression to SQLite word-index availability —
+  put cross-backend FULLTEXT assertions in their own test)
+- [ ] Test (`AllModeCoherentAcrossBackends`; Docker): same portable-term FULLTEXT query in
+  mode=ALL → same path set across SQLite and Postgres (sanity check over a portable-term
+  corpus, NOT a guaranteed-identical contract for arbitrary input)
+- [ ] Test (`AnyModeCoherentAcrossBackends`; Docker): same portable-term FULLTEXT query in
+  mode=ANY → same path set across backends for the portable corpus; each backend
+  independently ranks a more-term-matching doc above a fewer-term-matching one (scores not
+  compared across backends)
+- [ ] Wrap the cross-backend act phase with `pyleak` `no_task_leaks(action="raise")`
+
+## 11. Notebook demo
+
+- [ ] Update `notebooks/02` to demonstrate ALL vs ANY on the same corpus: same multi-term FULLTEXT query in both modes, result sets shown side-by-side.
+  Label the Postgres ranker `ts_rank` (not BM25)
+
+## 12. Search correctness floor — self-healing → fail-loud (folded from #5)
+
+> Serves US-2. Removes the always-on self-healing that ladders to no PoC user story while
+> keeping the fail-loud trust floor. Net code reduction, not added scope.
+
+- [ ] Drop **query-time lazy backfill** in `vfs._native_search` (the straggler-path `index_text`
+  - `update_search_artifact` block); `vfs.reindex()` remains the explicit remedy.
+    The write-path in-transaction `index_text` is unchanged (fresh ⇔ current invariant holds).
+- [ ] Drop the **`has_text_artifacts` existence re-check** in `vfs._native_search`; the in-DB
+  index makes out-of-band record loss a non-state (`object-store-text-index` parked).
+- [ ] **FULLTEXT straggler → fail loud:** classification keeps REGEX straggler verification
+  (honest line-level `re`); a stale/missing FULLTEXT artifact raises `reindex`-required rather
+  than running the inline token predicate (deleted with §7).
+- [ ] Remove the now-dead `is_usable` external params (`external_readable` /
+  `external_identity_match`) in `models.py`, unreferenced once the existence re-check is gone.
+- [ ] Spec deltas (`specs/search/spec.md`): narrow `ColdIndexFailsLoud` / `NativeTextSearchCapability` so straggler verification covers REGEX only and FULLTEXT staleness fails loud; soften `SearchMetaReindex` (versioning) to drop the lazy-backfill `MAY`.
+  Each delta requirement carries `Serves: US-2`.
+- [ ] Test: fresh FULLTEXT (both modes) authoritative with zero blob reads; any FULLTEXT
+  straggler → `reindex`-required (no approximation); REGEX straggler verify + budget fail-loud
+  unchanged; no lazy backfill occurs (a 2nd search after a straggler still requires explicit
+  `reindex`).
 
 ## User-owned
 
-- Update `CHANGELOG.md` under Unreleased: new `FullTextMatchMode` enum; `match_mode`
-  field on `SearchRequest`; `vfs.search` and `session.search` gain `match_mode` kwarg;
-  default is `ALL` (backward-compatible); `ANY` returns ranked-OR union.
+- [ ] Update `CHANGELOG.md` under Unreleased:
+  - FULLTEXT now uses a word-tokenized representation (SQLite `unicode61`, Postgres `'simple'`) distinct from the trigram representation used for REGEX; non-stemming / language-neutral.
+    **Behavior change:** fulltext matches whole words, not substrings, and no longer stems on Postgres (`databases` ≠ `database`); short terms like `s3` now match correctly.
+    Includes a one-time word-index rebuild from stored text (no blob reads) on upgrade.
+  - New `FullTextMatchMode` enum (`ALL`/`ANY`); `match_mode` field on `SearchRequest`;
+    `vfs.search` / `session.search` gain a `match_mode` kwarg; default `ALL`
+    (backward-compatible); `ANY` returns the ranked-OR union.
+  - SemVer: MINOR.
