@@ -6,7 +6,8 @@
 
 The system SHALL define a MetadataStore protocol with methods for file CRUD, version CRUD, permission checks, audit event persistence, name resolution, search metadata updates, and GC queries.
 All adapters SHALL implement this protocol.
-The protocol SHALL be satisfied by the SQLite, Postgres, and Mongo adapters, each round-tripping files and versions identically and persisting the extensible `search_meta` and `detail` fields as backend-native structures (JSON for SQLite, JSONB for Postgres, subdocuments for Mongo).
+The protocol spans two backend families — **relational** (SQLite, Postgres, and any other RDBMS) and **document** (MongoDB-wire stores, including Azure Cosmos DB for MongoDB) — and is defined at the **weakest common denominator** of the two, so any backend in either family is substitutable behind it (see `MetadataTransactions`, `MetadataCASSemantics`).
+The shipped exemplar adapters are SQLite, Postgres, and MongoDB; each round-trips files and versions identically and persists the extensible `search_meta` and `detail` fields as backend-native structures (JSON for SQLite, JSONB for Postgres, subdocuments for document stores).
 
 #### Scenario: SQLiteAdapter
 
@@ -133,9 +134,14 @@ enabling garbage collection to identify orphaned blobs with zero version referen
 ### Requirement: MetadataTransactions
 
 The MetadataStore protocol SHALL include an optional `transaction()` async context manager for atomic multi-step operations.
-SQLite and Postgres implement this via `BEGIN`/`COMMIT`/`ROLLBACK`.
-MongoDB provides true atomicity only on replica-set deployments; on standalone MongoDB `transaction()` is a documented best-effort no-op.
-Callers performing multi-document mutations SHALL NOT rely on `transaction()` rollback for non-destructiveness on stores where it is best-effort; they SHALL order writes so partial failure is non-destructive (see file-operations `MoveFile`).
+
+**Contract floor (weakest common denominator).**
+Multi-document atomicity is NOT part of the protocol contract — it is a relational-family bonus, not a document-family guarantee.
+Relational exemplars (SQLite, Postgres) implement true transactions via `BEGIN`/`COMMIT`/`ROLLBACK`.
+Document stores provide it only conditionally — MongoDB only on replica-set deployments, and Azure Cosmos DB for MongoDB only within tier/version-specific limits — so on a standalone MongoDB (or any document store lacking it) `transaction()` is a documented best-effort no-op.
+Because the floor excludes multi-document atomicity, callers performing multi-document mutations SHALL NOT rely on `transaction()` rollback for non-destructiveness; they SHALL order writes so partial failure is non-destructive (see file-operations `MoveFile`).
+
+> **Pre-implementation gate (document family):** before implementing or certifying a document-store adapter, verify the target deployment's actual transaction support, Mongo wire-protocol version, and indexing/throughput behavior (e.g. Cosmos RU limits and required field indexes) against current vendor documentation — the Mongo-wire compatibility surface differs across MongoDB replica sets and Cosmos tiers.
 
 #### Scenario: TransactionRollbackOnError
 
@@ -146,8 +152,10 @@ Callers performing multi-document mutations SHALL NOT rely on `transaction()` ro
 ### Requirement: MetadataCASSemantics
 
 The MetadataStore SHALL implement compare-and-swap semantics for version mutations.
-SQL adapters SHALL use `WHERE version_number = ?` returning zero rows on mismatch.
-NoSQL adapters SHALL use atomic find-and-update with version matching.
+Relational adapters SHALL use `WHERE version_number = ?` returning zero rows on mismatch.
+Document adapters SHALL use atomic find-and-update with version matching.
+
+> **In the contract floor:** unlike multi-document transactions, **single-document CAS is part of the floor** — every adapter in both families provides it. It is the coordination primitive the VFS relies on (CAS writes plus destination-before-source ordering) precisely because multi-document atomicity is not guaranteed.
 
 When two concurrent writers both attempt to insert the same `version_number` without an `expected_version` (no-CAS write), the store SHALL translate the resulting unique-constraint violation (`IntegrityError` for SQL, `DuplicateKeyError` for MongoDB) into a `VersionCollisionError` — distinct from `ConflictError`.
 The VFS layer retries on `VersionCollisionError`; `ConflictError` from a CAS mismatch continues to propagate un-retried.
@@ -173,6 +181,7 @@ The VFS layer retries on `VersionCollisionError`; `ConflictError` from a CAS mis
 ### Requirement: URIBasedStoreResolution
 
 The system SHALL resolve storage adapter implementations from URI schemes at VFS construction time, including `sqlite:///`, `postgresql://`, `mongodb://` (metadata) and `file:///`, `s3://` (blob).
+The `mongodb://` scheme covers any Mongo-wire-compatible document store, including Azure Cosmos DB for MongoDB.
 Importing an adapter whose optional dependency is not installed SHALL raise a clear, actionable error naming the missing extra.
 
 #### Scenario: URIResolution
@@ -259,7 +268,7 @@ were treated as a wildcard.
 The SQLite and Postgres metadata stores SHALL implement the `NativeTextSearch` capability, persisting the raw decoded text in a content-addressed `search_text_artifacts` table keyed by `(provider_key, params_hash, content_hash)` with a derived full-text index (SQLite FTS5; Postgres `tsvector` + `pg_trgm`).
 `index_text` SHALL run in the same transaction as the version write on these stores.
 A text artifact SHALL be reclaimed when its `content_hash` has no retained version references (the same orphan condition blob GC uses) or when its `params_hash` belongs to a retired index profile; reclamation SHALL be derived at GC time, not from an eager reference count.
-MongoDB SHALL NOT expose the capability — its `native_text_search()` SHALL return `None`.
+Document stores SHALL NOT expose the capability — `NativeTextSearch` is a relational-exemplar feature built on FTS5 / `tsvector`+`pg_trgm`, so a document store's `native_text_search()` SHALL return `None`.
 The stored text SHALL be treated as content at the same confidentiality level as blob content.
 
 #### Scenario: ContentAddressedTextDedup

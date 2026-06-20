@@ -1,5 +1,7 @@
 # Access Control — Spec
 
+> **Why (trust thesis):** default-deny, path-prefix permissions, and invisible pruning are the _isolation_ facet of `NORTH-STAR.md` bet #2 (trust) — they make delegating write access to a non-deterministic agent defensible. The rationale lives in the north star; this spec is the contract.
+
 ## Requirements
 
 ### Requirement: DefaultDeny
@@ -65,6 +67,10 @@ The system SHALL validate that any `path_prefix` stored via `set_permission` or
 The system SHALL exclude unauthorized paths from list and stat results.
 An agent SHALL NOT be able to discover or reference paths it cannot read.
 
+> **Deferred (perf):** `list` and `search` pruning call `check_permission` per path —
+> O(n) round-trips on networked metadata backends (Postgres, document stores). A batch
+> permission lookup is deferred.
+
 #### Scenario: ListExcludesUnauthorized
 
 - **GIVEN** files /public/a.txt and /secret/b.txt exist
@@ -81,6 +87,11 @@ An agent SHALL NOT be able to discover or reference paths it cannot read.
 
 The system SHALL enforce complete isolation between namespaces.
 Cross-namespace access requires an explicit permission entry for the foreign namespace.
+
+> **Accepted risk:** Content-addressed blobs and `search_text_artifacts` are shared across
+> namespaces at rest, so a successful idempotent `put`'s timing is observable as a
+> cross-namespace existence oracle. Physical-row namespace isolation is deferred; this is
+> accepted at the same level as the shared-at-rest content model.
 
 #### Scenario: CrossNamespaceDenied
 

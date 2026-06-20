@@ -1,6 +1,12 @@
 # ai-vfs: Virtual Filesystem for AI Agents
 
-**Date:** 2026-04-04 **Status:** Draft **Authors:** ahgraber + Claude
+> **ARCHIVED — historic brainstorming RFC.** Superseded by `NORTH-STAR.md` (product
+> intent) and `.specs/specs/` (contracts); per-change decisions live in each change's
+> `design.md`. Retained for provenance — including the prior-art / influence map
+> (Appendix) not migrated elsewhere. On any conflict, `NORTH-STAR.md` + specs win.
+> Archived 2026-06-19.
+
+**Date:** 2026-04-04 **Status:** Archived **Authors:** ahgraber + Claude
 
 > Updated 2026-06-09: reflects phase2 search pivot — bloom superseded by native FTS. See §7.2, §7.4, §9.4.
 

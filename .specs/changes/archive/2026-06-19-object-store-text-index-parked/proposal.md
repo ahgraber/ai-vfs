@@ -1,5 +1,11 @@
 # Object-Store Text Index: Full-Text Search Decoupled from the Metadata Store
 
+> **PARKED — deferred as scope creep (2026-06-19).** Not implemented and not part of the
+> PoC. Object-store-resident postings are a nice-to-have for non-FTS metadata backends, but
+> the PoC's search correctness floor (fail-loud + `reindex`) covers the gap. Resume by
+> moving this directory back under `.specs/changes/`. Parked in `archive/` only to keep the
+> active change set free of uncommitted scope.
+
 **Change name:** `object-store-text-index` **Date:** 2026-06-11 **Author:** ahgraber + Claude
 
 ## Intent
