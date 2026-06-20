@@ -1,5 +1,7 @@
 # Versioning — Spec
 
+> **Why (trust thesis):** immutable history and rollback are the _reversibility_ facet of `NORTH-STAR.md` bet #2 (trust) — an agent's bad write is always recoverable. The rationale lives in the north star; this spec is the contract.
+
 ## Requirements
 
 ### Requirement: ImmutableVersionHistory
@@ -97,9 +99,23 @@ Reclamation SHALL always preserve the first and current versions when `keep_firs
 
 Tier GC is activated when `VFSConfig.retention_tiers` is explicitly set (non-None, non-empty list of tier dicts); when `retention_tiers` is `None` (the default), GC falls back to the simple `max_recent_versions` path.
 
+> **Optional capability (advanced, opt-in).** Tiered retention is not part of the core
+> contract: it is inert unless `VFSConfig.retention_tiers` is explicitly set, and the
+> default policy uses only `max_recent_versions`. A backend that implements only the simple
+> retention path is conformant; tier evaluation is additive.
+
 The MetadataStore protocol SHALL expose `iter_versions_for_gc(namespace_id, file_path) -> AsyncIterator[VersionMeta]`, a coarse enumerator returning a file's versions in deterministic order (`created_at`, then `version_number`).
 Existing `list_reclaimable_versions(policy, namespace_id)` is retained for the simple rules (`max_recent_versions`, `keep_first_version`, `keep_current_version`); tier-aware reclamation consumes `iter_versions_for_gc`.
 
+> **Cross-adapter conformance (conditional).** The pure tier evaluator is the single source
+> of truth; an adapter is conformant when, given the same version set, it yields the
+> evaluator's reclaimed-ID set. This is proven continuously on SQLite; the Postgres and
+> document-store legs are conformance-tested when that infrastructure is configured.
+> Conformance depends on every adapter enumerating versions in one deterministic order
+> (`created_at`, then `version_number`); a document store that persists `created_at` as
+> ISO-8601 text and sorts lexically satisfies this only for fixed-offset UTC timestamps — a
+> required storage invariant.
+>
 > **Deferred:** Per-namespace `Namespace.retention_policy` overrides are not yet wired
 > (no `get_namespace` on `MetadataStore`); config-level policy applies uniformly to all namespaces.
 
@@ -123,9 +139,9 @@ Existing `list_reclaimable_versions(policy, namespace_id)` is retained for the s
 
 #### Scenario: ReclamationIdenticalAcrossAdapters
 
-- **GIVEN** the same file version set and `RetentionPolicy` materialized in the SQLite, Postgres, and Mongo adapters
+- **GIVEN** the same file version set and `RetentionPolicy` materialized in each configured adapter (SQLite always; Postgres and the document store when their infrastructure is available)
 - **WHEN** the GC library evaluates tiers via `iter_versions_for_gc` against each adapter
-- **THEN** all three adapters yield the identical set of reclaimed version IDs
+- **THEN** each configured adapter yields the reclaimed version-ID set computed by the pure tier evaluator
 
 ### Requirement: SearchMetaReindex
 

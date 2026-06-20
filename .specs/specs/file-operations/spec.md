@@ -7,6 +7,9 @@
 The system SHALL store file content in the blob store keyed by BLAKE3 hash
 of the content bytes, so that identical content is stored only once.
 
+> **Rationale:** BLAKE3 was chosen over SHA-256 for cryptographic strength, ~2× hashing
+> speed, and content-addressed deduplication for free.
+
 #### Scenario: DeduplicatedWrite
 
 - **GIVEN** two files with identical content exist in different paths
@@ -192,6 +195,10 @@ Callers SHALL treat move as non-atomic on best-effort stores and re-resolve on f
 
 The system SHALL support optimistic concurrency via an optional `expected_version` parameter on write.
 When provided, the write SHALL fail with `ConflictError` if the file's current version does not match.
+
+> **Rationale:** Optimistic CAS via version stamps keeps writes coordination-free (no
+> locks, no coordination layer); the pattern is borrowed from turbopuffer's S3
+> conditional-write approach.
 
 When `expected_version` is **not** provided (last-writer-wins), two concurrent writers reading the same current version N and both attempting to write version N+1 SHALL both ultimately succeed, producing versions N+1 and N+2 respectively, because the VFS retries the read-compute-put loop on a version-number collision (`VersionCollisionError`), bounded at 5 attempts.
 If the retry budget is exhausted, `VersionCollisionError` is raised.

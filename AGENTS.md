@@ -98,8 +98,20 @@ For multi-step tasks, state a brief plan defining the step task and associated v
 - Use Spec-Driven Development and Test-Driven Development.
 - Any change to data schemas, embedding parameters, or retrieval scoring requires a migration/test plan and version bump of the affected artifact.
 - Code review checks for reproducibility (pinned deps, seeded operations), privacy adherence, and observability hooks (structured logs + metrics).
-- Techstack/tooling choices for external services or internal frameworks MUST reference an ADR in `docs/decision-record/` or be manually overridden with references to other documents.
-- Significant architectural decisions MUST have an ADR.
+
+### Spec authoring
+
+- **Contract floor (weakest common denominator).**
+  When a spec defines a contract (protocol, interface, adapter) satisfied by more than one implementation or backend family, define the MANDATORY contract at the **intersection** of what every declared implementation guarantees — never the union, never the strongest one.
+  Expose capabilities only some implementations provide as **optional, queryable capabilities** (feature detection, e.g. `native_text_search() -> None`), never as mandatory clauses only some backends satisfy.
+  Name exemplar implementations in scenarios; keep exemplar-specific behavior out of contract prose.
+  This is the Liskov Substitution Principle for backends: any declared implementation MUST be substitutable without callers observing a behavioral change.
+- **Value-chain laddering.**
+  Every change's user stories (in `proposal.md`) MUST ladder to the product north star (`.specs/NORTH-STAR.md`); every delta-spec requirement that advances a story carries a `Serves: <story>` backlink.
+  A requirement that ladders to no story is scope to question, not implement.
+- **Document hierarchy (single source of truth).**
+  North star = product intent; baseline `specs/` = contracts; per-change `design.md` = decisions and rationale (there is no separate ADR store).
+  On any conflict, north star + specs win.
 
 ## Governance Practices
 

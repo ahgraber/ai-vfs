@@ -1,5 +1,7 @@
 # Observability — Spec
 
+> **Why (trust thesis):** the append-only audit log is the _accountability_ facet of `NORTH-STAR.md` bet #2 (trust) — every agent state-change is attributable after the fact. The rationale lives in the north star; this spec is the contract.
+
 ## Requirements
 
 ### Requirement: OTelSpansOnAllOperations
@@ -72,6 +74,9 @@ state-changing operation: write, delete, rollback, permission change, and GC run
 
 The system SHALL NOT update or delete audit events.
 GC MAY archive old audit entries but SHALL NOT delete them.
+
+> **Deferred:** No archival or rotation mechanism exists; under sustained agent write load
+> the audit table grows unbounded. An archival strategy is deferred.
 
 #### Scenario: AuditImmutable
 
