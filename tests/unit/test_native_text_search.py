@@ -29,7 +29,7 @@ from ulid import ULID
 
 from vfs.config import VFSConfig
 from vfs.gc import GarbageCollector
-from vfs.models import SearchType, VersionMeta
+from vfs.models import FullTextMatchMode, SearchType, VersionMeta
 from vfs.stores.local_blob import LocalFSBlobStore
 from vfs.stores.sqlite_metadata import SQLiteMetadataStore
 from vfs.vfs import VFS
@@ -99,13 +99,16 @@ async def nts_store():
     await store.close()
 
 
-async def _setup_vfs(vfs: VFS):
-    """Bootstrap namespace + agent; returns (namespace, agent_principal)."""
+async def _setup_vfs(vfs: VFS, ops: set[str] | None = None):
+    """Bootstrap namespace + agent; returns (namespace, agent_principal).
+
+    ``ops`` overrides the operations granted to the agent (default read+write).
+    """
     ns = await vfs.create_namespace("ns", "admin")
     admin = await vfs.create_principal("admin")
     await vfs.bootstrap_admin(admin.id, ns.id)
     agent = await vfs.create_principal("agent")
-    await vfs.grant(admin.id, agent.id, ns.id, "/", {"read", "write"})
+    await vfs.grant(admin.id, agent.id, ns.id, "/", ops or {"read", "write"})
     return ns, agent
 
 
@@ -218,6 +221,42 @@ class TestNativeTextSearchStorage:
             (content_hash,),
         )
         assert rows[0][0] == 0, "text artifact must be deleted when its content_hash is orphaned"
+
+    @pytest.mark.asyncio
+    async def test_live_referenced_content_never_swept(self, nts_store, tmp_path):
+        """LiveReferencedContentNeverSwept: GC must not sweep a content_hash with a live version.
+
+        The reference check and the text-artifact deletion are atomic (one metadata transaction
+        holding the store lock), so a live-referenced hash is never swept — neither its blob nor
+        its text artifacts.  This pins the invariant the removed query-time existence re-check
+        incidentally guarded; cross-store concurrency is exercised by the delegated integration test.
+        """
+        from vfs.config import VFSConfig
+
+        blob_store = LocalFSBlobStore(tmp_path / "blobs")
+        nts = nts_store.native_text_search()
+
+        content = b"keep me alive"
+        content_hash = _blake3.blake3(content).hexdigest()
+        await blob_store.put(content_hash, content)
+        await nts.index_text(str(ULID()), content_hash, nts.params_hash, content.decode())
+
+        # A live (non-tombstone) version references the content at check time.
+        v = _version("ns", "/live.txt", 1, content_hash)
+        await nts_store.put_version(v)
+        assert await nts_store.has_version_references(content_hash)
+
+        config = VFSConfig(audit_log_enabled=False)
+        gc = GarbageCollector(nts_store, blob_store, config)
+        result = await gc.run()
+
+        assert result.blobs_reclaimed == 0, "a live-referenced hash must not be swept"
+        rows = await nts_store._execute_fetchall(
+            "SELECT COUNT(*) FROM search_text_artifacts WHERE content_hash=?",
+            (content_hash,),
+        )
+        assert rows[0][0] == 1, "text artifact for a live-referenced hash must survive"
+        assert await blob_store.get(content_hash) == content, "blob for a live-referenced hash must survive"
 
     @pytest.mark.asyncio
     async def test_mongo_has_no_native_text_search(self):
@@ -348,6 +387,41 @@ class TestNativeTextSearchCapability:
                 (vfs_nts._meta.native_text_search().provider_key,),
             )
         }
+
+    @pytest.mark.asyncio
+    async def test_copy_propagates_search_meta(self, vfs_nts):
+        """CopyPropagatesSearchMeta: a copied file is searchable with no blob reads (no reindex).
+
+        The copy shares the source ``content_hash``, so carrying ``search_meta`` forward keeps the
+        destination identity-current (fresh) — served from the index rather than re-verified as a
+        straggler via a blob read.
+        """
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/a.py", b"def discover(): return 1", principal_id=agent.id)
+        await vfs_nts.copy(ns.id, "/a.py", "/b.py", principal_id=agent.id)
+
+        counting = _CountingBlobStore(vfs_nts._blob)
+        vfs_nts._blob = counting
+
+        results = await vfs_nts.search(ns.id, "discover", "/", SearchType.REGEX, principal_id=agent.id)
+
+        assert counting.get_count == 0, "copied file must be fresh (no straggler blob read)"
+        assert {r.path for r in results} == {"/a.py", "/b.py"}
+
+    @pytest.mark.asyncio
+    async def test_move_destination_propagates_search_meta(self, vfs_nts):
+        """MoveDestinationPropagatesSearchMeta: a moved file is searchable at the destination, no blob reads."""
+        ns, agent = await _setup_vfs(vfs_nts, {"read", "write", "delete"})
+        await vfs_nts.write(ns.id, "/old.py", b"def relocate(): return 2", principal_id=agent.id)
+        await vfs_nts.move(ns.id, "/old.py", "/new.py", principal_id=agent.id)
+
+        counting = _CountingBlobStore(vfs_nts._blob)
+        vfs_nts._blob = counting
+
+        results = await vfs_nts.search(ns.id, "relocate", "/", SearchType.REGEX, principal_id=agent.id)
+
+        assert counting.get_count == 0, "moved file must be fresh at the destination (no straggler blob read)"
+        assert {r.path for r in results} == {"/new.py"}, "destination present; source tombstone absent"
 
     @pytest.mark.asyncio
     async def test_result_set_equivalent_to_brute_force(self, vfs_nts):
@@ -494,27 +568,105 @@ class TestNativeTextSearchCapability:
         assert "/barbaz.txt" not in or_paths
 
     @pytest.mark.asyncio
-    async def test_straggler_regex_emits_per_line_results(self, vfs_nts):
-        """Regression: straggler REGEX path must emit one SearchResult per matching line.
+    async def test_fulltext_match_any_ranks_union(self, vfs_nts):
+        """FulltextMatchAnyRanksUnion (SQLite): mode=ANY returns the union, both-terms doc ranks first.
 
-        Forces an artifact into the straggler path by updating its params_hash to a
-        value that does not match the active NTS params_hash.  The straggler reader then
-        verifies content via blob read.  The resulting SearchResult objects must carry
-        line_number (1-based) and match_context, matching the shape produced by the
-        fresh path (DefaultSearchProvider._regex_search).
+        Corpus: "hello world" (matches one term) and "hello cloud bucket" (matches both).
+        Query "hello cloud" in mode=ANY returns both; the both-terms doc ranks above the
+        one-term doc.
+
+        NB: the SQLite FTS5 index uses the *trigram* tokenizer, which produces no tokens
+        for terms shorter than 3 characters.  The spec scenario's literal "s3" term (2
+        chars) is therefore unrepresentable on this backend; "cloud" preserves the scenario
+        intent (one-term doc vs both-terms doc) with a trigram-viable term.
+        """
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/one.txt", b"hello world", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/both.txt", b"hello cloud bucket", principal_id=agent.id)
+
+        results = await vfs_nts.search(
+            ns.id, "hello cloud", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ANY
+        )
+
+        paths = [r.path for r in results]
+        assert set(paths) == {"/one.txt", "/both.txt"}, "ANY mode must return the union of per-term matches"
+        # The both-terms doc must rank before the one-term doc (results are relevance-ordered).
+        assert paths.index("/both.txt") < paths.index("/one.txt"), (
+            f"both-terms doc must rank above one-term doc; got order {paths}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fulltext_match_all_requires_every_term(self, vfs_nts):
+        """FulltextMatchAllRequiresEveryTerm (SQLite): mode=ALL returns only docs with every term.
+
+        Same corpus as the ANY test; query "hello cloud" in mode=ALL returns only the
+        both-terms doc.  (See the ANY test for why "cloud" stands in for the spec's "s3":
+        the trigram tokenizer cannot index sub-trigram terms.)
+        """
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/one.txt", b"hello world", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/both.txt", b"hello cloud bucket", principal_id=agent.id)
+
+        results = await vfs_nts.search(
+            ns.id, "hello cloud", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ALL
+        )
+
+        assert {r.path for r in results} == {"/both.txt"}, "ALL mode must require every query term"
+
+    @pytest.mark.asyncio
+    async def test_ranked_fulltext_any_mode(self, vfs_nts):
+        """RankedFulltextAnyMode (SQLite): a both-terms doc ranks above a one-term doc in ANY mode."""
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/both.txt", b"alpha beta together", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/one.txt", b"alpha only here", principal_id=agent.id)
+
+        results = await vfs_nts.search(
+            ns.id, "alpha beta", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ANY
+        )
+
+        paths = [r.path for r in results]
+        assert set(paths) == {"/both.txt", "/one.txt"}
+        assert paths.index("/both.txt") < paths.index("/one.txt"), (
+            f"doc matching both terms must rank above doc matching one term; got {paths}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fulltext_any_mode_quote_escaping(self, vfs_nts):
+        """ANY mode quote escaping: a token containing '\"' is escaped (\"\") and does not raise.
+
+        Mirrors test_fulltext_injection_safe_operators for the OR-join path: an embedded
+        double-quote must be doubled into a literal phrase, never become an FTS5 operator.
+        """
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/q.txt", b'he said "hi" today', principal_id=agent.id)
+
+        # Token containing an embedded double-quote — must not raise an FTS5 syntax error,
+        # and the escaped phrase must still match the document literally.
+        results = await vfs_nts.search(
+            ns.id, 'said "hi"', "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ANY
+        )
+        assert {r.path for r in results} == {"/q.txt"}, (
+            "embedded-quote query in ANY mode must escape to a literal phrase that still matches"
+        )
+
+    @pytest.mark.asyncio
+    async def test_params_hash_drift_is_straggler_fails_loud(self, vfs_nts):
+        """A ready artifact whose params_hash no longer matches the active provider is a straggler.
+
+        The former straggler path verified (REGEX) or approximated (FULLTEXT) such entries
+        in-process; the native path now fails loud (ReindexRequiredError) for both search types —
+        reindex is the remedy, and no lazy backfill occurs (the artifact stays stale).
         """
         from datetime import datetime, timezone
 
+        from vfs.errors import ReindexRequiredError
         from vfs.models import SearchArtifact
 
         ns, agent = await _setup_vfs(vfs_nts)
-        # Three-line file; line 1 and line 3 match "TODO".
-        content = b"TODO first action\nnothing here\nTODO second action\n"
-        ver = await vfs_nts.write(ns.id, "/strag.txt", content, principal_id=agent.id)
-
+        ver = await vfs_nts.write(ns.id, "/strag.txt", b"hello world", principal_id=agent.id)
         nts = vfs_nts._meta.native_text_search()
 
-        # Corrupt the artifact's params_hash to force the straggler path.
+        # Drift the artifact's params_hash so it is no longer identity-current → straggler.
         stale_artifact = SearchArtifact(
             status="ready",
             schema_version=1,
@@ -529,15 +681,11 @@ class TestNativeTextSearchCapability:
         async with vfs_nts._meta.transaction():
             await vfs_nts._meta.update_search_artifact(ver.id, nts.provider_key, stale_artifact)
 
-        # Now search; the file must be verified via the straggler path.
-        results = await vfs_nts.search(ns.id, "TODO", "/", SearchType.REGEX, principal_id=agent.id)
+        with pytest.raises(ReindexRequiredError, match="reindex"):
+            await vfs_nts.search(ns.id, "hello", "/", SearchType.REGEX, principal_id=agent.id)
 
-        # Must produce per-line results matching both occurrences.
-        assert len(results) == 2, f"expected 2 results (one per matching line), got {len(results)}"
-        by_line = sorted(results, key=lambda r: r.line_number or 0)
-        assert by_line[0].line_number == 1
-        assert by_line[0].match_context == "TODO first action"
-        assert by_line[0].path == "/strag.txt"
-        assert by_line[1].line_number == 3
-        assert by_line[1].match_context == "TODO second action"
-        assert by_line[1].path == "/strag.txt"
+        # Still stale (no backfill happened) → FULLTEXT also fails loud, no inline approximation.
+        with pytest.raises(ReindexRequiredError, match="reindex"):
+            await vfs_nts.search(
+                ns.id, "hello", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ANY
+            )

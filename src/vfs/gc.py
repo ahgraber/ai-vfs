@@ -208,19 +208,28 @@ class GarbageCollector:
     async def _blob_gc(self) -> int:
         """Sweep orphaned blobs; also delete their text artifacts to keep metadata consistent.
 
-        For each blob whose content_hash has no remaining version references, text artifacts
-        are deleted before the blob so partial failures leave no dangling text rows.  Both
-        operations are idempotent, so a retry safely re-visits any hash that was partially
-        cleaned.
+        The reference check and the text-artifact deletion run inside one metadata transaction,
+        which holds the store lock for the critical section.  A concurrent write that revives a
+        ``content_hash`` therefore cannot interleave between the check and the deletion: it either
+        commits before the check (the live reference is seen and the hash is skipped) or after the
+        transaction (it re-indexes the text artifact via the write path).  This keeps a
+        live-referenced ``content_hash`` from ever having its text artifacts swept — the invariant
+        the removed query-time existence re-check incidentally guarded.
+
+        The blob delete follows the committed transaction; the cross-store blob/metadata race is
+        inherent (two independent stores, no shared transaction) and unchanged by this change.
+        Operations are idempotent, so a retry safely re-visits any partially-cleaned hash.
         """
         nts = self._meta.native_text_search()
         count = 0
         async for content_hash in self._blob.list_hashes():
-            if not await self._meta.has_version_references(content_hash):
+            async with self._meta.transaction():
+                if await self._meta.has_version_references(content_hash):
+                    continue
                 if nts is not None:
                     await nts.delete_text_artifacts([content_hash], [])
-                await self._blob.delete(content_hash)
-                count += 1
+            await self._blob.delete(content_hash)
+            count += 1
         return count
 
     async def sweep_retired_text_params(self, retired_params_hashes: list[str]) -> None:

@@ -265,3 +265,55 @@ class TestPublicContractSurface:
 
         for name in ["AnchorMap", "resolve_execution_provider", "AnchorConflictError", "VersionCollisionError"]:
             assert name in vfs.__all__, f"{name!r} missing from vfs.__all__"
+
+
+class TestFullTextMatchMode:
+    """FulltextMatchMode — enum definition and round-trip through SearchRequest."""
+
+    def test_members_importable_from_models(self):
+        """FullTextMatchMode.ALL/ANY are importable from vfs.models and equal themselves."""
+        from vfs.models import FullTextMatchMode
+
+        assert FullTextMatchMode.ALL == FullTextMatchMode.ALL
+        assert FullTextMatchMode.ANY == FullTextMatchMode.ANY
+        assert FullTextMatchMode.ALL != FullTextMatchMode.ANY
+        assert FullTextMatchMode.ALL.value == "all"
+        assert FullTextMatchMode.ANY.value == "any"
+
+    def _make_request(self, **kwargs):
+        from vfs.models import SearchType
+        from vfs.protocols.search import SearchRequest
+        from vfs.search.reader import ContentReader
+
+        reader = ContentReader(entries=[], blob=None, max_reads=0)
+        return SearchRequest(
+            query="hello s3",
+            scope="/",
+            search_type=SearchType.FULLTEXT,
+            search_metas=[],
+            read_content=reader,
+            **kwargs,
+        )
+
+    def test_match_mode_round_trips_as_enum(self):
+        """A FullTextMatchMode round-trips through SearchRequest.match_mode as the enum type."""
+        from vfs.models import FullTextMatchMode
+
+        req = self._make_request(match_mode=FullTextMatchMode.ANY)
+        assert req.match_mode is FullTextMatchMode.ANY
+        assert isinstance(req.match_mode, FullTextMatchMode)
+        assert req.match_mode != "any"  # the type is the enum, not a string
+
+    def test_default_match_mode_is_all(self):
+        """FulltextMatchModeDefaultIsAll: SearchRequest without match_mode defaults to ALL."""
+        from vfs.models import FullTextMatchMode
+
+        req = self._make_request()
+        assert req.match_mode == FullTextMatchMode.ALL
+
+    def test_explicit_any_match_mode(self):
+        """SearchRequest with match_mode=ANY yields ANY."""
+        from vfs.models import FullTextMatchMode
+
+        req = self._make_request(match_mode=FullTextMatchMode.ANY)
+        assert req.match_mode == FullTextMatchMode.ANY

@@ -37,7 +37,7 @@ import pytest_asyncio
 
 from vfs.config import VFSConfig
 from vfs.errors import SearchTypeUnsupportedError
-from vfs.models import SearchResult, SearchType
+from vfs.models import FullTextMatchMode, SearchResult, SearchType
 from vfs.protocols.search import (
     FindPredicates,
     SearchMetaEntry,
@@ -58,9 +58,6 @@ def _stub_nts(real_nts=None) -> MagicMock:
     stub = MagicMock()
     stub.provider_key = real_nts.provider_key if real_nts is not None else "test"
     stub.params_hash = real_nts.params_hash if real_nts is not None else "test"
-    # has_text_artifacts must be AsyncMock so 'await nts.has_text_artifacts(...)' works;
-    # side_effect returns all hashes as 'found' so no fresh entry gets reclassified.
-    stub.has_text_artifacts = AsyncMock(side_effect=lambda hashes, ph: set(hashes))
     return stub
 
 
@@ -205,6 +202,47 @@ class TestNativeCapabilityServesRegex:
         assert request_arg.search_type == SearchType.FULLTEXT
 
     @pytest.mark.asyncio
+    async def test_match_mode_any_reaches_search_text(self, vfs_instance):
+        """vfs.search(FULLTEXT, match_mode=ANY) threads ANY through to search_text.
+
+        Exercises the fresh_request reconstruction path: the request captured inside
+        search_text (the fresh_request, not the one built in vfs.search) must carry
+        match_mode=ANY.  This regression-covers the fresh_request write-site.
+        """
+        ns, p, _ = await _setup_vfs(vfs_instance)
+        await vfs_instance.write(ns.id, "/doc.txt", b"hello s3", principal_id=p.id)
+
+        _real_nts = vfs_instance._meta.native_text_search()
+        stub_nts = _stub_nts(_real_nts)
+        stub_nts.search_text = AsyncMock(return_value=SearchResponse(results=[]))
+        vfs_instance._meta.native_text_search = lambda: stub_nts
+
+        await vfs_instance.search(
+            ns.id, "hello s3", "/", SearchType.FULLTEXT, principal_id=p.id, match_mode=FullTextMatchMode.ANY
+        )
+
+        stub_nts.search_text.assert_called_once()
+        request_arg = stub_nts.search_text.call_args[0][0]
+        assert request_arg.match_mode == FullTextMatchMode.ANY
+
+    @pytest.mark.asyncio
+    async def test_match_mode_defaults_to_all_in_search_text(self, vfs_instance):
+        """FulltextMatchModeDefaultIsAll (threading): vfs.search without match_mode → ALL reaches search_text."""
+        ns, p, _ = await _setup_vfs(vfs_instance)
+        await vfs_instance.write(ns.id, "/doc.txt", b"hello s3", principal_id=p.id)
+
+        _real_nts = vfs_instance._meta.native_text_search()
+        stub_nts = _stub_nts(_real_nts)
+        stub_nts.search_text = AsyncMock(return_value=SearchResponse(results=[]))
+        vfs_instance._meta.native_text_search = lambda: stub_nts
+
+        await vfs_instance.search(ns.id, "hello s3", "/", SearchType.FULLTEXT, principal_id=p.id)
+
+        stub_nts.search_text.assert_called_once()
+        request_arg = stub_nts.search_text.call_args[0][0]
+        assert request_arg.match_mode == FullTextMatchMode.ALL
+
+    @pytest.mark.asyncio
     async def test_visible_version_ids_passed_to_capability(self, vfs_instance):
         """search_text receives fresh version_ids (all entries have usable artifacts here)."""
         ns, p, _ = await _setup_vfs(vfs_instance)
@@ -278,6 +316,47 @@ class TestGlobFindAlwaysAvailable:
         await vfs_instance.search(ns.id, "*.py", "/", SearchType.FIND, principal_id=p.id)
 
         stub_nts.search_text.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# FulltextMatchMode/MatchModeIgnoredForNonFulltext
+# ---------------------------------------------------------------------------
+
+
+class TestMatchModeIgnoredForNonFulltext:
+    """MatchModeIgnoredForNonFulltext: match_mode is acted on only by the FULLTEXT path.
+
+    For GLOB, FIND, and REGEX, passing ``match_mode=ANY`` must raise no error and return
+    exactly the same results as the same search with no ``match_mode`` argument (the
+    default ``ALL``).  This covers the non-FULLTEXT ignore path of the dispatch contract:
+    neither the DefaultSearchProvider GLOB/FIND/REGEX paths nor the native regex path read
+    the field.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("search_type", "query", "scope"),
+        [
+            (SearchType.GLOB, "*.py", "/src/"),
+            (SearchType.FIND, "*.py", "/"),
+            (SearchType.REGEX, "hello", "/"),
+        ],
+    )
+    async def test_match_mode_ignored_for_non_fulltext(self, vfs_instance, search_type, query, scope):
+        """match_mode=ANY yields the same result set as no match_mode for GLOB/FIND/REGEX."""
+        ns, p, _ = await _setup_vfs(vfs_instance)
+        await vfs_instance.write(ns.id, "/src/a.py", b"hello world\n", principal_id=p.id)
+        await vfs_instance.write(ns.id, "/src/b.txt", b"hello there\n", principal_id=p.id)
+
+        default_results = await vfs_instance.search(ns.id, query, scope, search_type, principal_id=p.id)
+        any_results = await vfs_instance.search(
+            ns.id, query, scope, search_type, principal_id=p.id, match_mode=FullTextMatchMode.ANY
+        )
+
+        # Guard against a vacuous pass: each parametrization must match a real file, so the
+        # equality below compares non-empty sets rather than {} == {}.
+        assert default_results, f"{search_type.value} fixture should match at least one file"
+        assert {r.path for r in any_results} == {r.path for r in default_results}
 
 
 # ---------------------------------------------------------------------------

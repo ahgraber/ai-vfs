@@ -5,11 +5,12 @@ failed) when that tokenizer is unavailable.
 
 Covers:
     ColdIndexFailsLoud/FreshIndexCompleteNoBlobReads
-    ColdIndexFailsLoud/BoundedStragglersVerified
-    ColdIndexFailsLoud/ColdIndexFailsLoud   (both error variants)
+    ColdIndexFailsLoud/AnyStragglerFailsLoud
+    ColdIndexFailsLoud/DecidedNonMatchExcluded
+    ColdIndexFailsLoud/IndexUnavailableFailsLoud
     ColdIndexFailsLoud/UndecodableContentIsUnsupported
     SearchMetaReindex/BatchReindex
-    SearchMetaReindex/LazyBackfillIsBoundedAndVfsOwned
+    SearchMetaReindex/SearchPerformsNoLazyBackfill
     SearchMetaReindex/RollbackCopiesSearchMeta
 """
 
@@ -135,52 +136,49 @@ class TestFreshIndexCompleteNoBlobReads:
 
 
 # ---------------------------------------------------------------------------
-# ColdIndexFailsLoud/BoundedStragglersVerified
+# ColdIndexFailsLoud/AnyStragglerFailsLoud
 # ---------------------------------------------------------------------------
 
 
-class TestBoundedStragglersVerified:
+class TestAnyStragglerFailsLoud:
+    """AnyStragglerFailsLoud: any in-scope straggler fails the search loud — no verify, no reads."""
+
     @pytest.mark.asyncio
-    async def test_straggler_verified_via_guarded_reader(self, vfs_nts):
-        """BoundedStragglersVerified: straggler files are read once and included if they match."""
+    async def test_single_straggler_fails_loud_regex(self, vfs_nts):
+        """A single missing-artifact straggler raises ReindexRequiredError with zero blob reads."""
         ns, agent = await _setup_vfs(vfs_nts)
         await vfs_nts.write(ns.id, "/indexed.txt", b"indexed phrase here", principal_id=agent.id)
         await vfs_nts.write(ns.id, "/straggler.txt", b"straggler phrase here", principal_id=agent.id)
-
-        # Make /straggler.txt a straggler by clearing its search_meta.
         await _clear_search_meta(vfs_nts, ns.id, "/straggler.txt")
 
         counting = _CountingBlobStore(vfs_nts._blob)
         vfs_nts._blob = counting
 
-        results = await vfs_nts.search(ns.id, "phrase", "/", SearchType.REGEX, principal_id=agent.id)
-
-        # Exactly one blob read for the straggler; none for the fresh indexed file.
-        assert counting.get_count == 1, "exactly one blob read for the one straggler"
-        assert {r.path for r in results} == {"/indexed.txt", "/straggler.txt"}
+        with pytest.raises(ReindexRequiredError, match="reindex"):
+            await vfs_nts.search(ns.id, "phrase", "/", SearchType.REGEX, principal_id=agent.id)
+        assert counting.get_count == 0, "fail-loud must not read blobs"
 
     @pytest.mark.asyncio
-    async def test_straggler_non_matching_not_included(self, vfs_nts):
-        """BoundedStragglersVerified: stragglers that do not match the pattern are excluded."""
+    async def test_single_straggler_fails_loud_fulltext(self, vfs_nts):
+        """A FULLTEXT search with any straggler fails loud — no inline approximation."""
         ns, agent = await _setup_vfs(vfs_nts)
-        await vfs_nts.write(ns.id, "/match.txt", b"target word inside", principal_id=agent.id)
-        await vfs_nts.write(ns.id, "/nomatch.txt", b"completely different content", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/indexed.txt", b"galaxy clusters", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/straggler.txt", b"galaxy winds", principal_id=agent.id)
+        await _clear_search_meta(vfs_nts, ns.id, "/straggler.txt")
 
-        # Both become stragglers.
-        await _clear_search_meta(vfs_nts, ns.id, "/match.txt")
-        await _clear_search_meta(vfs_nts, ns.id, "/nomatch.txt")
+        counting = _CountingBlobStore(vfs_nts._blob)
+        vfs_nts._blob = counting
 
-        results = await vfs_nts.search(ns.id, "target", "/", SearchType.REGEX, principal_id=agent.id)
-
-        assert {r.path for r in results} == {"/match.txt"}
+        with pytest.raises(ReindexRequiredError, match="reindex"):
+            await vfs_nts.search(ns.id, "galaxy", "/", SearchType.FULLTEXT, principal_id=agent.id)
+        assert counting.get_count == 0, "fail-loud must not read blobs"
 
     @pytest.mark.asyncio
-    async def test_straggler_with_stale_content_hash_verified(self, vfs_nts):
-        """BoundedStragglersVerified: a stale (wrong content_hash) artifact makes entry a straggler."""
+    async def test_stale_content_hash_is_straggler(self, vfs_nts):
+        """A ready artifact with a drifted content_hash is a straggler → fail loud."""
         ns, agent = await _setup_vfs(vfs_nts)
         ver = await vfs_nts.write(ns.id, "/stale.txt", b"fresh content here", principal_id=agent.id)
 
-        # Overwrite search_meta with an artifact that has a wrong content_hash.
         nts = vfs_nts._meta.native_text_search()
         stale_artifact = SearchArtifact(
             status="ready",
@@ -195,13 +193,43 @@ class TestBoundedStragglersVerified:
         )
         await vfs_nts._meta.update_search_artifact(ver.id, nts.provider_key, stale_artifact)
 
+        with pytest.raises(ReindexRequiredError, match="reindex"):
+            await vfs_nts.search(ns.id, "fresh content", "/", SearchType.REGEX, principal_id=agent.id)
+
+
+class TestDecidedNonMatchExcluded:
+    """DecidedNonMatchExcluded: identity-current unsupported/failed artifacts are excluded, not stragglers."""
+
+    @pytest.mark.asyncio
+    async def test_identity_current_failed_excluded_not_failloud(self, vfs_nts):
+        """An identity-current `failed` artifact is a decided non-match — excluded, no fail-loud, no reads."""
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/match.txt", b"target word inside", principal_id=agent.id)
+        ver = await vfs_nts.write(ns.id, "/failed.txt", b"target word also here", principal_id=agent.id)
+
+        # Mark /failed.txt with an identity-current 'failed' artifact (e.g. oversized at index time).
+        nts = vfs_nts._meta.native_text_search()
+        failed_artifact = SearchArtifact(
+            status="failed",
+            schema_version=1,
+            provider_key=nts.provider_key,
+            provider_version="1",
+            params_hash=nts.params_hash,
+            content_hash=ver.content_hash,
+            created_at=ver.created_at,
+            storage="inline",
+            error_code="too_large",
+            error_message="content exceeds index size limit",
+        )
+        await vfs_nts._meta.update_search_artifact(ver.id, nts.provider_key, failed_artifact)
+
         counting = _CountingBlobStore(vfs_nts._blob)
         vfs_nts._blob = counting
 
-        results = await vfs_nts.search(ns.id, "fresh content", "/", SearchType.REGEX, principal_id=agent.id)
+        results = await vfs_nts.search(ns.id, "target", "/", SearchType.REGEX, principal_id=agent.id)
 
-        assert counting.get_count == 1, "stale artifact causes one straggler read"
-        assert {r.path for r in results} == {"/stale.txt"}
+        assert counting.get_count == 0, "decided non-match must not read blobs and must not fail loud"
+        assert {r.path for r in results} == {"/match.txt"}, "failed-artifact file is excluded, not a straggler"
 
 
 # ---------------------------------------------------------------------------
@@ -224,34 +252,31 @@ class TestColdIndexFailsLoud:
             await vfs_nts.search(ns.id, "test", "/", SearchType.REGEX, principal_id=agent.id)
 
     @pytest.mark.asyncio
-    async def test_over_budget_stragglers_raise_reindex_required(self, vfs_nts):
-        """ColdIndexFailsLoud: straggler count > max_content_reads raises ReindexRequiredError."""
+    async def test_any_straggler_raises_reindex_required(self, vfs_nts):
+        """ColdIndexFailsLoud: a single straggler (not a budget overflow) raises ReindexRequiredError."""
         ns, agent = await _setup_vfs(vfs_nts)
-
-        # Write more files than the default max_content_reads (10) and make them all stragglers.
-        budget = SearchLimits().max_content_reads
-        for i in range(budget + 1):
-            await vfs_nts.write(ns.id, f"/file{i:02d}.txt", f"content {i}".encode(), principal_id=agent.id)
-            await _clear_search_meta(vfs_nts, ns.id, f"/file{i:02d}.txt")
+        await vfs_nts.write(ns.id, "/a.txt", b"content here", principal_id=agent.id)
+        await _clear_search_meta(vfs_nts, ns.id, "/a.txt")
 
         with pytest.raises(ReindexRequiredError, match="reindex"):
             await vfs_nts.search(ns.id, "content", "/", SearchType.REGEX, principal_id=agent.id)
 
     @pytest.mark.asyncio
-    async def test_reindex_required_message_includes_count(self, vfs_nts):
-        """ColdIndexFailsLoud: ReindexRequiredError message includes straggler count."""
+    async def test_reindex_required_message_names_scope(self, vfs_nts):
+        """ColdIndexFailsLoud: the error names a path-scoped reindex over the search scope, with a count."""
         ns, agent = await _setup_vfs(vfs_nts)
-        budget = SearchLimits().max_content_reads
-        for i in range(budget + 1):
-            await vfs_nts.write(ns.id, f"/f{i}.txt", b"x", principal_id=agent.id)
-            await _clear_search_meta(vfs_nts, ns.id, f"/f{i}.txt")
+        await vfs_nts.write(ns.id, "/sub/a.txt", b"x", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/sub/b.txt", b"x", principal_id=agent.id)
+        await _clear_search_meta(vfs_nts, ns.id, "/sub/a.txt")
+        await _clear_search_meta(vfs_nts, ns.id, "/sub/b.txt")
 
         with pytest.raises(ReindexRequiredError) as exc_info:
-            await vfs_nts.search(ns.id, "x", "/", SearchType.REGEX, principal_id=agent.id)
+            await vfs_nts.search(ns.id, "x", "/sub/", SearchType.REGEX, principal_id=agent.id)
 
-        # Error message must include both the count and the budget.
-        assert str(budget + 1) in str(exc_info.value)
-        assert str(budget) in str(exc_info.value)
+        msg = str(exc_info.value)
+        assert "/sub/" in msg, "message must name the search scope for a path-scoped reindex"
+        assert "2 file" in msg, "message includes the straggler count"
+        assert "reindex" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -287,56 +312,32 @@ class TestBinaryUnsupportedSkipsBudget:
         assert {r.path for r in results} == {"/text.txt"}
 
     @pytest.mark.asyncio
-    async def test_binary_straggler_self_heals_via_backfill(self, vfs_nts):
-        """B2: a binary straggler (no unsupported artifact) gets an 'unsupported' artifact backfilled."""
+    async def test_binary_straggler_with_no_artifact_fails_loud(self, vfs_nts):
+        """A binary file whose artifact was cleared is a straggler (absent artifact) → fail loud.
+
+        An absent artifact is indistinguishable from any other straggler; the search fails loud
+        rather than reading and self-healing. ``reindex`` then records the identity-current
+        ``unsupported`` artifact that makes the file a decided non-match thereafter.
+        """
         ns, agent = await _setup_vfs(vfs_nts)
 
         await vfs_nts.write(ns.id, "/binary.bin", b"\xff\xfe\x00binary", principal_id=agent.id)
         await vfs_nts.write(ns.id, "/text.txt", b"hello world", principal_id=agent.id)
-
-        # Remove the artifact for the binary file to make it a straggler.
         await _clear_search_meta(vfs_nts, ns.id, "/binary.bin")
 
-        # First search: binary is a straggler → UnicodeDecodeError → backfill 'unsupported'.
+        with pytest.raises(ReindexRequiredError, match="reindex"):
+            await vfs_nts.search(ns.id, "hello", "/", SearchType.REGEX, principal_id=agent.id)
+
+        # reindex records the unsupported artifact; the binary file is then a decided non-match.
+        await vfs_nts.reindex(ns.id)
         results = await vfs_nts.search(ns.id, "hello", "/", SearchType.REGEX, principal_id=agent.id)
         assert {r.path for r in results} == {"/text.txt"}
 
-        # After the search, the binary file should have an 'unsupported' artifact.
-        nts = vfs_nts._meta.native_text_search()
-        ver = await vfs_nts._meta.get_version(ns.id, "/binary.bin")
-        assert nts.provider_key in ver.search_meta
-        artifact = SearchArtifact.from_dict(ver.search_meta[nts.provider_key])
-        assert artifact.status == "unsupported"
 
-
-class TestExternalRecordMissingIsStraggler:
-    """S2 regression: a fresh artifact whose external text row is deleted becomes a straggler."""
-
-    @pytest.mark.asyncio
-    async def test_deleted_text_row_reclassified_as_straggler(self, vfs_nts):
-        """S2: deleting a text row out-of-band still returns the match via straggler verification.
-
-        The search_meta still says the artifact is 'ready' (external record reference),
-        but the actual text row in search_text_artifacts has been removed.  The VFS must
-        detect the missing record, reclassify the entry as a straggler, and verify it via
-        the guarded reader — not silently miss it.
-        """
-        ns, agent = await _setup_vfs(vfs_nts)
-
-        await vfs_nts.write(ns.id, "/doc.txt", b"unique searchable content", principal_id=agent.id)
-        ver = await vfs_nts._meta.get_version(ns.id, "/doc.txt")
-
-        # Confirm the artifact is fresh and the text row exists.
-        nts = vfs_nts._meta.native_text_search()
-        assert nts.provider_key in ver.search_meta
-
-        # Delete the text row using the NTS's own delete method (proper lock + commit).
-        await nts.delete_text_artifacts([ver.content_hash], [])
-
-        # search_meta still references the (now-missing) external record.
-        # The VFS must detect this via has_text_artifacts and reclassify as straggler.
-        results = await vfs_nts.search(ns.id, "unique searchable", "/", SearchType.REGEX, principal_id=agent.id)
-        assert {r.path for r in results} == {"/doc.txt"}
+# NOTE: the former S2 "external record missing → reclassified as straggler" defense is removed.
+# The native path no longer re-checks record existence per query; instead blob GC is made atomic
+# (NativeTextSearchStorage/LiveReferencedContentNeverSwept), so a live-referenced content_hash is
+# never swept and an identity-current 'ready' artifact always has its record present.
 
 
 class TestUndecodableContentIsUnsupported:
@@ -361,12 +362,11 @@ class TestUndecodableContentIsUnsupported:
         assert artifact.error_code == "decode_error"
 
     @pytest.mark.asyncio
-    async def test_binary_file_is_straggler_not_false_negative(self, vfs_nts):
-        """Binary files have 'unsupported' artifacts; they become stragglers (not excluded).
+    async def test_binary_file_is_decided_non_match(self, vfs_nts):
+        """A freshly-written binary file is a decided non-match (identity-current 'unsupported').
 
-        A straggler search via the guarded reader for a binary file produces no match
-        (strict UTF-8 decode fails, file skipped) but does NOT count as a false negative —
-        binary content cannot satisfy a text regex predicate.
+        Its artifact is excluded from results without a blob read and does NOT trigger fail-loud —
+        binary content cannot satisfy a text predicate.
         """
         ns, agent = await _setup_vfs(vfs_nts)
         await vfs_nts.write(ns.id, "/text.txt", b"searchable text", principal_id=agent.id)
@@ -374,7 +374,7 @@ class TestUndecodableContentIsUnsupported:
 
         results = await vfs_nts.search(ns.id, "searchable", "/", SearchType.REGEX, principal_id=agent.id)
 
-        # Only the text file matches; the binary file is skipped, not errored.
+        # Only the text file matches; the binary file is a decided non-match, excluded (not errored).
         assert {r.path for r in results} == {"/text.txt"}
 
 
@@ -458,69 +458,38 @@ class TestBatchReindex:
 
 
 # ---------------------------------------------------------------------------
-# SearchMetaReindex/LazyBackfillIsBoundedAndVfsOwned
+# SearchMetaReindex/SearchPerformsNoLazyBackfill
 # ---------------------------------------------------------------------------
 
 
-class TestLazyBackfillIsBoundedAndVfsOwned:
+class TestSearchPerformsNoLazyBackfill:
+    """SearchPerformsNoLazyBackfill: a fail-loud search writes nothing; reindex is the sole remedy."""
+
     @pytest.mark.asyncio
-    async def test_lazy_backfill_updates_artifact_after_straggler_read(self, vfs_nts):
-        """LazyBackfillIsBoundedAndVfsOwned: straggler verification triggers lazy index backfill."""
+    async def test_failloud_writes_nothing_and_reindex_is_the_remedy(self, vfs_nts):
         ns, agent = await _setup_vfs(vfs_nts)
-        await vfs_nts.write(ns.id, "/lazy.txt", b"lazy backfill content", principal_id=agent.id)
-        await _clear_search_meta(vfs_nts, ns.id, "/lazy.txt")
+        await vfs_nts.write(ns.id, "/doc.txt", b"recoverable content", principal_id=agent.id)
+        await _clear_search_meta(vfs_nts, ns.id, "/doc.txt")
 
-        # First search: straggler detected, read via guarded reader, result included.
-        results = await vfs_nts.search(ns.id, "lazy backfill", "/", SearchType.REGEX, principal_id=agent.id)
-        assert {r.path for r in results} == {"/lazy.txt"}
+        # First search fails loud and must NOT write an artifact (no lazy backfill).
+        with pytest.raises(ReindexRequiredError):
+            await vfs_nts.search(ns.id, "recoverable", "/", SearchType.REGEX, principal_id=agent.id)
 
-        # After the search, the straggler should have been lazily backfilled.
         nts = vfs_nts._meta.native_text_search()
-        ver = await vfs_nts._meta.get_version(ns.id, "/lazy.txt")
-        assert nts.provider_key in ver.search_meta, "lazy backfill must persist the artifact"
-        artifact = SearchArtifact.from_dict(ver.search_meta[nts.provider_key])
-        assert artifact.status == "ready"
+        ver = await vfs_nts._meta.get_version(ns.id, "/doc.txt")
+        assert nts.provider_key not in ver.search_meta, "fail-loud search must not backfill an artifact"
 
-    @pytest.mark.asyncio
-    async def test_lazy_backfill_enables_zero_reads_on_second_search(self, vfs_nts):
-        """LazyBackfillIsBoundedAndVfsOwned: second search after backfill uses zero blob reads."""
-        ns, agent = await _setup_vfs(vfs_nts)
-        await vfs_nts.write(ns.id, "/backfill.txt", b"backfill test text", principal_id=agent.id)
-        await _clear_search_meta(vfs_nts, ns.id, "/backfill.txt")
+        # A second search before reindex still fails loud (no self-healing happened).
+        with pytest.raises(ReindexRequiredError):
+            await vfs_nts.search(ns.id, "recoverable", "/", SearchType.REGEX, principal_id=agent.id)
 
-        # First search causes straggler read and lazy backfill.
-        await vfs_nts.search(ns.id, "backfill", "/", SearchType.REGEX, principal_id=agent.id)
-
-        # Second search: artifact now fresh → zero blob reads.
+        # reindex is the remedy — afterward the search succeeds with zero blob reads.
+        await vfs_nts.reindex(ns.id)
         counting = _CountingBlobStore(vfs_nts._blob)
         vfs_nts._blob = counting
-
-        results = await vfs_nts.search(ns.id, "backfill", "/", SearchType.REGEX, principal_id=agent.id)
-
-        assert counting.get_count == 0, "after lazy backfill, second search must use zero blob reads"
-        assert {r.path for r in results} == {"/backfill.txt"}
-
-    @pytest.mark.asyncio
-    async def test_lazy_backfill_bounded_by_max_content_reads(self, vfs_nts):
-        """LazyBackfillIsBoundedAndVfsOwned: lazy backfill is bounded by max_content_reads budget."""
-        ns, agent = await _setup_vfs(vfs_nts)
-        budget = SearchLimits().max_content_reads
-
-        # Write exactly `budget` stragglers (within budget) and one fresh file.
-        for i in range(budget):
-            await vfs_nts.write(ns.id, f"/s{i}.txt", f"target {i}".encode(), principal_id=agent.id)
-            await _clear_search_meta(vfs_nts, ns.id, f"/s{i}.txt")
-        await vfs_nts.write(ns.id, "/fresh.txt", b"fresh target", principal_id=agent.id)
-
-        counting = _CountingBlobStore(vfs_nts._blob)
-        vfs_nts._blob = counting
-
-        # `budget` stragglers ≤ max_content_reads → no ReindexRequiredError.
-        results = await vfs_nts.search(ns.id, "target", "/", SearchType.REGEX, principal_id=agent.id)
-
-        # Exactly `budget` reads (one per straggler); fresh file has zero reads.
-        assert counting.get_count == budget
-        assert len(results) == budget + 1  # all stragglers + the fresh file
+        results = await vfs_nts.search(ns.id, "recoverable", "/", SearchType.REGEX, principal_id=agent.id)
+        assert counting.get_count == 0
+        assert {r.path for r in results} == {"/doc.txt"}
 
 
 # ---------------------------------------------------------------------------
