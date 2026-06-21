@@ -36,64 +36,90 @@
           #     uv run pytest tests/integration -q
           #     podman compose -f tests/integration/docker-compose.yaml down -v
           #
-          # Compatible fallback: Colima (Lima VM running dockerd). If you already
-          # run Colima, the shellHook below auto-detects its docker socket; just:
-          #     colima start
-          #     docker compose -f tests/integration/docker-compose.yaml up -d
-          #   Note: Colima's docker runtime requires the docker CLI client on PATH.
-          #   pkgs.docker on darwin is client-only (clientOnly = true by default on
-          #   non-Linux), so it is safe to include here — no daemon is pulled in.
-          #
-          # The shellHook resolves DOCKER_HOST/CONTAINER_HOST in this order:
-          #   1. an already-running `podman machine` socket  (primary)
-          #   2. a running Colima docker socket               (fallback)
-          #   3. otherwise leaves the environment untouched   (default Docker /
-          #      Linux native socket — never override on non-darwin).
-          #
-          # One-command path: scripts/integration-tests.sh handles engine
-          # resolution, stack up/down, MinIO bucket creation, env exports, and
-          # pytest invocation automatically (see scripts/integration-tests.sh --help).
+          # Lazy bring-up (see containerShellHook below): the shellHook defines `podman` / `docker`
+          # wrapper functions so the FIRST command that needs the daemon ensures the machine's
+          # API socket is live — (re)starting the machine if the socket is missing. Nothing
+          # touches the daemon merely by entering the shell. On macOS the socket lives under
+          # /tmp, which the OS reaps after ~3 days (leaving the VM "running" but unreachable), so
+          # the wrapper checks the socket itself, not just `podman machine` state. The docker CLI
+          # client (pkgs.docker, client-only on darwin — no daemon pulled in) is wrapped the same
+          # way, pointed at the podman socket. Colima stays installed as a manual alternative but
+          # is no longer auto-wired.
           containerPackages =
             [
               pkgs.docker-compose # primary compose provider for `podman compose`
               pkgs.podman-compose # Docker-free compose fallback
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.podman # bundles vfkit + gvproxy on darwin
-              pkgs.colima # compatible fallback VM (dockerd in Lima)
+              pkgs.colima # manual fallback VM (dockerd in Lima); no longer auto-wired
               pkgs.qemu # colima's default VM backend
-              pkgs.docker # CLI client only on darwin (colima's docker runtime needs it)
             ];
 
-          # Darwin-only socket resolution. Guarded so Linux users of this flake
-          # (native daemon socket) are never affected.
+          # Real engine binaries, referenced by absolute store path from the shims below so the
+          # shims are the only `podman`/`docker` on the devshell PATH (no collision, and the shim
+          # deterministically wins over a system install).
+          podmanReal = "${pkgs.podman}/bin/podman"; # bundles vfkit + gvproxy on darwin
+          dockerReal = "${pkgs.docker}/bin/docker"; # CLI client only on darwin (no daemon)
+
+          # Lazy machine bring-up shared by both shims: ensure the podman machine's API socket is
+          # live, (re)starting the machine when it is missing. macOS reaps the socket from /tmp
+          # after ~3 days, leaving the VM "running" but unreachable, so we check the socket itself.
+          # When no machine exists at all, offer to `init` one — but only interactively (init is
+          # heavy: it downloads a VM image), and only when /dev/tty is reachable so non-interactive
+          # callers (CI, pytest subprocesses, direnv eval) fall back to a hint instead of hanging.
+          ensureMachineSnippet = ''
+            _aivfs_ensure() {
+              sock="$(${podmanReal} machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null || true)"
+              if [ -n "$sock" ] && [ -S "$sock" ]; then return 0; fi
+              state="$(${podmanReal} machine inspect --format '{{.State}}' 2>/dev/null || true)"
+              if [ -z "$state" ]; then
+                if ! { : < /dev/tty; } 2>/dev/null; then
+                  echo "aivfs: no podman machine — run 'podman machine init && podman machine start' once" >&2
+                  return 1
+                fi
+                printf 'aivfs: no podman machine. Initialize one now? This downloads a VM image. [Y/n] ' > /dev/tty
+                read -r reply < /dev/tty || reply=n
+                # Fail safe: only an affirmative reply (or bare Enter) triggers the heavy init.
+                case "$reply" in
+                  "" | [Yy]*) ;;
+                  *)
+                    echo "aivfs: skipped — run 'podman machine init && podman machine start' when ready" >&2
+                    return 1 ;;
+                esac
+                echo "aivfs: initializing podman machine (this can take a few minutes)..." >&2
+                ${podmanReal} machine init || { echo "aivfs: 'podman machine init' failed" >&2; return 1; }
+                ${podmanReal} machine start >/dev/null 2>&1 || { echo "aivfs: 'podman machine start' failed" >&2; return 1; }
+                return 0
+              fi
+              echo "aivfs: podman machine socket unavailable — (re)starting machine..." >&2
+              [ "$state" = "running" ] && ${podmanReal} machine stop >/dev/null 2>&1
+              ${podmanReal} machine start >/dev/null 2>&1 || { echo "aivfs: 'podman machine start' failed" >&2; return 1; }
+            }
+          '';
+
+          # Darwin-only PATH shims: `podman` / `docker` ensure the machine on first use, then exec
+          # the real binary. PATH shims (not shellHook functions) so the lazy bring-up works in any
+          # login shell — direnv exports env vars to zsh, but not bash functions.
+          containerShimPkgs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            (pkgs.writeShellScriptBin "podman" ''
+              ${ensureMachineSnippet}
+              # Pass machine management straight through (no ensure, no recursion).
+              if [ "''${1:-}" = "machine" ]; then exec ${podmanReal} "$@"; fi
+              _aivfs_ensure || exit 1
+              exec ${podmanReal} "$@"
+            '')
+            (pkgs.writeShellScriptBin "docker" ''
+              ${ensureMachineSnippet}
+              _aivfs_ensure || exit 1
+              sock="$(${podmanReal} machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null || true)"
+              exec env DOCKER_HOST="unix://$sock" ${dockerReal} "$@"
+            '')
+          ];
+
+          # Darwin-only: prefer Podman's compose provider. (Machine bring-up lives in the shims.)
           containerShellHook =
             pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
-              # Prefer Podman's compose provider (reference implementation) but
-              # respect an explicit override.
               export PODMAN_COMPOSE_PROVIDER="''${PODMAN_COMPOSE_PROVIDER:-docker-compose}"
-
-              if [ -z "''${DOCKER_HOST:-}" ] && [ -z "''${CONTAINER_HOST:-}" ]; then
-                _aivfs_colima_sock="$HOME/.colima/default/docker.sock"
-                # Discover the podman machine socket dynamically; the path lives
-                # under $TMPDIR (e.g. /var/folders/.../T/podman/...) and varies
-                # across podman versions and machines — do not hard-code it.
-                _aivfs_podman_sock=""
-                if command -v podman >/dev/null 2>&1; then
-                  _aivfs_podman_sock="$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null || true)"
-                fi
-                if [ -n "$_aivfs_podman_sock" ] && [ -S "$_aivfs_podman_sock" ]; then
-                  export DOCKER_HOST="unix://$_aivfs_podman_sock"
-                  export CONTAINER_HOST="unix://$_aivfs_podman_sock"
-                  echo "aivfs devshell: using podman machine socket ($DOCKER_HOST)"
-                elif [ -S "$_aivfs_colima_sock" ]; then
-                  export DOCKER_HOST="unix://$_aivfs_colima_sock"
-                  echo "aivfs devshell: using colima docker socket ($DOCKER_HOST)"
-                else
-                  echo "aivfs devshell: no container VM detected; run 'podman machine start' (or 'colima start') for integration tests"
-                fi
-                unset _aivfs_podman_sock _aivfs_colima_sock
-              fi
             '';
         in
         # pkgs.devshell.mkShell {
@@ -120,7 +146,9 @@
             # nodejs_20 # nodejs runtime v20 for v8 javascript
           ]
           #--- containers (see containerPackages above) ---
-          ++ containerPackages;
+          ++ containerPackages
+          #--- lazy podman/docker PATH shims (darwin) ---
+          ++ containerShimPkgs;
 
           # imports = [ (pkgs.devshell.importTOML ./devshell.toml) ];
           shellHook = containerShellHook;
