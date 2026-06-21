@@ -27,7 +27,7 @@ import importlib.util
 import logging
 import os
 
-from vfs.models import SearchType
+from vfs.models import FullTextMatchMode, SearchType
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -239,7 +239,37 @@ await vfs.write(
     content=b"def helper():\n    return 42\n",
     principal_id=admin_id,
 )
-print("seeded /src/main.py and /src/utils.py")
+print("seeded /src/main.py and /src/utils.py  (REGEX demo)")
+
+# A second, clearly-named corpus under /corpus/ for the FULLTEXT match-mode demo.
+# It is laid out so the query "hello postgres" separates ALL from ANY: one doc has
+# both terms, two have exactly one, and one has neither. Kept under /corpus/ so the
+# REGEX cell above (scoped to /src/) is untouched.
+await vfs.write(
+    namespace_id=ns_id,
+    path="/corpus/both.md",
+    content=b"hello there - this service stores its data in postgres\n",
+    principal_id=admin_id,
+)
+await vfs.write(
+    namespace_id=ns_id,
+    path="/corpus/hello_only.md",
+    content=b"hello world, just a friendly greeting\n",
+    principal_id=admin_id,
+)
+await vfs.write(
+    namespace_id=ns_id,
+    path="/corpus/postgres_only.md",
+    content=b"postgres handles the relational data layer\n",
+    principal_id=admin_id,
+)
+await vfs.write(
+    namespace_id=ns_id,
+    path="/corpus/neither.md",
+    content=b"the quick brown fox jumps over the lazy dog\n",
+    principal_id=admin_id,
+)
+print("seeded /corpus/{both,hello_only,postgres_only,neither}.md  (FULLTEXT demo)")
 
 # %%
 # REGEX via pg_trgm — zero blob reads when index is fresh.
@@ -254,18 +284,54 @@ print(f"REGEX 'def \\w+()':  {len(regex_results)} hit(s)")
 for r in sorted(regex_results, key=lambda x: (x.path, x.line_number or 0)):
     print(f"  {r.path}:{r.line_number}  {r.match_context!r}")
 
+# %% [markdown]
+# ### FULLTEXT match modes — ALL vs ANY
+#
+# A multi-term FULLTEXT query can combine its terms two ways:
+#
+# - **`ALL`** (strict-AND, the **default** — backward-compatible): a document must
+#   contain **every** query term.  The result is the strict intersection.
+# - **`ANY`** (ranked-OR union): a document matches if it contains **at least one**
+#   query term.  The result is the union, `ts_rank`-ranked so documents matching more (or
+#   rarer) terms rank above those matching only one.
+#
+# The cell below runs the **same** query — `"hello postgres"` — over the `/corpus/`
+# set in both modes so the contrast is explicit: `ALL` returns only `both.md`
+# (the one doc with both terms); `ANY` also surfaces `hello_only.md` and
+# `postgres_only.md`, with `both.md` ranked first.
+
 # %%
-# FULLTEXT BM25 — tsvector ranking, zero blob reads.
-ft_results = await vfs.search(
+# FULLTEXT ts_rank — same multi-term query, both match modes, side-by-side.
+ft_query = "hello postgres"
+ft_all = await vfs.search(
     namespace_id=ns_id,
-    query="hello postgres",
-    scope="/",
+    query=ft_query,
+    scope="/corpus/",
     search_type=SearchType.FULLTEXT,
+    match_mode=FullTextMatchMode.ALL,
     principal_id=admin_id,
 )
-print(f"FULLTEXT 'hello postgres':  {len(ft_results)} hit(s)  (BM25-ranked)")
-for r in ft_results:
-    print(f"  {r.path}  score={r.score:.4f}")
+ft_any = await vfs.search(
+    namespace_id=ns_id,
+    query=ft_query,
+    scope="/corpus/",
+    search_type=SearchType.FULLTEXT,
+    match_mode=FullTextMatchMode.ANY,
+    principal_id=admin_id,
+)
+
+
+def _show_ft(label: str, results) -> None:
+    """Print a labeled, relevance-ranked block for one match mode."""
+    print(f"{label}:  {len(results)} hit(s)")
+    for r in results:
+        print(f"    {r.path}  score={r.score:.4f}")
+
+
+print(f"FULLTEXT '{ft_query}'  (scope=/corpus/)\n")
+_show_ft("ALL  (strict-AND intersection, default)", ft_all)
+print()
+_show_ft("ANY  (ranked-OR union)", ft_any)
 
 # %% [markdown]
 # ## Cleanup

@@ -102,44 +102,16 @@ class TestSearchArtifactUsability:
         art = _artifact(status="unsupported")
         assert art.is_usable(current_content_hash="abcdef", active_params_hash="params1") is False
 
-    def test_external_ready_matching_readable_is_usable(self):
-        """ExternalReadableUsable: external artifact with readable identity-matched record → usable."""
-        art = _artifact(status="ready", storage="external", artifact_ref="sha256:abc")
-        assert (
-            art.is_usable(
-                current_content_hash="abcdef",
-                active_params_hash="params1",
-                external_readable=True,
-                external_identity_match=True,
-            )
-            is True
-        )
+    def test_external_ready_matching_is_usable(self):
+        """An external `ready` artifact with matching hashes is usable.
 
-    def test_external_missing_record_is_straggler(self):
-        """ExternalRecordMissingOrMismatchedIsStale: unreadable external record → not usable."""
+        The former external-record readability/identity check (and its `external_readable` /
+        `external_identity_match` params) is removed: the text record is content-addressed and
+        resident in the metadata store, so an identity-current artifact's record is always present
+        (blob GC never sweeps a live-referenced content_hash).
+        """
         art = _artifact(status="ready", storage="external", artifact_ref="sha256:abc")
-        assert (
-            art.is_usable(
-                current_content_hash="abcdef",
-                active_params_hash="params1",
-                external_readable=False,
-                external_identity_match=True,
-            )
-            is False
-        )
-
-    def test_external_mismatched_identity_is_straggler(self):
-        """ExternalRecordMissingOrMismatchedIsStale: mismatched external identity → not usable."""
-        art = _artifact(status="ready", storage="external", artifact_ref="sha256:abc")
-        assert (
-            art.is_usable(
-                current_content_hash="abcdef",
-                active_params_hash="params1",
-                external_readable=True,
-                external_identity_match=False,
-            )
-            is False
-        )
+        assert art.is_usable(current_content_hash="abcdef", active_params_hash="params1") is True
 
 
 # ---------------------------------------------------------------------------

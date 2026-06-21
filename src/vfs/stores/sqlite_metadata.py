@@ -12,7 +12,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from vfs.models import SearchArtifact, SearchResult, SearchType
+from vfs.models import FullTextMatchMode, SearchArtifact, SearchResult, SearchType
 from vfs.protocols.search import SearchResponse
 from vfs.stores.sql_metadata import BaseSqlMetadataStore
 
@@ -218,7 +218,7 @@ class _SQLiteNativeTextSearch:
             return SearchResponse()
 
         if request.search_type == SearchType.FULLTEXT:
-            return await self._fulltext_search(request.query, ch_to_entries)
+            return await self._fulltext_search(request.query, ch_to_entries, request.match_mode)
         else:
             return await self._regex_search(request.query, ch_to_entries)
 
@@ -278,20 +278,42 @@ class _SQLiteNativeTextSearch:
 
         return SearchResponse(results=results)
 
-    async def _fulltext_search(self, query: str, ch_to_entries: dict[str, list[Any]]) -> SearchResponse:
+    async def _fulltext_search(
+        self,
+        query: str,
+        ch_to_entries: dict[str, list[Any]],
+        mode: FullTextMatchMode = FullTextMatchMode.ALL,
+    ) -> SearchResponse:
         """FTS5 BM25 ranked fulltext search — results ordered by relevance.
 
         The user query is tokenized on whitespace and each token is quoted as an FTS5
-        phrase (double-quoted, with internal double-quotes doubled).  Tokens are AND-joined,
-        matching ``plainto_tsquery`` semantics: tokens are treated as literal words rather
-        than FTS5 operators, so ``c++`` does not raise a syntax error and ``foo OR barbaz``
-        does not become boolean OR.
+        phrase (double-quoted, with internal double-quotes doubled).  Tokens are treated as
+        literal words rather than FTS5 operators, so ``c++`` does not raise a syntax error
+        and a token like ``OR`` does not become boolean OR.
+
+        ``mode`` selects how the token phrases are combined:
+
+        - ``ALL`` (default, strict-AND): phrases are space-joined (``"tok1" "tok2"``),
+          matching ``plainto_tsquery`` semantics — a document must contain every term.
+        - ``ANY`` (ranked-OR): phrases are OR-joined (``"tok1" OR "tok2"``) — a document
+          matching at least one term is returned.
+
+        Injection safety is identical across modes: each token is double-quoted with the
+        same internal ``"`` → ``""`` escaping, so user input is always a literal phrase.
+        The only difference is the join string — a bare ASCII ``" "`` (ALL) or ``" OR "``
+        (ANY) inserted by this method, never derived from user input.  BM25 ranking
+        (``ORDER BY rank``) already scores documents matching more and rarer terms higher,
+        satisfying the ranked-OR contract without extra scoring machinery.
         """
         tokens = query.split()
         if not tokens:
             return SearchResponse()
         # Quote each token as an FTS5 phrase: "token" — internal '"' → '""'
-        fts_query = " ".join('"' + tok.replace('"', '""') + '"' for tok in tokens)
+        phrases = ['"' + tok.replace('"', '""') + '"' for tok in tokens]
+        # Join with a bare ASCII operator literal (not user-derived): " OR " for ANY,
+        # " " (implicit AND) for ALL.
+        join = " OR " if mode == FullTextMatchMode.ANY else " "
+        fts_query = join.join(phrases)
 
         results: list[SearchResult] = []
         async with self._store._operation():
@@ -309,24 +331,6 @@ class _SQLiteNativeTextSearch:
                 for entry in ch_to_entries[ch]:
                     results.append(SearchResult(path=entry.path, score=score))
         return SearchResponse(results=results)
-
-    async def has_text_artifacts(self, content_hashes: list[str], params_hash: str) -> set[str]:
-        """Return the subset of content_hashes that have a text row in the store.
-
-        Used by the VFS straggler classifier to detect external records deleted
-        out-of-band: entries whose record is missing are reclassified as stragglers
-        and verified individually via the guarded reader rather than silently missed.
-        """
-        if not content_hashes:
-            return set()
-        async with self._store._operation():
-            placeholders = ",".join("?" * len(content_hashes))
-            rows = await self._store._execute_fetchall(
-                f"SELECT content_hash FROM search_text_artifacts "  # noqa: S608 — {placeholders} is "?,?,?" only; table/column names are module constants
-                f"WHERE provider_key=? AND params_hash=? AND content_hash IN ({placeholders})",
-                (self.provider_key, params_hash) + tuple(content_hashes),
-            )
-        return {row[0] for row in rows}
 
     async def delete_text_artifacts(
         self,

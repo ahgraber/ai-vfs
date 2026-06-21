@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from vfs.models import FileMeta, SearchArtifact, SearchResult, SearchType
+from vfs.models import FileMeta, FullTextMatchMode, SearchArtifact, SearchResult, SearchType
 
 if TYPE_CHECKING:
     from vfs.search.reader import ContentReader
@@ -71,6 +71,8 @@ class SearchRequest:
     read_content: ContentReader  # type: ignore[type-arg]
     limits: SearchLimits = field(default_factory=SearchLimits)
     find_predicates: FindPredicates | None = None
+    # Applies only to FULLTEXT searches; ignored for GLOB, FIND, and REGEX.
+    match_mode: FullTextMatchMode = FullTextMatchMode.ALL
 
 
 @dataclass

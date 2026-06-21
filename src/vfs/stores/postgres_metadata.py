@@ -17,7 +17,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from vfs.models import SearchArtifact, SearchResult, SearchType
+from vfs.models import FullTextMatchMode, SearchArtifact, SearchResult, SearchType
 from vfs.protocols.search import SearchResponse
 from vfs.stores.sql_metadata import BaseSqlMetadataStore
 
@@ -37,6 +37,36 @@ _PG_PROVIDER_KEY: str = "vfs.postgres_fts"
 _PG_PARAMS_HASH: str = hashlib.sha256(b"postgres:tsvector+trgm:english:v1").hexdigest()[:16]
 
 
+def _build_fulltext_tsquery(query: str, mode: FullTextMatchMode) -> tuple[str, dict[str, str]] | None:
+    """Build the tsquery SQL fragment and its bound params for a fulltext query.
+
+    Returns ``(fragment, bindparams)`` where ``fragment`` is a SQL expression containing
+    only ``plainto_tsquery('english', :tN)`` calls referencing named placeholders, and
+    ``bindparams`` maps each placeholder to the user term it binds.  Returns ``None`` when
+    the query has no terms (empty or whitespace-only), so callers can short-circuit to an
+    empty response rather than emit invalid SQL.
+
+    - ``ALL`` (default): a single ``plainto_tsquery('english', :query)`` over the whole
+      query string — every term must appear (``plainto_tsquery`` AND-combines its lexemes).
+    - ``ANY``: the query is split on whitespace and each term gets its own
+      ``plainto_tsquery('english', :tN)`` call, OR-combined with the tsquery ``||``
+      operator.  A single-term query reduces to exactly one ``plainto_tsquery`` call,
+      identical to ``ALL``.
+
+    User terms are carried only as **separate bound parameters** (``:t0``, ``:t1``, …),
+    never string-interpolated into SQL.  ``plainto_tsquery`` (unlike ``to_tsquery``) never
+    raises on malformed input — it normalizes input to a safe lexeme sequence — so no term
+    can produce a syntax error.
+    """
+    terms = query.split()
+    if not terms:
+        return None
+    if mode == FullTextMatchMode.ANY:
+        fragment = " || ".join(f"plainto_tsquery('english', :t{i})" for i in range(len(terms)))
+        return fragment, {f"t{i}": term for i, term in enumerate(terms)}
+    return "plainto_tsquery('english', :query)", {"query": query}
+
+
 class _PostgresNativeTextSearch:
     """NativeTextSearch capability backed by PostgreSQL ``pg_trgm`` (regex) and ``to_tsvector`` / ``ts_rank`` (fulltext).
 
@@ -54,8 +84,9 @@ class _PostgresNativeTextSearch:
     a sequential scan of ``search_text_artifacts`` — correctness and zero-blob-read
     invariant hold; the sub-millisecond latency claim does not.
 
-    Fulltext path: ``plainto_tsquery('english', :query)`` matched against
-    ``to_tsvector('english', raw_text)``; results ranked by ``ts_rank``.
+    Fulltext path: ``plainto_tsquery`` matched against ``to_tsvector('english', raw_text)``,
+    ranked by ``ts_rank``.  In ``ALL`` mode a single ``plainto_tsquery('english', :query)``
+    is used; in ``ANY`` mode per-term ``plainto_tsquery`` calls are OR-combined with ``||``.
     """
 
     provider_key: str = _PG_PROVIDER_KEY
@@ -126,7 +157,7 @@ class _PostgresNativeTextSearch:
             return SearchResponse()
 
         if request.search_type == SearchType.FULLTEXT:
-            return await self._fulltext_search(request.query, ch_to_entries)
+            return await self._fulltext_search(request.query, ch_to_entries, request.match_mode)
         else:
             return await self._regex_search(request.query, ch_to_entries)
 
@@ -180,8 +211,41 @@ class _PostgresNativeTextSearch:
 
         return SearchResponse(results=results)
 
-    async def _fulltext_search(self, query: str, ch_to_entries: dict[str, list[Any]]) -> SearchResponse:
-        """``ts_rank`` ranked fulltext search via ``plainto_tsquery``."""
+    async def _fulltext_search(
+        self,
+        query: str,
+        ch_to_entries: dict[str, list[Any]],
+        mode: FullTextMatchMode = FullTextMatchMode.ALL,
+    ) -> SearchResponse:
+        """``ts_rank`` ranked fulltext search via ``plainto_tsquery``.
+
+        ``mode`` selects how the query terms are combined:
+
+        - ``ALL`` (default, strict-AND): a single ``plainto_tsquery('english', :query)`` is
+          used in both the ``@@`` match predicate and the ``ts_rank`` score — a document
+          must contain every term.
+        - ``ANY`` (ranked-OR): the query is split on whitespace and each term gets its own
+          ``plainto_tsquery('english', :tN)`` call, OR-combined with the tsquery ``||``
+          operator (``plainto_tsquery(:t0) || plainto_tsquery(:t1) || …``).  The same
+          OR-combined tsquery is used in both the ``@@`` predicate and the ``ts_rank``
+          score, so ``ts_rank`` scores documents matching more or rarer terms higher,
+          satisfying the ranked-OR contract.  A single-term query reduces to exactly one
+          ``plainto_tsquery`` call — identical to ``ALL``.
+
+        User terms are passed only as **separate bound parameters** (``:t0``, ``:t1``, …),
+        never string-interpolated into SQL.  ``plainto_tsquery`` (unlike ``to_tsquery``)
+        never raises on malformed input — it normalizes input to a safe lexeme sequence — so
+        no term can produce a syntax error.
+
+        An empty or whitespace-only query has no terms and returns an empty
+        :class:`SearchResponse` (matching the SQLite backend), rather than emitting an
+        invalid empty ``||`` expression.
+        """
+        built = _build_fulltext_tsquery(query, mode)
+        if built is None:
+            return SearchResponse()
+        tsquery_fragment, term_binds = built
+
         visible_hashes = list(ch_to_entries.keys())
         results: list[SearchResult] = []
 
@@ -189,23 +253,25 @@ class _PostgresNativeTextSearch:
             rows = (
                 await self._store._db.execute(
                     sa.text(
-                        """
+                        # tsquery_fragment contains only literal plainto_tsquery() calls
+                        # referencing :tN / :query placeholders — never user text.
+                        f"""
                         SELECT content_hash,
                                ts_rank(to_tsvector('english', raw_text),
-                                       plainto_tsquery('english', :query)) AS score
+                                       {tsquery_fragment}) AS score
                         FROM search_text_artifacts
                         WHERE provider_key = :pk
                           AND params_hash  = :ph
                           AND content_hash = ANY(:hashes)
                           AND to_tsvector('english', raw_text)
-                              @@ plainto_tsquery('english', :query)
+                              @@ ({tsquery_fragment})
                         ORDER BY score DESC
-                        """
+                        """  # noqa: S608 — fragment is module-built placeholders only; terms are bound params
                     ).bindparams(
                         pk=self.provider_key,
                         ph=self.params_hash,
                         hashes=visible_hashes,
-                        query=query,
+                        **term_binds,
                     )
                 )
             ).fetchall()
@@ -237,26 +303,6 @@ class _PostgresNativeTextSearch:
                         "DELETE FROM search_text_artifacts WHERE provider_key = :pk AND params_hash = ANY(:hashes)"
                     ).bindparams(pk=self.provider_key, hashes=retired_params_hashes)
                 )
-
-    async def has_text_artifacts(self, content_hashes: list[str], params_hash: str) -> set[str]:
-        """Return the subset of content_hashes that have a text row in the store.
-
-        Used by the VFS straggler classifier to detect external records deleted
-        out-of-band: entries whose record is missing are reclassified as stragglers
-        and verified individually via the guarded reader rather than silently missed.
-        """
-        if not content_hashes:
-            return set()
-        async with self._store._operation():
-            rows = (
-                await self._store._db.execute(
-                    sa.text(
-                        "SELECT content_hash FROM search_text_artifacts "
-                        "WHERE provider_key = :pk AND params_hash = :ph AND content_hash = ANY(:hashes)"
-                    ).bindparams(pk=self.provider_key, ph=params_hash, hashes=content_hashes)
-                )
-            ).fetchall()
-        return {row[0] for row in rows}
 
 
 # ---------------------------------------------------------------------------

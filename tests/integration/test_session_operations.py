@@ -97,6 +97,22 @@ class TestSessionProxiesVFS:
         assert paths == {"/workspace/src/main.py", "/workspace/src/util.py"}
 
     @pytest.mark.asyncio
+    async def test_session_search_forwards_match_mode(self):
+        """Session.search(match_mode=ANY) delegates to vfs.search with match_mode=ANY intact."""
+        from unittest.mock import AsyncMock
+
+        from vfs.models import FullTextMatchMode
+
+        mock_vfs = AsyncMock()
+        mock_vfs.search.return_value = []
+        session = Session(mock_vfs, "ns-id", "p-id")
+
+        await session.search("hello s3", "/", SearchType.FULLTEXT, match_mode=FullTextMatchMode.ANY)
+
+        mock_vfs.search.assert_awaited_once()
+        assert mock_vfs.search.call_args.kwargs["match_mode"] == FullTextMatchMode.ANY
+
+    @pytest.mark.asyncio
     async def test_session_versions_relative(self, vfs_instance):
         session, ns_id, p_id = await _setup_session(vfs_instance)
         await vfs_instance.write(ns_id, "/workspace/file.txt", b"v1", principal_id=p_id)

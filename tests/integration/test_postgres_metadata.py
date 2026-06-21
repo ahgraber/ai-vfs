@@ -26,7 +26,7 @@ import pytest_asyncio
 from ulid import ULID
 
 from vfs.errors import ConflictError
-from vfs.models import AuditEvent, FileMeta, Permission, SearchType, VersionMeta
+from vfs.models import AuditEvent, FileMeta, FullTextMatchMode, Permission, SearchType, VersionMeta
 
 _DSN = os.environ.get("AIVFS_TEST_POSTGRES_DSN")
 
@@ -114,6 +114,26 @@ async def pg_store(worker_dsn):
         pytest.skip(f"PostgreSQL worker database unreachable: {exc}")
 
     yield store
+    await store.close()
+
+
+@pytest_asyncio.fixture
+async def sqlite_nts():
+    """An in-memory SQLite ``NativeTextSearch`` alongside ``pg_store`` for cross-backend tests.
+
+    Mirrors the construction in ``tests/unit/test_native_text_search.py``: build a
+    ``SQLiteMetadataStore(":memory:")``, initialize it, and yield its ``native_text_search()``
+    capability.  Skips cleanly when the SQLite build lacks the FTS5 trigram tokenizer.
+    """
+    from vfs.stores.sqlite_metadata import SQLiteMetadataStore
+
+    store = SQLiteMetadataStore(":memory:")
+    await store.initialize()
+    nts = store.native_text_search()
+    if nts is None:
+        await store.close()
+        pytest.skip("FTS5 trigram tokenizer not available (SQLite < 3.34)")
+    yield nts
     await store.close()
 
 
@@ -315,16 +335,24 @@ def _search_meta_entry(path: str, content_hash: str):
     )
 
 
-def _req(query: str, search_type: SearchType, entries: list):
-    """Build a SearchRequest; read_content is None (Postgres NTS never calls it)."""
+def _req(query: str, search_type: SearchType, entries: list, match_mode: FullTextMatchMode | None = None):
+    """Build a SearchRequest; read_content is None (Postgres NTS never calls it).
+
+    ``match_mode`` is omitted from the constructor when ``None`` so its default (``ALL``)
+    is exercised; pass an explicit mode to drive the ANY/ALL fulltext paths.
+    """
     from vfs.protocols.search import SearchRequest
 
+    kwargs: dict = {}
+    if match_mode is not None:
+        kwargs["match_mode"] = match_mode
     return SearchRequest(
         query=query,
         scope="/",
         search_type=search_type,
         search_metas=entries,
         read_content=None,  # type: ignore[arg-type]
+        **kwargs,
     )
 
 
@@ -332,8 +360,8 @@ class TestPostgresNativeTextSearch:
     """NativeTextSearch capability integration tests for PostgreSQL.
 
     Covers regex (pg_trgm), fulltext (tsvector + ts_rank), delete_text_artifacts,
-    has_text_artifacts (S2), and the brute-force equivalence contract (including
-    trigram-unfriendly ``[0-9]+`` and alternation patterns).
+    and the brute-force equivalence contract (including trigram-unfriendly ``[0-9]+``
+    and alternation patterns).
 
     All tests skip cleanly when ``asyncpg`` is missing, ``AIVFS_TEST_POSTGRES_DSN`` is
     unset, or the server is unreachable (inherited from the module-level ``pytestmark``).
@@ -406,6 +434,103 @@ class TestPostgresNativeTextSearch:
             )
 
     @pytest.mark.asyncio
+    async def test_fulltext_match_any_ranks_union(self, pg_store):
+        """FulltextMatchAnyRanksUnion (Postgres): mode=ANY returns the union, both-terms doc ranks first.
+
+        Corpus: "hello world" (matches one term) and "hello cloud bucket" (matches both).
+        Query "hello cloud" in mode=ANY returns both; the both-terms doc ranks above the
+        one-term doc.  Terms are ≥3 chars to stay consistent with the SQLite-compatible
+        cross-backend corpus (Postgres itself handles short terms fine).
+        """
+        nts = pg_store.native_text_search()
+        ch_one = _ch("hello world")
+        ch_both = _ch("hello cloud bucket")
+        await nts.index_text(str(ULID()), ch_one, nts.params_hash, "hello world")
+        await nts.index_text(str(ULID()), ch_both, nts.params_hash, "hello cloud bucket")
+
+        entries = [_search_meta_entry("/one.txt", ch_one), _search_meta_entry("/both.txt", ch_both)]
+        response = await nts.search_text(
+            _req("hello cloud", SearchType.FULLTEXT, entries, match_mode=FullTextMatchMode.ANY), []
+        )
+
+        paths = [r.path for r in response.results]
+        assert set(paths) == {"/one.txt", "/both.txt"}, "ANY mode must return the union of per-term matches"
+        assert paths.index("/both.txt") < paths.index("/one.txt"), (
+            f"both-terms doc must rank above one-term doc; got order {paths}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fulltext_match_all_requires_every_term(self, pg_store):
+        """FulltextMatchAllRequiresEveryTerm (Postgres): mode=ALL returns only docs with every term.
+
+        Same corpus as the ANY test; query "hello cloud" in mode=ALL returns only the
+        both-terms doc ("hello world" lacks "cloud").
+        """
+        nts = pg_store.native_text_search()
+        ch_one = _ch("hello world")
+        ch_both = _ch("hello cloud bucket")
+        await nts.index_text(str(ULID()), ch_one, nts.params_hash, "hello world")
+        await nts.index_text(str(ULID()), ch_both, nts.params_hash, "hello cloud bucket")
+
+        entries = [_search_meta_entry("/one.txt", ch_one), _search_meta_entry("/both.txt", ch_both)]
+        response = await nts.search_text(
+            _req("hello cloud", SearchType.FULLTEXT, entries, match_mode=FullTextMatchMode.ALL), []
+        )
+
+        assert {r.path for r in response.results} == {"/both.txt"}, "ALL mode must require every query term"
+
+    @pytest.mark.asyncio
+    async def test_ranked_fulltext_any_mode(self, pg_store):
+        """RankedFulltextAnyMode (Postgres): a both-terms doc ranks above a one-term doc in ANY mode."""
+        nts = pg_store.native_text_search()
+        ch_both = _ch("hello cloud bucket")
+        ch_one = _ch("hello world")
+        await nts.index_text(str(ULID()), ch_both, nts.params_hash, "hello cloud bucket")
+        await nts.index_text(str(ULID()), ch_one, nts.params_hash, "hello world")
+
+        entries = [_search_meta_entry("/both.txt", ch_both), _search_meta_entry("/one.txt", ch_one)]
+        response = await nts.search_text(
+            _req("hello cloud", SearchType.FULLTEXT, entries, match_mode=FullTextMatchMode.ANY), []
+        )
+
+        paths = [r.path for r in response.results]
+        assert set(paths) == {"/both.txt", "/one.txt"}
+        assert paths.index("/both.txt") < paths.index("/one.txt"), (
+            f"doc matching both terms must rank above doc matching one term; got {paths}"
+        )
+        scores = {r.path: r.score for r in response.results}
+        assert scores["/both.txt"] >= scores["/one.txt"], (
+            f"both-terms ts_rank {scores['/both.txt']:.4f} must be >= one-term {scores['/one.txt']:.4f}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fulltext_single_term_any_equals_all(self, pg_store):
+        """Single-term degenerate case (Postgres): one-term ANY == one-term ALL result set.
+
+        With a single term the ANY construction reduces to one plainto_tsquery call —
+        identical to ALL — so both modes return the same documents.
+        """
+        nts = pg_store.native_text_search()
+        ch_hit = _ch("hello cloud bucket")
+        ch_miss = _ch("java scala kotlin")
+        await nts.index_text(str(ULID()), ch_hit, nts.params_hash, "hello cloud bucket")
+        await nts.index_text(str(ULID()), ch_miss, nts.params_hash, "java scala kotlin")
+
+        entries = [_search_meta_entry("/hit.txt", ch_hit), _search_meta_entry("/miss.txt", ch_miss)]
+
+        any_resp = await nts.search_text(
+            _req("hello", SearchType.FULLTEXT, entries, match_mode=FullTextMatchMode.ANY), []
+        )
+        all_resp = await nts.search_text(
+            _req("hello", SearchType.FULLTEXT, entries, match_mode=FullTextMatchMode.ALL), []
+        )
+
+        assert {r.path for r in any_resp.results} == {"/hit.txt"}
+        assert {r.path for r in any_resp.results} == {r.path for r in all_resp.results}, (
+            "single-term ANY must match single-term ALL result set"
+        )
+
+    @pytest.mark.asyncio
     async def test_delete_text_artifacts_by_content_hash(self, pg_store):
         """delete_text_artifacts(content_hashes) removes indexed content so subsequent search returns nothing."""
         nts = pg_store.native_text_search()
@@ -442,22 +567,52 @@ class TestPostgresNativeTextSearch:
         assert after.results == [], "retired-params records must be deleted"
 
     @pytest.mark.asyncio
-    async def test_has_text_artifacts(self, pg_store):
-        """S2 (Postgres): has_text_artifacts returns only the subset of hashes that exist in the store."""
+    async def test_live_referenced_content_never_swept(self, pg_store, tmp_path):
+        """LiveReferencedContentNeverSwept (Postgres): GC honors a live reference under a real transaction.
+
+        The reference check and the text-artifact deletion run in one BaseSqlMetadataStore
+        transaction (the same path SQLite uses), so a live-referenced content_hash keeps both its
+        blob and its text artifacts — the invariant the removed query-time existence re-check
+        incidentally guarded.
+        """
+        from vfs.config import VFSConfig
+        from vfs.gc import GarbageCollector
+        from vfs.stores.local_blob import LocalFSBlobStore
+
         nts = pg_store.native_text_search()
-        ch_present = _ch("this is present in store")
-        ch_absent = _ch("this was never indexed")
+        blob_store = LocalFSBlobStore(tmp_path / "blobs")
 
-        await nts.index_text(str(ULID()), ch_present, nts.params_hash, "this is present in store")
+        content = b"keep me alive"
+        content_hash = _ch("keep me alive")
+        await blob_store.put(content_hash, content)
+        await nts.index_text(str(ULID()), content_hash, nts.params_hash, content.decode())
 
-        found = await nts.has_text_artifacts([ch_present, ch_absent], nts.params_hash)
-        assert found == {ch_present}
+        # A live (non-tombstone) version references the content.
+        v = VersionMeta(
+            id=str(ULID()),
+            file_path="/live.txt",
+            namespace_id="ns",
+            version_number=1,
+            content_hash=content_hash,
+            size=len(content),
+            created_at=_now(),
+            created_by="tester",
+        )
+        await pg_store.put_version(v, expected_version=None)
+        assert await pg_store.has_version_references(content_hash)
 
-        # Empty input returns empty set.
-        assert await nts.has_text_artifacts([], nts.params_hash) == set()
+        gc = GarbageCollector(pg_store, blob_store, VFSConfig(audit_log_enabled=False))
+        result = await gc.run()
+
+        assert result.blobs_reclaimed == 0, "a live-referenced hash must not be swept"
+        assert await blob_store.get(content_hash) == content, "blob for a live-referenced hash must survive"
+        # The text artifact must survive too — search still finds the content.
+        entry = _search_meta_entry("/live.txt", content_hash)
+        resp = await nts.search_text(_req("keep", SearchType.REGEX, [entry]), [v.id])
+        assert {r.path for r in resp.results} == {"/live.txt"}, "text artifact must survive GC"
 
     @pytest.mark.asyncio
-    async def test_result_set_equivalent_to_brute_force(self, pg_store):
+    async def test_result_set_equivalent_to_brute_force(self, pg_store, sqlite_nts):
         """ResultSetEquivalentToBruteForce (Postgres leg): NTS and Python brute-force agree.
 
         Patterns include:
@@ -466,6 +621,10 @@ class TestPostgresNativeTextSearch:
         - ``cat|dogs``: two-branch alternation.
         - ``\\|``: escaped pipe matches literal ``|`` character.
         - ``order``: ordinary literal.
+
+        Also formalizes the existing ALL-mode FULLTEXT behavior with an explicit
+        cross-backend leg: the same multi-term query in ``mode=ALL`` returns the same path
+        set on SQLite and Postgres (terms ≥3 chars for the SQLite FTS5 trigram floor).
         """
         nts = pg_store.native_text_search()
 
@@ -502,3 +661,82 @@ class TestPostgresNativeTextSearch:
             brute_paths = {p for p, text in documents.items() if re.search(pattern, text)}
 
             assert pg_paths == brute_paths, f"pattern {pattern!r}: Postgres={pg_paths} != brute-force={brute_paths}"
+
+        # --- FULLTEXT mode=ALL cross-backend equivalence -------------------------------
+        # Formalizes the existing ALL-mode contract: a multi-term query in mode=ALL returns
+        # the same path set on both native backends. Corpus has one doc matching every term,
+        # one matching a subset, and one matching neither, so the ALL result is non-trivial.
+        ft_documents = {
+            "/world.txt": "hello world",  # matches "hello" only → excluded by ALL
+            "/cloud.txt": "hello cloud bucket",  # matches both "hello" and "cloud"
+            "/other.txt": "random python content",  # matches neither
+        }
+        ft_entries = []
+        for path, text in ft_documents.items():
+            ch = _ch(text)
+            await nts.index_text(str(ULID()), ch, nts.params_hash, text)
+            await sqlite_nts.index_text(str(ULID()), ch, sqlite_nts.params_hash, text)
+            ft_entries.append(_search_meta_entry(path, ch))
+
+        ft_req = _req("hello cloud", SearchType.FULLTEXT, ft_entries, match_mode=FullTextMatchMode.ALL)
+        pg_ft = await nts.search_text(ft_req, [])
+        sqlite_ft = await sqlite_nts.search_text(ft_req, [])
+
+        assert {r.path for r in pg_ft.results} == {r.path for r in sqlite_ft.results} == {"/cloud.txt"}, (
+            f"ALL-mode FULLTEXT path set must match across backends; "
+            f"pg={ {r.path for r in pg_ft.results} } sqlite={ {r.path for r in sqlite_ft.results} }"
+        )
+
+    @pytest.mark.asyncio
+    async def test_any_mode_result_set_equivalent_across_backends(self, pg_store, sqlite_nts):
+        """AnyModeResultSetEquivalentAcrossBackends: SQLite and Postgres agree on the ANY path set.
+
+        Brute-force does NOT participate (there is no single-pass ranked-OR baseline); this
+        compares the two native backends only.  Corpus has one doc matching both query
+        terms, one matching each single term, and one matching neither, so the ANY union is
+        non-trivial.  Asserts an identical path set across backends and that the both-terms
+        doc outranks each one-term doc on each backend independently — scores are NOT
+        compared across backends (BM25 vs ts_rank differ).  Terms are ≥3 chars for the
+        SQLite FTS5 trigram floor.
+        """
+        from pyleak import no_task_leaks
+
+        pg_nts = pg_store.native_text_search()
+
+        documents = {
+            "/both.txt": "hello cloud bucket",  # matches both "hello" and "cloud"
+            "/hello.txt": "hello world",  # matches "hello" only
+            "/cloud.txt": "cloud storage system",  # matches "cloud" only
+            "/none.txt": "random python content",  # matches neither
+        }
+
+        entries = []
+        for path, text in documents.items():
+            ch = _ch(text)
+            await pg_nts.index_text(str(ULID()), ch, pg_nts.params_hash, text)
+            await sqlite_nts.index_text(str(ULID()), ch, sqlite_nts.params_hash, text)
+            entries.append(_search_meta_entry(path, ch))
+
+        req = _req("hello cloud", SearchType.FULLTEXT, entries, match_mode=FullTextMatchMode.ANY)
+
+        # Act: run the same ANY-mode FULLTEXT query against both native backends.
+        async with no_task_leaks(action="raise"):
+            pg_resp = await pg_nts.search_text(req, [])
+            sqlite_resp = await sqlite_nts.search_text(req, [])
+
+        pg_paths = [r.path for r in pg_resp.results]
+        sqlite_paths = [r.path for r in sqlite_resp.results]
+        expected_union = {"/both.txt", "/hello.txt", "/cloud.txt"}
+
+        assert set(pg_paths) == set(sqlite_paths) == expected_union, (
+            f"ANY-mode path set must be identical across backends; pg={set(pg_paths)} sqlite={set(sqlite_paths)}"
+        )
+
+        # Monotonic ordering, asserted per backend (scores not compared across backends).
+        for label, paths in (("postgres", pg_paths), ("sqlite", sqlite_paths)):
+            assert paths.index("/both.txt") < paths.index("/hello.txt"), (
+                f"{label}: both-terms doc must rank above the hello-only doc; got {paths}"
+            )
+            assert paths.index("/both.txt") < paths.index("/cloud.txt"), (
+                f"{label}: both-terms doc must rank above the cloud-only doc; got {paths}"
+            )

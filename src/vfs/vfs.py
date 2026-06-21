@@ -9,7 +9,6 @@ import importlib.util
 import inspect
 import logging
 import posixpath
-import re
 import time
 
 import blake3
@@ -31,6 +30,7 @@ from vfs.errors import (
 from vfs.models import (
     AuditEvent,
     FileMeta,
+    FullTextMatchMode,
     Namespace,
     Permission,
     Principal,
@@ -106,26 +106,6 @@ def _load_optional_adapter(scheme: str, spec: tuple[str, str, str, str]) -> type
 
 _MAX_WRITE_RETRIES: int = 5
 """Maximum number of times VFS write/copy/move retries on a version-number collision."""
-
-
-def _straggler_regex_results(path: str, text: str, query: str) -> list:
-    """Return per-line SearchResult entries for ``text`` matching ``query`` (REGEX).
-
-    Mirrors ``DefaultSearchProvider._regex_search`` semantics: one result per
-    matching line, ``line_number`` 1-based, ``match_context`` is the stripped line.
-    Returns an empty list when ``query`` is not a valid regex.
-    """
-    from vfs.models import SearchResult
-
-    try:
-        compiled = re.compile(query)
-    except re.error:
-        return []
-    results = []
-    for line_num, line in enumerate(text.splitlines(), start=1):
-        if compiled.search(line):
-            results.append(SearchResult(path=path, line_number=line_num, match_context=line.strip()))
-    return results
 
 
 def _require_canonical(path: str) -> None:
@@ -546,6 +526,10 @@ class VFS:
                     size=src_version.size,
                     created_at=now,
                     created_by=principal_id,
+                    # Copy search_meta from the source: the text record is content-addressed by
+                    # content_hash (shared with the source), so the copied artifact stays
+                    # identity-current and the copy is immediately searchable without reindex.
+                    search_meta=src_version.search_meta,
                 )
                 try:
                     await self._meta.put_version(new_version, expected_version=expected_version)
@@ -633,6 +617,9 @@ class VFS:
                         size=src_version.size,
                         created_at=now,
                         created_by=principal_id,
+                        # Carry search_meta to the destination: content-addressed by content_hash
+                        # (shared with the source), so the moved file is searchable without reindex.
+                        search_meta=src_version.search_meta,
                     )
                 else:
                     now = datetime.now(timezone.utc)
@@ -780,8 +767,12 @@ class VFS:
         *,
         principal_id: str,
         find_predicates: FindPredicates | None = None,
+        match_mode: FullTextMatchMode = FullTextMatchMode.ALL,
     ) -> list[SearchResult]:
         """Search files in scope, silently pruning results the principal cannot read.
+
+        ``match_mode`` applies only to ``FULLTEXT`` searches (``ALL`` = strict-AND,
+        ``ANY`` = ranked-OR); it is ignored for GLOB, FIND, and REGEX.
 
         Dispatch rules
         --------------
@@ -877,6 +868,7 @@ class VFS:
                 read_content=reader,
                 limits=limits,
                 find_predicates=find_predicates,
+                match_mode=match_mode,
             )
 
             # Dispatch: route by search type and available capability
@@ -891,11 +883,7 @@ class VFS:
                         nts=nts,
                         entries=entries,
                         request=request,
-                        reader=reader,
                         namespace_id=namespace_id,
-                        search_type=search_type,
-                        query=query,
-                        limits=limits,
                     )
                 elif search_type == SearchType.FULLTEXT:
                     raise SearchTypeUnsupportedError(
@@ -1056,97 +1044,66 @@ class VFS:
         nts,
         entries,
         request,
-        reader,
         namespace_id: str,
-        search_type,
-        query: str,
-        limits,
     ):
         """Serve a REGEX/FULLTEXT search via the NativeTextSearch capability.
 
-        Classifies each visible entry as *fresh* (usable artifact), *confirmed non-match*
-        (identity-matched ``unsupported`` artifact — binary content), or *straggler*
-        (missing, failed, or stale artifact).  Fresh entries are served by the capability
-        without any blob read.  Confirmed non-matches are skipped entirely and do not
-        count against the straggler budget.  Stragglers are verified individually via the
-        guarded reader up to ``limits.max_content_reads``.
-
-        Fresh entries whose external text record has been deleted out-of-band (detected
-        via ``nts.has_text_artifacts``) are reclassified as stragglers so they are
-        verified individually rather than silently missed.
+        A fresh native index is authoritative.  Each visible entry is classified as
+        *decided* — an identity-current artifact: a ``ready`` artifact answers from the
+        stored text, while an ``unsupported`` or ``failed`` artifact is a confirmed
+        non-match (binary or un-indexable content cannot satisfy a text predicate) and is
+        excluded — or a *straggler* (artifact absent or identity-drifted).  Decided/``ready``
+        entries are served by the capability with zero blob reads.  If any in-scope entry is
+        a straggler, the search fails loud: a fresh index is authoritative and a stale one is
+        repaired by ``vfs.reindex()`` over the search scope, never verified or approximated at
+        query time.
 
         Raises
         ------
         ReindexRequiredError
-            When the straggler count exceeds ``limits.max_content_reads`` — serving
-            the search would require unbounded blob reads.  Run ``vfs.reindex()``
-            to rebuild the index.
+            When any in-scope entry is a straggler (artifact missing or identity-drifted).
+            Run ``vfs.reindex()`` over the named scope to rebuild the index.
         IndexUnavailableError
             When the index store raises during the capability search call.  Run
             ``vfs.reindex()`` after the store issue is resolved.
-
-        Note on fulltext straggler scores
-        ----------------------------------
-        Fresh fulltext results are ranked by the native BM25/ts_rank score.  Straggler
-        fulltext results use a naive token-AND match and are appended with score=1.0
-        after the ranked fresh results.  The merged list is therefore not globally
-        sorted by relevance when stragglers are present.
         """
-        # Classify entries: fresh (usable), confirmed non-match (binary), or straggler
+        # Classify: fresh (ready + identity-current), confirmed non-match (identity-current
+        # unsupported/failed), or straggler (artifact absent or identity-drifted).
         fresh_entries = []
-        straggler_entries = []
+        straggler_count = 0
         for entry in entries:
             artifact_dict = entry.search_meta.get(nts.provider_key)
             if artifact_dict is None:
-                straggler_entries.append(entry)
+                straggler_count += 1
                 continue
             try:
                 artifact = SearchArtifact.from_dict(artifact_dict)
-                # B2: An identity-matched 'unsupported' artifact (content_hash and
-                # params_hash current) is a confirmed non-match for text predicates —
-                # binary content cannot satisfy any regex or fulltext query.  Skip it
-                # without counting against the straggler budget.
-                if (
-                    artifact.status == "unsupported"
-                    and artifact.content_hash == entry.content_hash
-                    and artifact.params_hash == nts.params_hash
-                ):
-                    continue  # confirmed non-match — excluded from budget
-                if artifact.is_usable(
-                    current_content_hash=entry.content_hash,
-                    active_params_hash=nts.params_hash,
-                ):
-                    fresh_entries.append(entry)
-                else:
-                    straggler_entries.append(entry)
-            except Exception:  # noqa: BLE001 — malformed artifact treated as straggler
-                straggler_entries.append(entry)
+            except Exception:  # noqa: BLE001 — malformed artifact is a straggler
+                straggler_count += 1
+                continue
+            identity_current = artifact.content_hash == entry.content_hash and artifact.params_hash == nts.params_hash
+            if identity_current and artifact.status in ("unsupported", "failed"):
+                # Decided non-match: binary or otherwise un-indexable content cannot satisfy
+                # a text predicate.  Excluded without a blob read; not a straggler.
+                continue
+            if artifact.is_usable(
+                current_content_hash=entry.content_hash,
+                active_params_hash=nts.params_hash,
+            ):
+                fresh_entries.append(entry)
+            else:
+                straggler_count += 1
 
-        # S2: Verify that external text records exist for fresh entries (detects out-of-band
-        # deletes from search_text_artifacts).  Entries whose record is missing are
-        # reclassified as stragglers so they are verified via the guarded reader rather than
-        # silently missed.  All current NTS implementations use 'external' storage, so this
-        # check covers all fresh entries.
-        if fresh_entries:
-            unique_fresh_hashes = list({e.content_hash for e in fresh_entries})
-            found_hashes = await nts.has_text_artifacts(unique_fresh_hashes, nts.params_hash)
-            still_fresh = []
-            for entry in fresh_entries:
-                if entry.content_hash in found_hashes:
-                    still_fresh.append(entry)
-                else:
-                    straggler_entries.append(entry)
-            fresh_entries = still_fresh
-
-        # Fail loud when straggler count would require unbounded reads
-        if len(straggler_entries) > limits.max_content_reads:
+        # Any straggler fails loud — a fresh index is authoritative; a stale one is repaired by
+        # reindex over the search scope, not verified or approximated at query time.
+        if straggler_count:
             raise ReindexRequiredError(
-                f"{len(straggler_entries)} file(s) in the search scope lack a fresh "
-                f"index artifact (budget: {limits.max_content_reads}). "
-                f"Run vfs.reindex({namespace_id!r}) to rebuild the index."
+                f"{straggler_count} file(s) in scope {request.scope!r} lack a fresh index "
+                f"artifact. Run vfs.reindex({namespace_id!r}, scope={request.scope!r}) to "
+                f"rebuild the index for that subtree."
             )
 
-        # Search fresh entries via native capability (zero blob reads)
+        # Serve decided/ready entries via the native capability (zero blob reads).
         fresh_request = SearchRequest(
             query=request.query,
             scope=request.scope,
@@ -1155,68 +1112,17 @@ class VFS:
             read_content=request.read_content,
             limits=request.limits,
             find_predicates=request.find_predicates,
+            match_mode=request.match_mode,
         )
         fresh_version_ids = [e.version_id for e in fresh_entries]
         try:
-            response = await nts.search_text(fresh_request, fresh_version_ids)
+            return await nts.search_text(fresh_request, fresh_version_ids)
         except Exception as exc:
             raise IndexUnavailableError(
                 f"The native search index is unavailable. "
                 f"Run vfs.reindex({namespace_id!r}) after resolving the store issue. "
                 f"Cause: {exc}"
             ) from exc
-
-        # Verify stragglers via guarded reader; backfill index after verification
-        for entry in straggler_entries:
-            content = await reader.read(entry.path)
-            # Strict UTF-8: binary content cannot be regex/fulltext searched
-            try:
-                text = content.decode("utf-8")
-            except UnicodeDecodeError:
-                # B2: binary straggler — best-effort backfill an 'unsupported' artifact so
-                # future searches skip it without counting it against the budget.
-                try:
-                    _unsupported = SearchArtifact(
-                        status="unsupported",
-                        schema_version=1,
-                        provider_key=nts.provider_key,
-                        provider_version="1",
-                        params_hash=nts.params_hash,
-                        content_hash=entry.content_hash,
-                        created_at=datetime.now(timezone.utc),
-                        storage="inline",
-                        error_code="decode_error",
-                        error_message="content is not valid UTF-8",
-                    )
-                    await self._meta.update_search_artifact(entry.version_id, nts.provider_key, _unsupported)
-                except Exception as exc:  # noqa: BLE001 — best-effort
-                    _log.debug("Failed to record unsupported artifact for %s: %s", entry.path, exc)
-                continue
-
-            # Apply predicate against decoded text.
-            # REGEX: per-line results (line_number, match_context) via helper.
-            # FULLTEXT: whole-text predicate; single path-only result (no per-line
-            # context for fulltext stragglers — documented behaviour).
-            if search_type == SearchType.REGEX:
-                response.results.extend(_straggler_regex_results(entry.path, text, query))
-            else:  # FULLTEXT: all query tokens must appear in the text (best-effort)
-                tokens = query.lower().split()
-                text_lower = text.lower()
-                if bool(tokens) and all(tok in text_lower for tok in tokens):
-                    response.results.append(SearchResult(path=entry.path))
-
-            # Lazy backfill: persist the verified text so future searches are fresh.
-            # Best-effort — a failure here must not fail the search.
-            try:
-                async with self._meta.transaction():
-                    backfill_artifact = await nts.index_text(
-                        entry.version_id, entry.content_hash, nts.params_hash, text
-                    )
-                    await self._meta.update_search_artifact(entry.version_id, nts.provider_key, backfill_artifact)
-            except Exception as exc:  # noqa: BLE001 — best-effort backfill
-                _log.debug("Lazy backfill failed for %s: %s", entry.path, exc)
-
-        return response
 
     # --- GC / reindex ---
 

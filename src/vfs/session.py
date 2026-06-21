@@ -5,6 +5,8 @@ from __future__ import annotations
 import posixpath
 from typing import TYPE_CHECKING
 
+from vfs.models import FullTextMatchMode
+
 if TYPE_CHECKING:
     from vfs.models import ExecutionResult, FileMeta, SearchResult, SearchType, VersionMeta
     from vfs.protocols.execution import ResourceLimits
@@ -165,10 +167,14 @@ class Session:
         search_type: SearchType,
         *,
         find_predicates: FindPredicates | None = None,
+        match_mode: FullTextMatchMode = FullTextMatchMode.ALL,
     ) -> list[SearchResult]:
         """Search ``scope`` (resolved through ``cwd``) for ``query``.
 
         ``find_predicates`` is forwarded to the underlying ``vfs.search`` call unchanged.
+        ``match_mode`` applies only to ``FULLTEXT`` searches (``ALL`` = strict-AND,
+        ``ANY`` = ranked-OR) and is ignored for GLOB, FIND, and REGEX; it is forwarded
+        to ``vfs.search`` unchanged.
         """
         return await self._vfs.search(
             self._namespace_id,
@@ -177,6 +183,7 @@ class Session:
             search_type,
             principal_id=self._principal_id,
             find_predicates=find_predicates,
+            match_mode=match_mode,
         )
 
     async def execute(

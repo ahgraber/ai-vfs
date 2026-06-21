@@ -21,6 +21,18 @@ class SearchType(Enum):
     SEMANTIC = "semantic"
 
 
+class FullTextMatchMode(Enum):
+    """Match mode for FULLTEXT searches.
+
+    ``ALL`` requires every query term to appear in a document (strict-AND, the
+    backward-compatible default); ``ANY`` returns every document matching at least one
+    query term (ranked-OR).  Applies only to FULLTEXT; ignored for GLOB, FIND, and REGEX.
+    """
+
+    ALL = "all"
+    ANY = "any"
+
+
 class RetentionTier(BaseModel):
     """A single tier in a retention policy."""
 
@@ -172,24 +184,19 @@ class SearchArtifact:
         *,
         current_content_hash: str,
         active_params_hash: str,
-        external_readable: bool = True,
-        external_identity_match: bool = True,
     ) -> bool:
         """Return True iff the artifact can answer a search without re-indexing.
 
-        For ``storage == "external"``, the caller must also supply the external record's
-        readability and identity-match status (``external_readable``,
-        ``external_identity_match``); a missing or mismatched record is a straggler.
+        Usable means ``ready`` status with a current ``content_hash`` and ``params_hash``.
+        The text record is content-addressed and resident in the metadata store, so an
+        identity-current artifact's record is always present (blob GC never sweeps a
+        live-referenced ``content_hash``); there is no separate external-record check.
         """
         if self.status != "ready":
             return False
         if self.content_hash != current_content_hash:
             return False
-        if self.params_hash != active_params_hash:
-            return False
-        if self.storage == "external":
-            return external_readable and external_identity_match
-        return True
+        return self.params_hash == active_params_hash
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-safe dict for storage in the ``search_meta`` manifest.
