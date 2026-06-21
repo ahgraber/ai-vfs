@@ -1,22 +1,31 @@
-# Tasks: fulltext-match-modes
+# Tasks: search-realignment
 
 > Build-dependency order: word representation + Postgres `simple` + migration (the
 > substrate) → match-mode enum/field → VFS/session threading → ANY construction on the word
 > representation (both backends) → boundary term cap → dispatch/validation → cross-backend
-> contract tests → notebook demo.
+> contract tests → notebook demo → native-search self-healing cull (§12).
 >
 > Every SHALL is paired with at least one evidence-producing test. Foreseeable write-sites
 > for the match-mode dispatch: the SQLite ANY path, the Postgres ANY path, the ALL default
-> path (both backends), and the non-FULLTEXT ignore path. The in-process straggler FULLTEXT
-> path is **removed** (see §12): stale fulltext fails loud, so `match_mode` does not thread
-> through any straggler path.
+> path (both backends), and the non-FULLTEXT ignore path. The in-process straggler path is
+> **removed** by the §12 cull: any straggler fails loud (REGEX and FULLTEXT), so `match_mode`
+> does not thread through any straggler path.
 >
-> **Implementation status:** sections 3–5 and 7–10 were implemented against the prior
-> trigram-fulltext substrate during initial work. The substrate change in sections 1–2
-> supersedes them: the SQLite fulltext path must be re-pointed from the trigram table to the
-> new word table, the Postgres path from `'english'` to `'simple'`, and the affected tests
-> re-grounded on real terms (e.g. `s3`). Treat previously-implemented items as drafts to
-> rebase onto the word representation, not as done.
+> **Implementation status (reviewed 2026-06-21):**
+>
+> - **Done + tested:** §3 (match-mode enum), §4 (`SearchRequest.match_mode`), §5 (VFS/session
+>   threading), §9 (dispatch / ignore-for-non-FULLTEXT), §11 (notebook ALL-vs-ANY demo), and all
+>   of §12 (self-healing cull, incl. copy/move propagation and GC atomicity).
+> - **Not implemented:** §1 (the `unicode61` word table, the Postgres `'english'`→`'simple'`
+>   switch, the `provider_version` bump), §2 (word-index backfill migration), §6 (term-count
+>   cap). Their named tests do not exist.
+> - **Drafted on the OLD substrate — NOT done:** §7–§8 ANY/ALL construction and §10 cross-backend
+>   tests run against the trigram (SQLite) / `'english'` (Postgres) representation — the substrate
+>   this change exists to replace — so the `s3`-floor fix and the whole-word / cross-backend
+>   coherence guarantees are not yet delivered. They rebase onto §1–2 once built.
+>
+> Net: the match-mode _plumbing_ and the cull are complete; the word-representation _substrate_
+> that is the point of this change is not. §1, §2, §6 are net-new implementation work.
 
 ## 1. Word representation — substrate (`FulltextWordRepresentation`)
 
@@ -60,28 +69,28 @@
   word-table rows (no duplicate `SearchResult`s), and an init after a simulated partial
   backfill fills only the missing rows
 
-## 3. Model — `FullTextMatchMode` enum (`FulltextMatchMode`) — _implemented; verify_
+## 3. Model — `FullTextMatchMode` enum (`FulltextMatchMode`)
 
-- [ ] `FullTextMatchMode(Enum)` with `ALL = "all"`, `ANY = "any"` in `src/vfs/models.py`,
+- [x] `FullTextMatchMode(Enum)` with `ALL = "all"`, `ANY = "any"` in `src/vfs/models.py`,
   beside `SearchType`
-- [ ] Test: members importable from `vfs.models`, equal to themselves; round-trip through
+- [x] Test: members importable from `vfs.models`, equal to themselves; round-trip through
   `SearchRequest.match_mode` confirms the type is the enum, not a string
 
-## 4. Protocol — `match_mode` field on `SearchRequest` — _implemented; verify_
+## 4. Protocol — `match_mode` field on `SearchRequest`
 
-- [ ] `match_mode: FullTextMatchMode = FullTextMatchMode.ALL` on `SearchRequest`; documented
+- [x] `match_mode: FullTextMatchMode = FullTextMatchMode.ALL` on `SearchRequest`; documented
   as FULLTEXT-only, ignored for other types
-- [ ] Test (`FulltextMatchModeDefaultIsAll` — default path): no `match_mode` →
+- [x] Test (`FulltextMatchModeDefaultIsAll` — default path): no `match_mode` →
   `request.match_mode == ALL`; explicit `ANY` → `ANY`
 
-## 5. VFS & Session threading — _implemented; verify_
+## 5. VFS & Session threading
 
-- [ ] `match_mode` keyword-only param (default `ALL`) on `vfs.VFS.search` and
+- [x] `match_mode` keyword-only param (default `ALL`) on `vfs.VFS.search` and
   `session.Session.search`, forwarded into `SearchRequest` construction — including the
   `fresh_request` reconstruction in `vfs._native_search`
-- [ ] Test: `vfs.search(..., FULLTEXT, match_mode=ANY)` reaches `search_text` with
+- [x] Test: `vfs.search(..., FULLTEXT, match_mode=ANY)` reaches `search_text` with
   `match_mode=ANY` (captured via stub capability, exercising the `fresh_request` path)
-- [ ] Test: `vfs.search` without `match_mode` → `ALL`; `session.search(..., match_mode=ANY)`
+- [x] Test: `vfs.search` without `match_mode` → `ALL`; `session.search(..., match_mode=ANY)`
   delegates with `ANY` intact
 
 ## 6. Boundary term-count cap
@@ -98,9 +107,8 @@
   `mode: FullTextMatchMode`, and OR-joins double-quoted word tokens (`"tok1" OR "tok2"`) for
   ANY vs AND-join for ALL; double-quote escaping (`"`→`""`) unchanged; empty-query guard
   retained
-- [ ] In `vfs._native_search`, **remove** the inline straggler FULLTEXT predicate (see §12):
-  a stale/missing FULLTEXT artifact fails loud (`reindex`-required) rather than being
-  approximated, so `match_mode` does NOT thread through any straggler path
+- [ ] `match_mode` threads only through the **fresh** capability path; the inline straggler
+  predicate is removed by §12b, so `match_mode` does NOT thread through any straggler path
 - [ ] Test (`FulltextMatchAnyRanksUnion` — SQLite): mode=ANY returns the union incl. a
   one-term doc excluded under ALL; both-terms doc ranks first
 - [ ] Test (`FulltextMatchAllRequiresEveryTerm` — SQLite): mode=ALL returns only docs with
@@ -108,9 +116,9 @@
 - [ ] Test (`RankedFulltextAnyMode` — SQLite): both-terms doc outranks one-term doc (BM25)
 - [ ] Test: a query token containing `"` is escaped (`""`) in ANY mode and exercises the
   escaping (only the quoted term can match the asserted doc)
-- [ ] Test (straggler fulltext fails loud): a FULLTEXT search whose scope contains any
-  stale/missing artifact fails loud with `reindex`-required — no inline approximation for
-  either `ALL` or `ANY` (replaces the former inline-straggler-ANY behavior; see §12)
+- [ ] (Straggler fail-loud tests for FULLTEXT and REGEX — including removal of the inline
+  `ALL`/`ANY` approximation — are owned by §12b; ANY construction here applies only on the
+  fresh path)
 
 ## 8. Postgres ANY construction — on `'simple'` (rebase from the `'english'` draft)
 
@@ -129,11 +137,11 @@
   (`ts_rank`)
 - [ ] Test (Docker): single-term ANY == single-term ALL result set
 
-## 9. Dispatch / validation — _implemented; verify_
+## 9. Dispatch / validation
 
-- [ ] `search_text` reads `request.match_mode` only inside the FULLTEXT branch; GLOB/FIND/
+- [x] `search_text` reads `request.match_mode` only inside the FULLTEXT branch; GLOB/FIND/
   REGEX unaffected
-- [ ] Test (`MatchModeIgnoredForNonFulltext`): `vfs.search` with GLOB/FIND/REGEX and
+- [x] Test (`MatchModeIgnoredForNonFulltext`): `vfs.search` with GLOB/FIND/REGEX and
   `match_mode=ANY` raises no error and returns the same (non-empty) result set as without it
 
 ## 10. Cross-backend contract tests
@@ -155,30 +163,70 @@
 
 ## 11. Notebook demo
 
-- [ ] Update `notebooks/02` to demonstrate ALL vs ANY on the same corpus: same multi-term FULLTEXT query in both modes, result sets shown side-by-side.
+- [x] Update `notebooks/02` to demonstrate ALL vs ANY on the same corpus: same multi-term FULLTEXT query in both modes, result sets shown side-by-side.
   Label the Postgres ranker `ts_rank` (not BM25)
 
-## 12. Search correctness floor — self-healing → fail-loud (folded from #5)
+## 12. Native-search self-healing cull
 
-> Serves US-2. Removes the always-on self-healing that ladders to no PoC user story while
-> keeping the fail-loud trust floor. Net code reduction, not added scope.
+> Serves US-2 (trustworthy search) and US-3 (correct search after file ops). Collapses
+> `vfs._native_search` to classify + fail-loud + fresh-serve; the copy/move fix (12a) is the
+> prerequisite that makes stragglers migration-only. Net code reduction. Implement 12a first.
 
-- [ ] Drop **query-time lazy backfill** in `vfs._native_search` (the straggler-path `index_text`
-  - `update_search_artifact` block); `vfs.reindex()` remains the explicit remedy.
-    The write-path in-transaction `index_text` is unchanged (fresh ⇔ current invariant holds).
-- [ ] Drop the **`has_text_artifacts` existence re-check** in `vfs._native_search`; the in-DB
-  index makes out-of-band record loss a non-state (`object-store-text-index` parked).
-- [ ] **FULLTEXT straggler → fail loud:** classification keeps REGEX straggler verification
-  (honest line-level `re`); a stale/missing FULLTEXT artifact raises `reindex`-required rather
-  than running the inline token predicate (deleted with §7).
-- [ ] Remove the now-dead `is_usable` external params (`external_readable` /
-  `external_identity_match`) in `models.py`, unreferenced once the existence re-check is gone.
-- [ ] Spec deltas (`specs/search/spec.md`): narrow `ColdIndexFailsLoud` / `NativeTextSearchCapability` so straggler verification covers REGEX only and FULLTEXT staleness fails loud; soften `SearchMetaReindex` (versioning) to drop the lazy-backfill `MAY`.
-  Each delta requirement carries `Serves: US-2`.
-- [ ] Test: fresh FULLTEXT (both modes) authoritative with zero blob reads; any FULLTEXT
-  straggler → `reindex`-required (no approximation); REGEX straggler verify + budget fail-loud
-  unchanged; no lazy backfill occurs (a 2nd search after a straggler still requires explicit
-  `reindex`).
+### 12a. Copy/move propagate `search_meta` (prerequisite — `SearchMetaReindex`)
+
+- [x] `vfs.copy`: set `search_meta=src_version.search_meta` on the destination `VersionMeta`
+  (mirroring `rollback`).
+- [x] `vfs.move`: set `search_meta=src_version.search_meta` on the destination `VersionMeta`
+  (the tombstone keeps `search_meta={}`).
+- [x] Test (`CopyPropagatesSearchMeta`): copy a fresh-indexed file → a matching search returns
+  source and destination with zero blob reads and no `ReindexRequiredError`.
+- [x] Test (`MoveDestinationPropagatesSearchMeta`): move a fresh-indexed file → matching search
+  returns the destination with zero blob reads and no `ReindexRequiredError`; source tombstone absent.
+- [x] Test (`RollbackCopiesSearchMeta` — regression): rollback propagation still holds.
+
+### 12b. Collapse `_native_search` (`ColdIndexFailsLoud`, `SearchArtifactEnvelope`)
+
+- [x] Reduce `_native_search` to: classify decided (identity-current `ready` answers;
+  `unsupported`/`failed` confirmed non-match) vs straggler (absent/identity-drifted); any
+  straggler → `ReindexRequiredError` (path-scoped); else `search_text` over decided/`ready`
+  (preserving `match_mode` on the fresh path); a capability error → `IndexUnavailableError`.
+- [x] Remove the straggler verify loop, guarded-reader straggler reads, query-time lazy backfill,
+  the `has_text_artifacts` existence re-check, and the inline FULLTEXT token predicate.
+- [x] Fold identity-current `failed` into the confirmed-non-match branch (excluded, not straggler).
+- [x] Test (`FreshIndexCompleteNoBlobReads`): all-fresh scope → complete, zero blob reads.
+- [x] Test (`AnyStragglerFailsLoud` — REGEX **and** FULLTEXT): one straggler in scope →
+  `ReindexRequiredError`, zero reads, no partial/approximate results (replaces the former
+  inline-straggler behavior and the bounded REGEX verify).
+- [x] Test (`DecidedNonMatchExcluded`): identity-current `unsupported` and `failed` excluded, no fail-loud.
+- [x] Test (`IndexUnavailableFailsLoud`): capability `search_text` raises → `IndexUnavailableError`.
+- [x] Test (`SearchPerformsNoLazyBackfill`): after fail-loud nothing is written; a 2nd search
+  before `reindex` still fails loud.
+
+### 12c. Path-scoped reindex remediation
+
+- [x] The `ReindexRequiredError` message names a path-scoped `reindex` (the search scope).
+- [x] Test: error guidance references the scoped form; `reindex(ns, scope=...)` over the stale
+  subtree clears the fail-loud.
+
+### 12d. `_blob_gc` atomicity (`NativeTextSearchStorage`)
+
+- [x] Make `_blob_gc`'s reference check + `delete_text_artifacts`+blob delete atomic (transaction
+  where available; re-check references inside the delete on best-effort stores).
+- [x] Test (`LiveReferencedContentNeverSwept` — SQLite): a live-referenced `content_hash` is never
+  swept; the transaction/lock prevents a mid-operation check→revive→delete interleave.
+- [x] Test (`TextArtifactGcFollowsContentOrphan` — regression): a truly orphaned hash is still swept.
+- [x] Test (Postgres, Docker): `LiveReferencedContentNeverSwept` holds on the transactional store (`test_postgres_metadata.py::TestPostgresNativeTextSearch::test_live_referenced_content_never_swept`) — passed against the local compose stack.
+  Mongo exposes no `NativeTextSearch`, so the text-artifact invariant is N/A there.
+
+### 12e. Dead-code removal
+
+- [x] Remove `has_text_artifacts` from `sqlite_metadata.py`, `postgres_metadata.py`, and its tests.
+- [x] Remove the `is_usable` external params (`external_readable`/`external_identity_match`) in
+  `models.py`; update `test_search_envelope.py`.
+- [x] Remove the straggler-only regex helper (`_straggler_regex_results`); also dropped the now-unused
+  `import re` in `vfs.py`.
+- [x] Test (`ReadyArtifactUsable` / `ContentHashMismatchIsStale` / `ParamsHashMismatchIsStale`):
+  the trimmed `is_usable` still classifies usable/stale correctly without the external params.
 
 ## User-owned
 
@@ -189,4 +237,12 @@
   - New `FullTextMatchMode` enum (`ALL`/`ANY`); `match_mode` field on `SearchRequest`;
     `vfs.search` / `session.search` gain a `match_mode` kwarg; default `ALL`
     (backward-compatible); `ANY` returns the ranked-OR union.
+  - Native search no longer self-heals at query time: a fresh index is authoritative and any
+    straggler fails loud (`ReindexRequiredError`) pointing at a path-scoped `reindex`; query-time
+    straggler verification, lazy backfill, the external-record existence re-check, and the inline
+    FULLTEXT approximation are removed.
+  - `copy`/`move` now propagate `search_meta`, so derived files are immediately searchable without
+    reindex (regression fix; previously they were perpetual stragglers).
+  - Blob GC reference-check and deletion are now atomic (a live-referenced `content_hash` is never
+    swept).
   - SemVer: MINOR.

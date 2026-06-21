@@ -179,6 +179,57 @@ No performance benchmarks published.
 
 ---
 
+## JuiceFS — fsspec-compatible with a no-FUSE Python SDK
+
+Where TigerFS is FUSE-only and API-less, JuiceFS is the opposite end of the same category: a mature, cloud-backed virtual filesystem that exposes both an **fsspec interface** and an **in-process Python SDK requiring no OS-level mount** — which places it squarely in this document's **function-injection** integration pattern rather than the mount-then-point pattern TigerFS forces.
+
+**Architecture.**
+JuiceFS is a "rich client" splitting data across two backends: a **metadata engine** (Redis / SQL — MySQL, PostgreSQL, SQLite / TiKV / FoundationDB; Enterprise uses a proprietary service) holding POSIX metadata plus the inode → chunk → slice → block mapping, and an **object store** (S3, GCS, MinIO, …) holding content.
+Files are split into chunks (≤64 MiB) → slices → blocks (4 MiB default) and uploaded as numerically-named objects under a `chunks/` prefix — the original file is not recoverable directly from the bucket.
+All I/O, compaction, and trash expiry happen in the client, which talks to both backends. ([architecture](https://github.com/juicedata/juicefs/blob/main/docs/en/introduction/architecture.md), [IO processing](https://juicefs.com/docs/community/internals/io_processing/))
+
+**The no-FUSE Python SDK — the key finding.**
+Community Edition 1.3 (and Enterprise 5.1) ship an official Python SDK, imported as `juicefs` with a `juicefs.Client` class, that performs full file operations with **no FUSE mount and no running gateway**.
+It wraps the same Go client compiled to a shared library (`libjfs`, the same lib the Java/Hadoop SDK uses) via its C interface — it is the core client code, not a reimplementation, and not a subprocess.
+It connects **directly to the same metadata engine + object store** a mount would use, just skipping the kernel FUSE layer (Community: `juicefs.Client(name="myjfs", meta="redis://localhost")`; Enterprise: `juicefs.Client('volume', token=..., access_key=..., secret_key=...)`).
+It exposes the expected surface — `open`/`read`/`write`/`seek`/`close`, `rename`, `listdir`, `makedirs`, `exists`, `remove`, permission changes, symlinks, xattrs, plus JuiceFS extensions (`warmup`, `summary`, `rmr`, `info`) — and a **native fsspec filesystem** ships in the same package (import path `sdk.python.juicefs.juicefs.spec`, used for Ray/AI dataloaders).
+Both are **beta** in 1.3/5.1; JuiceFS advises testing before production. ([1.3 SDK release](https://juicefs.com/en/blog/release-notes/juicefs-1-3-python-sdk), [getting started](https://juicefs.com/en/blog/usage-tips/use-python-sdk), [Cloud SDK docs](https://juicefs.com/docs/cloud/deployment/python-sdk/))
+
+**Consequence for sandbox integration.**
+Because the SDK is in-process and fsspec-compatible, JuiceFS drops straight into the **`FsspecBridge` roadmap** described below — the same ~50-line function-injection wrapper that backs Monty/Starlark/PyMiniRacer against any fsspec filesystem works against JuiceFS unchanged.
+A sandbox's `FsOperations` (read/write/list/exists) can call `juicefs.Client` (or its fsspec wrapper) directly, with **no FUSE, no mount lifecycle, and no kernel dependency** — exactly the gap that made TigerFS a blunt instrument.
+This is the cleanest live-cloud-backing option for a function-injection sandbox that has surfaced in this research.
+
+**FUSE and other access modes (for contrast).**
+The traditional `juicefs mount` path runs a **long-lived client process** holding the FUSE mount: it must stay resident (death → stale mount), holds credentials to both backends, maintains a local cache directory, and **each host needs its own mount** (processes on one host can share it).
+FUSE also caps reads at 128 KB, fragmenting large reads — a motivation for the SDK.
+FUSE-free alternatives besides the Python SDK: the **S3 Gateway** (`juicefs gateway`, serves the volume over the S3 protocol via MinIO's interface), the **WebDAV gateway**, and the **Java/Hadoop SDK** (same `libjfs`).
+The Kubernetes **CSI driver** does _not_ avoid FUSE — it runs a mount pod. ([architecture](https://github.com/juicedata/juicefs/blob/main/docs/en/introduction/architecture.md), [gateway guide](https://juicefs.com/docs/community/guide/gateway/))
+
+**What it gives natively vs. what an app still builds.**
+This is the load-bearing comparison for a system (like this one) that currently builds its own per-file versioning + content-addressed dedup on top of S3:
+
+- **Content-addressed dedup: NO.** Blocks are named by sequential ID, not content hash.
+  Two identical files written independently produce separate, duplicate blocks — there is no automatic hash-based dedup. (Directly contrasts a BLAKE3 content-dedup design.)
+- **Per-file version history: NO.** Blocks are immutable and edits append new slices, but JuiceFS exposes no queryable per-file version lineage; superseded slices become garbage to compact/trash, not retained versions.
+- **Snapshots / clones: YES** via `juicefs clone` — metadata-only copy-on-write, sharing the original's blocks until modified.
+  This is the _only_ block-sharing mechanism, and it is explicit, not automatic. ([clone](https://juicefs.com/docs/community/guide/clone/))
+- **Trash: YES**, on by default — deletes (and stale slices) move to a hidden `.trash/` retained for `--trash-days`, recoverable via `mv` or `juicefs restore` (v1.1+). ([trash](https://juicefs.com/docs/community/security/trash/))
+
+**Multi-tenancy.**
+A JuiceFS volume is a **single flat POSIX namespace** with no native per-tenant workspace abstraction.
+Isolation primitives exist — POSIX permissions + ACLs (1.2+), `squash` UID remapping (Community), access tokens scoped by subdirectory/IP (Cloud/Enterprise only, and they gate _metadata_ not object-store creds), Kerberos/Ranger (Enterprise), S3-Gateway IAM (enhanced gateway) — but JuiceFS's own recommendation for _strong_ tenant isolation is **a separate filesystem per tenant**, which scales poorly to thousands of users.
+For thousands of isolated user workspaces on one volume, **the application still enforces isolation via path-prefixing + its own authz** — exactly as it would on raw S3.
+JuiceFS does not remove the access-control layer. ([AI multi-tenancy](https://juicefs.com/en/blog/solutions/ai-inference-multi-cloud-storage-multi-tenancy), [permissions deep-dive](https://juicefs.com/en/blog/engineering/linux-file-system-juicefs-access-management))
+
+**Net assessment.**
+Adopting JuiceFS as a backend would let an application delete its blob-store layer (object-store I/O, chunking, local caching) and the directory-tree mechanics of its metadata store, while talking to it from Python with no FUSE.
+It would **not** remove the application's two hardest layers — multi-tenant authz and untrusted-code execution isolation — and it would **forfeit** content-addressed dedup and per-file version history (replacing the latter with explicit `clone` snapshots + trash).
+The added infrastructure is a metadata engine (Redis/SQL/TiKV) alongside the object store, and the Python SDK is currently beta.
+It is therefore a genuine code-reduction option _iff_ per-file versioning and content-dedup are not product requirements — orthogonal to, and no substitute for, the sandbox-isolation work this document is primarily concerned with.
+
+---
+
 ## WASI virtual filesystem implementations compared
 
 | Implementation                   | Runtime               | Read/Write | Dynamic backend             | Python-accessible | Maturity                                   |

@@ -79,6 +79,9 @@ For multi-step tasks, state a brief plan defining the step task and associated v
 - If worktrees are warranted use a local .worktrees/ directory.
 - Use descriptive, consistent naming conventions.
 - Write docstrings or comments for public contracts and non-obvious behavior.
+- Comments and docstrings describe what exists now (or the rationale for the current design), never what the code used to be.
+  No "previously…", "no longer…", "changed from…", or "renamed from…" — that history belongs in commit messages and changelogs.
+  When editing, delete stale historical asides you encounter rather than preserving them.
 - Use type annotations where the language supports them.
 - Use structured logging where the project uses logging.
 - Run lint/format/test through project tooling when available; do not hand-format code.
@@ -123,8 +126,8 @@ For multi-step tasks, state a brief plan defining the step task and associated v
 ## Testing
 
 - Run tests via `uv run pytest tests/`.
-- For parallel execution, use `pytest-xdist`: `uv run pytest -n auto -m "not integration_lifecycle" tests/`.
-- Tests marked `integration_lifecycle` (subprocess lifecycle with `pytest-isolate`) are incompatible with xdist; run them separately: `uv run pytest -m integration_lifecycle tests/`.
+- For parallel execution, use `pytest-xdist`: `uv run pytest -n auto -m "not isolate" tests/`.
+- Tests marked `isolate` (subprocess lifecycle with `pytest-isolate`) are incompatible with xdist; run them separately: `uv run pytest -m isolate tests/`.
 - Do not use `pytest-run-parallel` — it is a thread-safety stress tester (runs the same test N times in N threads), not a test suite parallelizer.
 
 ### Resource leak detection with pyleak
@@ -135,7 +138,7 @@ When writing tests for code that spawns concurrent work, wrap the act phase with
 - `no_task_leaks(action="raise")` — for code using `asyncio.create_task`, `asyncio.gather`, `asyncio.to_thread`, or `TaskGroup`.
 - `no_thread_leaks(action="raise")` — for code using `ThreadPoolExecutor`, `threading.Thread`, or `subprocess.Popen` lifecycle management.
 
-Existing examples: `test_fetcher.py`, `test_async_utils.py`, `test_limiters.py`, `test_health_checks.py`, `test_worker_shutdown.py`.
+Existing examples: `test_execute.py`, `test_boundary_hardening.py`, `test_sqlite_metadata.py`, `test_monty_provider.py`, `test_postgres_metadata.py`.
 
 ## Commit & Review Guidelines
 
@@ -151,7 +154,6 @@ Existing examples: `test_fetcher.py`, `test_async_utils.py`, `test_limiters.py`,
 
 ## Sandbox Limitations
 
-- The sandbox cannot run `uv sync` or read `.env` / `.env.example` (permission errors).
-- `tests/conversion/conftest.py` imports `aizk.conversion.db` → `pydantic_settings`, which may fail with `ModuleNotFoundError: No module named 'pydantic_settings.sources.providers.secrets'` if sandbox permissions are too strict.
-- **Delegate test runs to the user** when any of the above errors occur.
+- The sandbox may not be able to run `uv sync` or read `.env` / `.env.example` (permission errors) — attempt the command first rather than assuming failure.
+- Delegate to the user only if a command actually fails on a permission or missing-tool error.
   Describe the exact command to run (e.g., `uv run pytest tests/...`).

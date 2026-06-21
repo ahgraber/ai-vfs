@@ -1,10 +1,10 @@
-# Fulltext: Word-Tokenized Representation + Match Modes (ALL / ANY)
+# Search Realignment: Word Representation, Match Modes & Self-Healing Cull
 
-**Change name:** `fulltext-match-modes` **Date:** 2026-06-14 (scope expanded 2026-06-15) **Author:** ahgraber + Claude
+**Change name:** `search-realignment` **Date:** 2026-06-14 (scope expanded 2026-06-15; self-healing cull folded in 2026-06-20) **Author:** ahgraber + Claude
 
 ## Intent
 
-Two coupled defects in the FULLTEXT search path motivate this change.
+Three defects motivate this change: two coupled in the FULLTEXT representation, and one in the native-search self-healing machinery.
 
 1. **FULLTEXT runs on the wrong representation.**
    It rides on the _trigram_ index that exists for REGEX acceleration.
@@ -16,7 +16,12 @@ Two coupled defects in the FULLTEXT search path motivate this change.
    FULLTEXT is strict-AND only.
    A user searching `"hello s3"` gets zero results for a document containing only `"hello"`, even though it is clearly relevant.
 
-This change introduces a **representation-per-modality** model and layers a **match-mode** parameter on top of it:
+3. **The native-search self-healing is overbuilt.**
+   `vfs._native_search` verifies stragglers via blob reads, lazily backfills, re-checks external-record existence, and approximates FULLTEXT inline — machinery built as if a not-fresh index were a steady-state hazard.
+   It is not: indexing is atomic with the version write, so a fresh index is the steady state and stragglers are a migration/index-build transient that `reindex` already owns.
+   The machinery pays always-on cost (and returns dishonest FULLTEXT results), and an adversarial review found it was masking a real defect — `copy`/`move` commit a current version without propagating `search_meta`, manufacturing steady-state stragglers.
+
+This change introduces a **representation-per-modality** model, layers a **match-mode** parameter on top of it, and reduces the native path to its correctness floor — a fresh index is authoritative; any straggler fails loud and points at a (path-scoped) `reindex`:
 
 | Modality | Representation             | SQLite                            | Postgres                   |
 | -------- | -------------------------- | --------------------------------- | -------------------------- |
@@ -33,12 +38,16 @@ On that representation, callers choose **`ALL`** (strict-AND, backward-compatibl
   As an agent searching my workspace, I want correct whole-word / short-term fulltext and a
   ranked-OR (`ANY`) mode, so relevant documents surface even when not every query term matches.
 - **US-2 (trustworthy search) — _Serves north-star P2 (trust scaffolding)._**
-  As an agent relying on search, I need fulltext to be authoritative when the index is fresh
-  and to **fail loud (reindex)** when it is stale — never to return approximate results that
-  differ from the index — so I can trust what search tells me.
+  As an agent relying on search, I need search to be authoritative when the index is fresh
+  and to **fail loud (reindex)** when it is stale — never an approximation that differs from
+  the index — so I can trust what search tells me.
+- **US-3 (correct search after file ops) — _Serves north-star P4 (filesystem + code-mode interaction)._**
+  As an agent that copies, moves, and rolls back files as part of normal work, I want search
+  over the result to be immediately correct and cheap — not silently degraded, not a forced
+  reindex — so routine file operations don't quietly break search.
 
-> Delta-spec requirements carry `Serves: US-1` / `Serves: US-2` backlinks. This is the first
-> change to ladder to `NORTH-STAR.md`, piloting the value-chain directive.
+> Delta-spec requirements carry `Serves: US-1` / `US-2` / `US-3` backlinks. This change pilots
+> the value-chain directive (the first to ladder to `NORTH-STAR.md`).
 
 ## Scope
 
@@ -77,12 +86,17 @@ On that representation, callers choose **`ALL`** (strict-AND, backward-compatibl
 - **Notebook demo:** `notebooks/02` contrasts ALL vs ANY on the same corpus.
 - **Additive `NativeTextSearch` protocol note:** the protocol gains `match_mode` via `SearchRequest`; any future implementation honors it when it lands.
   No build-order dependency.
-- **Search correctness floor — self-healing reduced to fail-loud (folded from the #5 realignment).**
+- **Native-search self-healing cull — collapse `_native_search` to classify + fail-loud + fresh-serve.**
   _Serves US-2._
-  The native index is authoritative for fresh entries.
-  REGEX stragglers remain verified individually via the guarded reader within `max_content_reads` (honest line-level match), failing loud over budget.
-  **FULLTEXT stragglers fail loud → `reindex`** instead of inline approximation — this **removes** the inline token-presence predicate in `vfs._native_search`, so `match_mode` no longer threads through any straggler path (a net simplification of this change, not added scope).
-  Query-time **lazy backfill** is dropped (`reindex` is the remedy), and the **`has_text_artifacts` existence re-check** is dropped — the index lives in-DB, so external rows cannot disappear independently now that `object-store-text-index` is parked.
+  Classify each in-scope version as _decided_ (identity-current artifact: `ready` answers, `unsupported`/`failed` is a confirmed non-match) or _straggler_ (absent or identity-drifted); **any straggler in scope fails loud** (`ReindexRequiredError`, path-scoped).
+  Serve decided/`ready` versions from the index with zero blob reads.
+  This **culls** the guarded-reader straggler verification (REGEX _and_ FULLTEXT), the query-time lazy backfill, the `has_text_artifacts` existence re-check, and the inline FULLTEXT token approximation — so `match_mode` no longer threads through any straggler path.
+- **`copy` / `move` propagate `search_meta`** from the source version (mirroring `rollback`), so derived versions are fresh with zero reads — the prerequisite that makes "stragglers are migration-only" true (an adversarial review found copy/move otherwise manufacture steady-state stragglers).
+  _Serves US-3._
+- **`failed` folded into the decided non-match class** (with `unsupported`): an identity-current un-indexable artifact is excluded, not a straggler — so an oversized file does not brick its scope under fail-loud.
+- **Path-scoped `reindex` remediation** — fail-loud points at the stale subtree, not the whole namespace.
+- **`_blob_gc` reference-check→delete made atomic** + the live-reference invariant asserted (a `content_hash` with a live version reference is never swept) — the GC race the existence re-check incidentally guarded.
+- **Dead-code removal:** `has_text_artifacts` (both stores), the `is_usable` external params (`external_readable` / `external_identity_match`), and the straggler-only regex helper if unreferenced.
 
 ### Out of Scope
 
@@ -93,6 +107,7 @@ On that representation, callers choose **`ALL`** (strict-AND, backward-compatibl
 - Changing the default from `ALL` to `ANY` — deliberately rejected.
 - **REGEX / GLOB / FIND** behavior — unchanged; `match_mode` is a no-op for those types.
 - **MongoDB** fulltext — remains unsupported.
+- **Brute-force fallback search** (no `NativeTextSearch` capability) — unchanged; it retains the guarded reader and `max_content_reads` budget.
 - Any change to the `SearchArtifact` envelope shape, the content→occurrence identity
   contract, or the `object-store-text-index` change's files.
 

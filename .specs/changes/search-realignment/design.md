@@ -1,7 +1,7 @@
-# Design: Fulltext Word-Tokenized Representation + Match Modes
+# Design: Search Realignment — Word Representation, Match Modes & Self-Healing Cull
 
-> Change: `fulltext-match-modes`
-> Date: 2026-06-14 (scope expanded 2026-06-15)
+> Change: `search-realignment`
+> Date: 2026-06-14 (scope expanded 2026-06-15; self-healing cull folded in 2026-06-20)
 
 ## Context
 
@@ -127,7 +127,7 @@ The field applies only to FULLTEXT; for GLOB/FIND/REGEX it is present but ignore
 No-error-for-other-types keeps generic wrappers simple.
 
 **Write-sites (threading):** the canonical `SearchRequest(...)` in `vfs.search`, the `fresh_request` reconstruction in `vfs._native_search`, and each backend's `_fulltext_search`.
-The in-process straggler FULLTEXT verification is **removed** (see "Search correctness floor" below), so `match_mode` does not thread through any straggler path.
+The in-process straggler verification is **removed** (see "Native-search self-healing cull" below), so `match_mode` does not thread through any straggler path.
 
 ### Decision: SQLite ANY construction — OR-joined double-quoted word tokens
 
@@ -198,14 +198,14 @@ Adding the word representation changes no stored, content-addressed record, so n
 The trigram regex index, the `raw_text` records, and per-version `search_meta` are all untouched; no retired-`params_hash` GC sweep is triggered.
 
 **Freshness blind spot (load-bearing).**
-The straggler classifier proves index presence via `has_text_artifacts`, which queries `search_text_artifacts` only and has **no visibility into the word table**.
+The straggler classifier proves index presence via the per-version artifact manifest (`search_meta`), which reflects the `search_text_artifacts` record only and has **no visibility into the word table**.
 A `content_hash` with a `raw_text` row therefore classifies as _fresh_ regardless of whether its word-table row exists — so if the backfill has not completed, `_fulltext_search` queries an incomplete word table and silently returns empty/wrong fulltext with no straggler fallback.
 **Fresh-fulltext correctness depends on the init backfill having run to completion before serving.**
 Because the backfill is anti-join/resumable, an interrupted init self-heals on the next init; the spec states this dependency explicitly rather than relying on the straggler path to cover a missing word-table row.
 
 **Precondition / fallback:** the zero-blob-read backfill holds only where a `raw_text` row is present.
 Content whose `raw_text` is absent (never-indexed or binary content) cannot be rebuilt from stored text.
-On its next search the modality split applies: **REGEX** falls to the bounded straggler/`reindex` path (a guarded blob read, as today); **FULLTEXT** fails loud (`reindex`-required) under the correctness floor rather than being approximated (see "Search correctness floor").
+On its next search such content is a straggler, so the native search **fails loud** (`ReindexRequiredError`, path-scoped) for both REGEX and FULLTEXT — `reindex` rebuilds it from the blob (see "Native-search self-healing cull").
 
 **Version bump (policy).**
 The repository requires a version bump of the affected artifact for retrieval-scoring changes.
@@ -234,20 +234,72 @@ No build-order dependency.
 
 > The `object-store-text-index` change (a candidate such implementation) is **parked** as scope creep (2026-06-19); this note implies no pending dependency.
 
-### Decision: Search correctness floor — FULLTEXT stragglers fail loud (folded from the #5 realignment)
+### Decision: Native-search self-healing cull — fresh is authoritative, any straggler fails loud
 
-**Chosen:** Reduce the native-search self-healing to a correctness floor.
-Classification keeps **REGEX** straggler verification (honest line-level `re` via the guarded reader, within `max_content_reads`, failing loud over budget).
-A stale or missing **FULLTEXT** artifact **fails loud (`reindex`-required)** rather than being approximated inline.
-Query-time lazy backfill and the `has_text_artifacts` existence re-check are removed.
+> The decisions in this block were validated by an adversarial review (provenance below) before
+> the cull was adopted. They reduce `vfs._native_search` to classify + fail-loud + fresh-serve.
 
-**Rationale:** The inline FULLTEXT straggler predicate (Python token-containment) is not `unicode61` / `'simple'` word semantics and cannot honor `ALL` / `ANY` or BM25 / `ts_rank` ranking — so it returns results the fresh index would not, making "fresh fulltext is authoritative" a lie the moment a straggler appears.
-There is no honest cheap fulltext verifier, so the correct floor for stale fulltext is **fail loud → `reindex`**, not approximation.
-This removes the very write-site this change was otherwise complicating (threading `match_mode` through straggler approximation) — a net simplification, not added scope.
-Lazy backfill duplicates the explicit `vfs.reindex()` remedy and adds write-during-read CAS concerns; the existence re-check guards out-of-band record loss, a non-state while the index lives in the metadata store (the `object-store-text-index` change that would make segments independently deletable is parked).
-Both served no PoC user story; the kept floor serves **US-2** (trustworthy search).
+**Chosen:** Classify each in-scope version by its artifact and serve only from the index:
 
-**Consequence:** the whole-word-semantics (`FulltextMatchesWholeWordsNotSubstrings`) and cross-backend-equivalence scenarios are already specified over **fresh (`ready`) records**, so failing loud on stale fulltext **strengthens** those guarantees — stale fulltext can no longer return a divergent approximation.
+- **Decided** — identity-current artifact (`content_hash` and `params_hash` both match): a `ready`
+  artifact answers from stored text; an `unsupported` or `failed` artifact is a confirmed
+  non-match (binary or un-indexable content) and is excluded.
+- **Straggler** — artifact absent or identity-drifted: the index cannot vouch for the version.
+
+If any in-scope version is a straggler, raise `ReindexRequiredError` (naming a path-scoped `reindex`) — no blob reads, no approximation, no partial results, for **both** REGEX and FULLTEXT.
+A capability store error raises `IndexUnavailableError`.
+This **culls** the guarded-reader straggler verify loop, the query-time lazy backfill, the `has_text_artifacts` existence re-check, and the inline FULLTEXT token predicate.
+The guarded reader and `max_content_reads` survive only on the brute-force fallback path (no native capability).
+
+**Rationale:** Indexing is atomic with the version write, so a fresh index is the steady state and stragglers are a migration/index-build transient that `reindex` owns.
+The REGEX bounded verify (phase 2's "graceful middle") drops to a UX courtesy the migration window doesn't need; the inline FULLTEXT predicate (Python token-containment) is additionally dishonest — not `unicode61`/`'simple'` word semantics, cannot honor `ALL`/`ANY` or ranking — so it returns results the fresh index would not, making "fresh fulltext is authoritative" a lie the moment a straggler appears.
+Failing loud is the honest floor for both.
+The classifier itself is the irreducible core: without it, an un-indexed version silently contributes no match and search lies "not found."
+The culled mechanisms served no PoC user story; the kept floor serves **US-2** (trustworthy search).
+
+**Consequence:** the whole-word-semantics (`FulltextMatchesWholeWordsNotSubstrings`) and
+cross-backend-equivalence scenarios are specified over **fresh (`ready`) records**, so failing loud
+on stale content **strengthens** those guarantees — stale content can no longer return a divergent
+approximation.
+
+**Adversarial review (provenance):** before culling, three independent reviewers (Opus / Sonnet / Haiku) were tasked to **break** the thesis "stragglers are only a migration transient."
+All three converged on one real counterexample: **`copy` and `move` commit a current version with `search_meta = {}`** and never call `index_text`, so the destination is a straggler on every copy/move (the text record exists, content-addressed by the shared `content_hash`, but the manifest pointer is missing).
+`rollback` does not have this defect — it already copies `search_meta`.
+The finding does not reverse the cull; it adds a prerequisite (propagation, below).
+Today's self-healing was in effect **masking** the defect by verifying+backfilling the destination at query cost; culling without the fix would convert that hidden cost into a hard failure, so the fix lands in this change.
+
+### Decision: `copy` / `move` propagate `search_meta` (prerequisite)
+
+**Chosen:** `vfs.copy` and `vfs.move` set `search_meta=src_version.search_meta` on the destination
+`VersionMeta`, mirroring `rollback`.
+
+**Rationale:** The text record is content-addressed by `content_hash`, which copy/move preserve, so the propagated artifact is identity-current and the destination is immediately fresh — zero reads, no reindex.
+This makes the golden-path-atomic premise true and stragglers genuinely transient.
+**Write-sites:** the destination `VersionMeta(...)` in `vfs.copy` and in `vfs.move`; each carries its own test.
+
+### Decision: `failed` is a decided non-match, not a straggler
+
+**Chosen:** an identity-current `failed` artifact joins `unsupported` as a confirmed non-match
+(excluded), not a straggler.
+
+**Rationale:** treating it as a straggler would fail loud forever on an oversized/un-indexable file, since `reindex` re-produces `failed`.
+Excluding it is a documented PoC limitation (un-indexable text is absent from text search), not an error.
+
+### Decision: `_blob_gc` reference-check→delete made atomic
+
+**Chosen:** wrap the `has_version_references` check and `delete_text_artifacts` in one metadata transaction so a reviving write cannot delete a live-referenced hash's **text artifacts**.
+The blob delete stays outside the transaction (a separate store); the cross-store revive race — a write reviving a `content_hash` between the metadata commit and `blob.delete`, briefly leaving a live version's content blob reclaimed — is inherent and pre-existing, accepted at PoC scale.
+
+**Rationale:** the text-artifact atomicity is the **search**-correctness invariant the removed existence re-check guarded (search reads the text artifact); fixing it at the source beats a per-query existence query on the hot path.
+The residual blob race is a **read**-correctness gap; closing it needs grace-period / generational blob GC — out of scope for the PoC, and the search path does not depend on it.
+
+### Decision: Path-scoped `reindex` remediation
+
+**Chosen:** the fail-loud error names a path-scoped `reindex` (the search scope), so the remedy is
+the stale subtree, not necessarily the whole namespace.
+
+**Rationale:** a namespace-wide `reindex` is O(files × blob); pointing fail-loud at the narrowest covering scope keeps the remedy proportionate.
+The contract (stale → reindex) is scale-independent; the operational "cheap" assumption holds at bounded PoC scale and is not written into the spec.
 
 ## Architecture
 
@@ -290,9 +342,18 @@ Both served no PoC user story; the kept floor serves **US-2** (trustworthy searc
 - **Weaker English recall (non-stemming):** `databases` no longer matches `database`.
   Accepted; a stemmed profile is a future opt-in.
 - **Migration completeness:** content whose `raw_text` row is missing (never-indexed or binary content) cannot be rebuilt without a blob read.
-  REGEX falls to the bounded straggler/`reindex` path (`ReindexRequiredError`); FULLTEXT fails loud under the correctness floor — same `reindex` remedy in both cases.
-- **FULLTEXT stragglers fail loud (no approximation):** a stale or missing FULLTEXT artifact raises `reindex`-required rather than running an inline predicate (see "Search correctness floor").
-  This removes the former Python token-containment best-effort, whose results diverged from `unicode61` / `'simple'` word semantics and could not honor `ALL` / `ANY` or ranking.
-  Whole-word semantics (`FulltextMatchesWholeWordsNotSubstrings`) and cross-backend equivalence remain specified over **fresh (`ready`) records**; REGEX straggler verification (honest line-level `re`) is unchanged.
+  Such content is a straggler, so the native search fails loud (`ReindexRequiredError`) for both REGEX and FULLTEXT — `reindex` is the remedy in both cases.
+- **Any straggler fails loud (no verification, no approximation):** a missing or identity-drifted artifact raises `reindex`-required for both REGEX and FULLTEXT rather than being verified via blob read or approximated inline (see "Native-search self-healing cull").
+  This removes the former Python token-containment best-effort (which diverged from `unicode61` / `'simple'` word semantics and could not honor `ALL` / `ANY` or ranking) **and** the bounded REGEX verify.
+  Whole-word semantics (`FulltextMatchesWholeWordsNotSubstrings`) and cross-backend equivalence remain specified over **fresh (`ready`) records**; `copy`/`move` now propagate `search_meta` so derived versions are not stragglers.
 - **Injection (SQLite OR join):** `OR` is a bare ASCII literal between double-quoted tokens, never user-derived; identical surface to the existing AND join.
 - **Future `NativeTextSearch` providers default to `ALL`** until they branch on `match_mode`: acceptable; the protocol docstring documents the obligation (`object-store-text-index`, the candidate provider, is parked).
+- **`failed` content excluded from text search:** an oversized/un-indexable text file is silently absent from FULLTEXT/REGEX (decided non-match) rather than failing loud.
+  Documented PoC limitation; revisit if oversized indexing is implemented.
+
+## Verification Waivers
+
+- **Requirement:** `NativeTextSearchStorage` GC live-reference invariant (`LiveReferencedContentNeverSwept`) on Postgres **Reason:** requires the Docker-compose Postgres stack; not runnable in the sandbox.
+  Mongo exposes no `NativeTextSearch`, so it has no text artifacts to sweep — the invariant is N/A there, and its blob-GC behavior is unchanged by this change.
+  **Manual evidence:** `tests/integration/test_postgres_metadata.py::TestPostgresNativeTextSearch::test_live_referenced_content_never_swept`, run by the user against the compose stack; result recorded in the change before sync.
+  **Recorded:** 2026-06-20
