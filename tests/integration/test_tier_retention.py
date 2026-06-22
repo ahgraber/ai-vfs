@@ -157,7 +157,7 @@ async def postgres_store():
         async with engine.connect() as conn:
             await conn.execute(text(f'DROP DATABASE IF EXISTS "{db_name}"'))
             await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
-    except SQLAlchemyError as exc:
+    except (SQLAlchemyError, OSError) as exc:  # OSError: server unreachable (connection refused)
         pytest.skip(f"cannot provision Postgres tier-test database: {exc}")
     finally:
         await engine.dispose()
