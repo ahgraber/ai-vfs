@@ -91,6 +91,71 @@ The bound is well below the PostgreSQL bind-parameter ceiling (~32767) that ANY'
 
 ## MODIFIED Requirements
 
+### Requirement: PluggableSearchProviders
+
+> Serves: US-1, US-2
+>
+> Previously: the dispatch rules were stated as prose and scenarios only. This change adds a
+> capability matrix summarizing search-type × backend availability (reflecting the FULLTEXT
+> word representation introduced by this change) and otherwise preserves the dispatch contract
+> and all scenarios unchanged.
+
+The system SHALL dispatch each search by capability.
+Glob and find (metadata-only) SHALL always be served by the `DefaultSearchProvider`.
+For regex and fulltext, when the active metadata store exposes the `NativeTextSearch` capability the VFS SHALL use it.
+When the store does not expose `NativeTextSearch`:
+
+- **REGEX**: falls back to `DefaultSearchProvider` brute-force via the guarded reader; `max_content_reads` is enforced so large-scope regex fails loud (`ReadBudgetExceededError`) rather than issuing unbounded blob reads.
+- **FULLTEXT**: raises `SearchTypeUnsupportedError` — no brute-force equivalent exists for unranked full-text search.
+
+The availability and representation per backend SHALL be:
+
+| Search type  | SQLite                                       | PostgreSQL                                | MongoDB                                         |
+| ------------ | -------------------------------------------- | ----------------------------------------- | ----------------------------------------------- |
+| **GLOB**     | metadata-only (`DefaultSearchProvider`)      | metadata-only                             | metadata-only                                   |
+| **FIND**     | metadata-only                                | metadata-only                             | metadata-only                                   |
+| **REGEX**    | native — trigram FTS5 (`search_fts`)         | native — `pg_trgm` GIN                    | brute-force via guarded reader (budget-bounded) |
+| **FULLTEXT** | native — `unicode61` word index, `ALL`/`ANY` | native — `'simple'` tsvector, `ALL`/`ANY` | unsupported (`SearchTypeUnsupportedError`)      |
+| **SEMANTIC** | unsupported (`ValueError`, future)           | unsupported (future)                      | unsupported (future)                            |
+
+GLOB and FIND never read the blob store on any backend.
+Native REGEX/FULLTEXT serve fresh artifacts with zero blob reads and fail loud (`ReindexRequiredError`) over a stale index rather than degrade (see `ColdIndexFailsLoud`).
+FULLTEXT `match_mode` (default `ALL`) applies only where FULLTEXT is supported (see `FulltextMatchMode`).
+The MongoDB column is the general "no `NativeTextSearch` capability" behavior; any store lacking the capability dispatches identically.
+
+> **Deferred:** Whole-scope brute-force scope management (bounding regex on very large corpora
+> across any backend) and semantic search are deferred to future changes.
+
+#### Scenario: NativeCapabilityServesRegex
+
+- **GIVEN** a metadata store exposing `NativeTextSearch`
+- **WHEN** a regex search is requested
+- **THEN** the VFS dispatches to the store's `search_text` (verification against stored text, no blob reads for fresh artifacts)
+
+#### Scenario: GlobFindAlwaysAvailable
+
+- **GIVEN** any metadata backend (with or without `NativeTextSearch`)
+- **WHEN** a glob or find search is requested
+- **THEN** the `DefaultSearchProvider` serves it from metadata, with no blob reads
+
+#### Scenario: RegexFallbackToBruteForce
+
+- **GIVEN** a metadata store without `NativeTextSearch` (e.g. MongoDB standalone)
+- **WHEN** a regex search is requested
+- **THEN** the VFS serves it via bounded brute-force through the `DefaultSearchProvider` + guarded reader; `max_content_reads` is enforced so large-scope regex fails loud (`ReadBudgetExceededError`)
+
+#### Scenario: FulltextUnsupportedWithoutNativeCapability
+
+- **GIVEN** a metadata store without `NativeTextSearch` (e.g. MongoDB)
+- **WHEN** a fulltext search is requested
+- **THEN** the search raises `SearchTypeUnsupportedError`
+
+#### Scenario: UnknownCapabilityRejected
+
+- **GIVEN** the active provider does not declare the SEMANTIC capability
+- **WHEN** a principal requests a semantic search
+- **THEN** a `ValueError` is raised indicating no provider supports the requested search type
+
 ### Requirement: SearchProviderProtocol
 
 > Serves: US-1
@@ -104,6 +169,19 @@ The `SearchProvider.search()` method SHALL accept a `SearchRequest` and return a
 `SearchLimits` (the `max_content_reads` ceiling), a `find_predicates` value, and an optional
 `match_mode` (`FullTextMatchMode`, default `ALL`) that applies only to FULLTEXT and is ignored
 for other search types (see `FulltextMatchMode`).
+`SearchProvider.index()` SHALL return a `SearchArtifact | None` (None for no-op providers).
+
+#### Scenario: DefaultProviderMigratedToRequest
+
+- **GIVEN** the default provider (glob, find)
+- **WHEN** `search` is called with a `SearchRequest`
+- **THEN** it serves glob/find from `search_metas` (metadata only) and returns a `SearchResponse`
+
+#### Scenario: IndexReturnsArtifactOrNone
+
+- **GIVEN** a metadata store exposing `NativeTextSearch` and the default provider
+- **WHEN** a file is written
+- **THEN** native indexing produces a `ready` `SearchArtifact` and the default provider's `index` returns `None`
 
 ### Requirement: NativeTextSearchCapability
 
@@ -112,7 +190,10 @@ for other search types (see `FulltextMatchMode`).
 > Previously: `search_text` received a `SearchRequest` with no match-mode field; FULLTEXT
 > borrowed the trigram representation (SQLite) or an English-stemmed `tsvector` (Postgres)
 > and always used strict-AND; the brute-force equivalence requirement did not specify a mode
-> and no cross-backend FULLTEXT equivalence was claimed.
+> and no cross-backend FULLTEXT equivalence was claimed. The single `RankedFulltext` scenario
+> is split into mode-specific `RankedFulltextAllMode` and `RankedFulltextAnyMode` below.
+
+<!-- modified-removes: RankedFulltext -->
 
 The metadata store MAY expose an optional `NativeTextSearch` capability (obtained via `native_text_search()`, returning the capability or `None`) with `index_text`, `search_text`, and `delete_text_artifacts` operations.
 The capability SHALL store searchable text keyed by `(provider_key, params_hash, content_hash)` — content is the searchable document; a file version is an occurrence of that content at a path.
@@ -206,7 +287,14 @@ For portable terms over fresh-indexed content (whole words both tokenizers segme
 > within `max_content_reads`, never excluded; the search failed loud only when the index store
 > errored or the straggler set exceeded the budget. This change removes query-time straggler
 > verification entirely — any straggler fails loud — and folds identity-current `failed`
-> artifacts into the confirmed-non-match class alongside `unsupported`.
+> artifacts into the confirmed-non-match class alongside `unsupported`. The baseline
+> `BoundedStragglersVerified` scenario is removed (no bounded verify survives), and the
+> baseline `ColdIndexFailsLoud` scenario is replaced by `AnyStragglerFailsLoud` and
+> `IndexUnavailableFailsLoud` below.
+
+<!-- modified-removes: BoundedStragglersVerified -->
+
+<!-- modified-removes: ColdIndexFailsLoud -->
 
 The system SHALL serve searches over a fresh native index with complete results and no blob reads.
 A fresh native index is **authoritative**: every in-scope version is decided (a `ready` artifact answers from stored text; an identity-current `unsupported`/`failed` artifact is a confirmed non-match), so results are complete without reading the blob store.
@@ -286,6 +374,8 @@ The reader SHALL refuse paths outside the permission-pruned scope.
 > straggler. With the index resident in the metadata store (and `object-store-text-index`
 > parked), an identity-current artifact's record is always present, so the external-record
 > readability clause and its scenario are removed; the requirement now frames decided-vs-straggler.
+
+<!-- modified-removes: ExternalRecordMissingOrMismatchedIsStale -->
 
 The system SHALL represent every search artifact as a `SearchArtifact` envelope carrying common lifecycle and freshness fields — `status` (one of `ready`, `failed`, `unsupported`), `schema_version`, `provider_key`, `provider_version`, `params_hash`, `content_hash`, `created_at`, `storage` (one of `inline`, `blob`, `external`), `error_code`, and `error_message` — and either an inline `payload` or an `artifact_ref`.
 An artifact SHALL be usable (answerable directly from the index) only when its `status` is `ready`, its `content_hash` equals the version's `content_hash`, and its `params_hash` equals the active provider's.

@@ -154,13 +154,11 @@ class SearchArtifact:
     ``status`` is one of ``"ready"``, ``"failed"``, or ``"unsupported"``.
     ``storage`` is one of ``"inline"``, ``"blob"``, or ``"external"``.
 
-    Usability check:
-    - ``status == "ready"`` AND ``content_hash`` matches the version's content hash AND
-      ``params_hash`` matches the active provider's config hash.
-    - For ``storage == "external"``: additionally the referenced record must be readable
-      and its recorded identity must match (``content_hash``/``params_hash``); a missing,
-      unreadable, or mismatched record is treated as a straggler, never a confirmed
-      non-match.
+    Usability check (see :meth:`is_usable`): ``status == "ready"`` AND ``content_hash``
+    matches the version's content hash AND ``params_hash`` matches the active provider's
+    config hash.  The text record is content-addressed and resident in the metadata store,
+    so an identity-current artifact's record is always present — there is no separate
+    external-record readability check.
 
     Serialization: use :meth:`to_dict` / :meth:`from_dict` at the store boundary.
     The ``created_at`` datetime is stored as an ISO-8601 string in the serialized form.
