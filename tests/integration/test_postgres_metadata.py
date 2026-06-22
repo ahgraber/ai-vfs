@@ -414,6 +414,38 @@ class TestPostgresNativeTextSearch:
         assert response.results == [], "non-stemming 'simple' matches whole words — 'cat' must not match 'category'"
 
     @pytest.mark.asyncio
+    async def test_two_derived_representations_single_write(self, pg_store):
+        """TwoDerivedRepresentationsPerBackend (Postgres): one index_text serves both modalities.
+
+        A single `index_text` makes the content matchable by REGEX (pg_trgm substring) AND by
+        FULLTEXT (`'simple'` tsvector), including the sub-trigram term `s3` — no second write.
+        """
+        nts = pg_store.native_text_search()
+        ch = _ch("deploy to s3 bucket")
+        await nts.index_text(str(ULID()), ch, nts.params_hash, "deploy to s3 bucket")
+        entries = [_search_meta_entry("/deploy.txt", ch)]
+
+        regex = await nts.search_text(_req("deploy", SearchType.REGEX, entries), [])
+        fulltext = await nts.search_text(_req("s3", SearchType.FULLTEXT, entries), [])
+        assert {r.path for r in regex.results} == {"/deploy.txt"}, "REGEX must match after a single index_text"
+        assert {r.path for r in fulltext.results} == {"/deploy.txt"}, "FULLTEXT must match after the same index_text"
+
+    @pytest.mark.asyncio
+    async def test_index_text_in_version_transaction(self, pg_store):
+        """IndexTextInVersionTransaction (Postgres): index_text rolls back with its enclosing txn."""
+        nts = pg_store.native_text_search()
+        ch = _ch("rolled back postgres text")
+        entries = [_search_meta_entry("/rb.txt", ch)]
+
+        with pytest.raises(RuntimeError):
+            async with pg_store.transaction():
+                await nts.index_text(str(ULID()), ch, nts.params_hash, "rolled back postgres text")
+                raise RuntimeError("force rollback")
+
+        after = await nts.search_text(_req("rolled", SearchType.REGEX, entries), [])
+        assert after.results == [], "text artifact must not persist after the enclosing transaction rolls back"
+
+    @pytest.mark.asyncio
     async def test_regex_round_trip(self, pg_store):
         """AcceleratedRegexAvoidsBlobReads (Postgres): regex search returns matching paths, no blob reads."""
         nts = pg_store.native_text_search()
