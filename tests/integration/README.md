@@ -1,88 +1,60 @@
 # Running Integration Tests
 
 The integration tests require live Postgres, MongoDB, and MinIO instances.
-They are skipped automatically in the default test run when the required environment variables are absent.
+Each suite skips automatically when its service is unreachable, so a partial stack — or no stack — simply runs fewer tests.
 
-## One-command run
+## Run
+
+From the Nix devshell, opt in with `AIVFS_INTEGRATION` and the harness owns the stack for the session — it brings the compose stack up, runs every test against it, and tears it down at the end:
 
 ```sh
-scripts/integration-tests.sh
+AIVFS_INTEGRATION=1 uv run pytest tests/integration -q
 ```
 
-The script resolves a container engine (podman → colima → docker), starts the compose stack, creates the MinIO bucket, exports the env vars, runs pytest, and tears down the stack on exit.
-See `--help` for all options:
+No `podman` commands, env-var exports, or bucket creation are needed:
+
+- The devshell's lazy `podman`/`docker` shim brings the container machine up on first use (no `podman machine init`/`start`).
+- `conftest.py` runs `compose up -d --wait` at session start and `compose down -v` at session finish.
+- `conftest.py` also defaults the service DSNs and provisions an ephemeral, per-worker MinIO bucket, deleting it at the end.
+
+If a stack is **already running**, the session prompts — `r` reuse it (left running), `t` tear it down at exit, `q` quit — because teardown is destructive; with no interactive terminal it aborts rather than touch a stack it did not start.
+
+To reuse a running stack without any teardown (fast iteration, or CI that owns the stack), use `reuse` instead of `1`:
 
 ```sh
-scripts/integration-tests.sh --help
+AIVFS_INTEGRATION=reuse uv run pytest tests/integration -q
 ```
 
-Useful flags:
+## Run against your own services
 
-| Flag        | Effect                                                   |
-| ----------- | -------------------------------------------------------- |
-| `--init`    | Allow `podman machine init` when no VM exists (one-time) |
-| `--keep-up` | Leave containers running after the test run              |
-| `--stop-vm` | Also stop the container VM after teardown                |
-| `--`        | Everything after this is forwarded to pytest             |
-
-Examples:
+Without `AIVFS_INTEGRATION`, the harness manages nothing — it points at whatever is reachable and skips the rest:
 
 ```sh
-# Run only S3 blob tests
-scripts/integration-tests.sh -- -k s3_blob
-
-# Run with verbose pytest output, keep containers up for inspection
-scripts/integration-tests.sh --keep-up -- -x -v
-
-# First run on a machine without a podman VM
-scripts/integration-tests.sh --init
-```
-
-## Manual / step-by-step
-
-If you prefer to manage the stack yourself:
-
-```sh
-# 1. Start the stack
-docker compose -f tests/integration/docker-compose.yaml up -d
-
-# 2. Create the MinIO bucket (one-time, idempotent)
-docker compose -f tests/integration/docker-compose.yaml exec minio \
-    mc alias set local http://localhost:9000 minioadmin minioadmin
-docker compose -f tests/integration/docker-compose.yaml exec minio \
-    mc mb -p local/aivfs-test
-
-# 3. Export env vars
-export AIVFS_TEST_POSTGRES_DSN=postgresql://aivfs:aivfs@localhost:5432/aivfs
-export AIVFS_TEST_MONGO_URI=mongodb://localhost:27017/aivfs
-export AIVFS_TEST_S3_BUCKET=aivfs-test
-export AWS_ACCESS_KEY_ID=minioadmin
-export AWS_SECRET_ACCESS_KEY=minioadmin
-export AWS_ENDPOINT_URL_S3=http://localhost:9000
-export AWS_REGION=us-east-1
-
-# 4. Run tests
 uv run pytest tests/integration -q
-
-# 5. Tear down
-docker compose -f tests/integration/docker-compose.yaml down -v
 ```
 
-## Service details
+Export the matching env vars to target services you manage yourself; `setdefault` means your values take precedence, and an explicit `AIVFS_TEST_S3_BUCKET` is left unmanaged (conftest neither creates nor deletes it).
 
-See `docker-compose.yaml` for full service definitions and port mappings.
-
-| Service  | Port  | Env var                          |
+| Service  | Port  | Env var (defaulted by conftest)  |
 | -------- | ----- | -------------------------------- |
 | Postgres | 5432  | `AIVFS_TEST_POSTGRES_DSN`        |
 | MongoDB  | 27017 | `AIVFS_TEST_MONGO_URI`           |
 | MinIO    | 9000  | `AIVFS_TEST_S3_BUCKET` + `AWS_*` |
 
-## Parallel execution
-
-The integration tests are compatible with `pytest-xdist`.
-Each worker provisions its own database/key-prefix to avoid collisions:
+To bring the stack up manually for inspection or fast iteration (e.g. keeping it hot across several runs), use compose directly and run without `AIVFS_INTEGRATION`:
 
 ```sh
-uv run pytest -n auto tests/integration -q
+podman compose -f tests/integration/docker-compose.yaml up -d
+uv run pytest tests/integration -q
+podman compose -f tests/integration/docker-compose.yaml down -v
+```
+
+See `docker-compose.yaml` for full service definitions and port mappings.
+
+## Parallel execution
+
+The integration tests are compatible with `pytest-xdist`; each worker provisions its own bucket/database namespace to avoid collisions:
+
+```sh
+AIVFS_INTEGRATION=1 uv run pytest -n auto tests/integration -q
 ```

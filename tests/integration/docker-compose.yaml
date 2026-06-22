@@ -1,54 +1,25 @@
 # Service fixtures for ai-vfs integration tests.
 #
-# Postgres backs tests/integration/test_postgres_metadata.py. Start it with:
+# How to run: see tests/integration/README.md. In short, `AIVFS_INTEGRATION=1 uv run pytest
+# tests/integration` brings this stack up (`compose up -d --wait`), runs the suite against it, and
+# tears it down at the end — conftest.py owns the lifecycle, the service DSNs, and the bucket.
 #
-#     docker compose -f tests/integration/docker-compose.yaml up -d postgres
+# What each service backs (and how the harness isolates it):
+#   - postgres → test_postgres_metadata.py plus the boundary/tier suites. Tests provision a
+#     per-xdist-worker database (aivfs_<suite>_<worker>) via a maintenance connection to the
+#     `postgres` database, so the DSN's role needs CREATEDB; the default `aivfs` superuser has it.
+#     The DSN's own database is never modified.
+#   - mongo → test_mongo_metadata.py. A per-xdist-worker database is dropped before and after each
+#     test, so parallel workers never clobber each other.
+#   - minio → test_s3_blob.py. conftest provisions an ephemeral, per-xdist-worker bucket
+#     (AIVFS_TEST_S3_BUCKET) at session start and deletes it at the end; combined with the
+#     volume-less /data below, nothing persists across runs.
 #
-# then point the test suite at it:
+# To manage the stack by hand for inspection (then run pytest without AIVFS_INTEGRATION, or with
+# AIVFS_INTEGRATION=reuse, to use it without teardown):
 #
-#     export AIVFS_TEST_POSTGRES_DSN=postgresql://aivfs:aivfs@localhost:5432/aivfs
-#     uv run pytest tests/integration/test_postgres_metadata.py
-#
-# The tests provision a per-xdist-worker database (aivfs_test_<worker>) via a maintenance
-# connection to the `postgres` database, so the role in the DSN needs CREATEDB. The
-# default `aivfs` superuser below has it; the DSN's own database is never modified.
-#
-# Mongo backs tests/integration/test_mongo_metadata.py. Start it with:
-#
-#     docker compose -f tests/integration/docker-compose.yaml up -d mongo
-#
-# then point the test suite at it:
-#
-#     export AIVFS_TEST_MONGO_URI=mongodb://localhost:27017/aivfs
-#     uv run pytest tests/integration/test_mongo_metadata.py
-#
-# The tests provision a per-xdist-worker database (aivfs_test_<worker>) derived from the URI,
-# dropping it before and after each test, so parallel workers never clobber each other.
-#
-# MinIO backs tests/integration/test_s3_blob.py. Start it with:
-#
-#     docker compose -f tests/integration/docker-compose.yaml up -d minio
-#
-# then create the test bucket once (the tests do NOT auto-create it; they isolate by a
-# per-xdist-worker key prefix in a shared bucket):
-#
-#     docker compose -f tests/integration/docker-compose.yaml exec minio \
-#         mc alias set local http://localhost:9000 minioadmin minioadmin
-#     docker compose -f tests/integration/docker-compose.yaml exec minio \
-#         mc mb -p local/aivfs-test
-#
-# then point the test suite at it:
-#
-#     export AIVFS_TEST_S3_BUCKET=aivfs-test
-#     export AWS_ACCESS_KEY_ID=minioadmin
-#     export AWS_SECRET_ACCESS_KEY=minioadmin
-#     export AWS_ENDPOINT_URL_S3=http://localhost:9000
-#     export AWS_REGION=us-east-1
-#     uv run pytest tests/integration/test_s3_blob.py
-#
-# Tear down with:
-#
-#     docker compose -f tests/integration/docker-compose.yaml down -v
+#     podman compose -f tests/integration/docker-compose.yaml up -d
+#     podman compose -f tests/integration/docker-compose.yaml down -v
 services:
   postgres:
     image: postgres:17-alpine
