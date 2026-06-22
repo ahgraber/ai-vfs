@@ -26,8 +26,8 @@ from vfs.stores.postgres_metadata import _build_fulltext_tsquery
 def _compile(fragment: str, binds: dict[str, str]):
     """Compile the fragment in both score and predicate positions against the PG dialect."""
     stmt = sa.text(
-        f"SELECT ts_rank(to_tsvector('english', raw_text), {fragment}) "
-        f"WHERE to_tsvector('english', raw_text) @@ ({fragment})"
+        f"SELECT ts_rank(to_tsvector('simple', raw_text), {fragment}) "
+        f"WHERE to_tsvector('simple', raw_text) @@ ({fragment})"
     ).bindparams(**binds)
     return stmt.compile(dialect=postgresql.dialect())
 
@@ -37,7 +37,7 @@ def test_all_mode_single_plainto_tsquery() -> None:
     built = _build_fulltext_tsquery("hello cloud", FullTextMatchMode.ALL)
     assert built is not None
     fragment, binds = built
-    assert fragment == "plainto_tsquery('english', :query)"
+    assert fragment == "plainto_tsquery('simple', :query)"
     assert binds == {"query": "hello cloud"}
     _compile(fragment, binds)  # must not raise
 
@@ -48,7 +48,7 @@ def test_any_mode_or_combines_per_term() -> None:
     assert built is not None
     fragment, binds = built
     assert fragment == (
-        "plainto_tsquery('english', :t0) || plainto_tsquery('english', :t1) || plainto_tsquery('english', :t2)"
+        "plainto_tsquery('simple', :t0) || plainto_tsquery('simple', :t1) || plainto_tsquery('simple', :t2)"
     )
     assert binds == {"t0": "hello", "t1": "cloud", "t2": "bucket"}
     _compile(fragment, binds)  # must not raise
@@ -59,7 +59,7 @@ def test_any_mode_single_term_reduces_to_one_call() -> None:
     built = _build_fulltext_tsquery("hello", FullTextMatchMode.ANY)
     assert built is not None
     fragment, binds = built
-    assert fragment == "plainto_tsquery('english', :t0)"
+    assert fragment == "plainto_tsquery('simple', :t0)"
     assert "||" not in fragment
     assert binds == {"t0": "hello"}
 

@@ -571,21 +571,17 @@ class TestNativeTextSearchCapability:
     async def test_fulltext_match_any_ranks_union(self, vfs_nts):
         """FulltextMatchAnyRanksUnion (SQLite): mode=ANY returns the union, both-terms doc ranks first.
 
-        Corpus: "hello world" (matches one term) and "hello cloud bucket" (matches both).
-        Query "hello cloud" in mode=ANY returns both; the both-terms doc ranks above the
-        one-term doc.
-
-        NB: the SQLite FTS5 index uses the *trigram* tokenizer, which produces no tokens
-        for terms shorter than 3 characters.  The spec scenario's literal "s3" term (2
-        chars) is therefore unrepresentable on this backend; "cloud" preserves the scenario
-        intent (one-term doc vs both-terms doc) with a trigram-viable term.
+        Corpus: "hello world" (matches one term) and "hello s3 bucket" (matches both).
+        Query "hello s3" in mode=ANY returns both; the both-terms doc ranks above the
+        one-term doc.  The two-character term ``s3`` is a first-class ``unicode61`` word
+        token — no trigram floor.
         """
         ns, agent = await _setup_vfs(vfs_nts)
         await vfs_nts.write(ns.id, "/one.txt", b"hello world", principal_id=agent.id)
-        await vfs_nts.write(ns.id, "/both.txt", b"hello cloud bucket", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/both.txt", b"hello s3 bucket", principal_id=agent.id)
 
         results = await vfs_nts.search(
-            ns.id, "hello cloud", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ANY
+            ns.id, "hello s3", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ANY
         )
 
         paths = [r.path for r in results]
@@ -599,16 +595,15 @@ class TestNativeTextSearchCapability:
     async def test_fulltext_match_all_requires_every_term(self, vfs_nts):
         """FulltextMatchAllRequiresEveryTerm (SQLite): mode=ALL returns only docs with every term.
 
-        Same corpus as the ANY test; query "hello cloud" in mode=ALL returns only the
-        both-terms doc.  (See the ANY test for why "cloud" stands in for the spec's "s3":
-        the trigram tokenizer cannot index sub-trigram terms.)
+        Same ``s3`` corpus as the ANY test; query "hello s3" in mode=ALL returns only the
+        both-terms doc — the "hello world" doc lacks ``s3``.
         """
         ns, agent = await _setup_vfs(vfs_nts)
         await vfs_nts.write(ns.id, "/one.txt", b"hello world", principal_id=agent.id)
-        await vfs_nts.write(ns.id, "/both.txt", b"hello cloud bucket", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/both.txt", b"hello s3 bucket", principal_id=agent.id)
 
         results = await vfs_nts.search(
-            ns.id, "hello cloud", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ALL
+            ns.id, "hello s3", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ALL
         )
 
         assert {r.path for r in results} == {"/both.txt"}, "ALL mode must require every query term"
@@ -689,3 +684,208 @@ class TestNativeTextSearchCapability:
             await vfs_nts.search(
                 ns.id, "hello", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=FullTextMatchMode.ANY
             )
+
+
+class TestFulltextWordRepresentation:
+    """FulltextWordRepresentation: word tokens for FULLTEXT, trigram for REGEX, on SQLite."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", [FullTextMatchMode.ALL, FullTextMatchMode.ANY])
+    async def test_short_term_fulltext_is_representable(self, vfs_nts, mode):
+        """ShortTermFulltextIsRepresentable: the 2-char term ``s3`` matches exactly (no trigram floor)."""
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/deploy.txt", b"deploy to s3", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/archive.txt", b"deploy to archive", principal_id=agent.id)
+
+        results = await vfs_nts.search(ns.id, "s3", "/", SearchType.FULLTEXT, principal_id=agent.id, match_mode=mode)
+        assert {r.path for r in results} == {"/deploy.txt"}, (
+            "the two-character term 's3' must match only the document containing it"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fulltext_matches_whole_words_not_substrings(self, vfs_nts):
+        """FulltextMatchesWholeWordsNotSubstrings: FULLTEXT 'cat' does NOT match 'category'."""
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/cat.txt", b"this is a category of things", principal_id=agent.id)
+
+        results = await vfs_nts.search(ns.id, "cat", "/", SearchType.FULLTEXT, principal_id=agent.id)
+        assert {r.path for r in results} == set(), (
+            "fulltext matches whole word tokens, not substrings — 'cat' must not match 'category'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_regex_still_matches_substrings(self, vfs_nts):
+        """RegexStillMatchesSubstrings: REGEX 'cat' DOES match 'category' (trigram unchanged)."""
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/cat.txt", b"this is a category of things", principal_id=agent.id)
+
+        results = await vfs_nts.search(ns.id, "cat", "/", SearchType.REGEX, principal_id=agent.id)
+        assert {r.path for r in results} == {"/cat.txt"}, (
+            "regex retains substring matching via the unchanged trigram representation"
+        )
+
+    @pytest.mark.asyncio
+    async def test_provider_version_bumped_on_new_writes(self, vfs_nts):
+        """provider_version evidence: new SQLite artifacts carry the bumped marker; is_usable ignores it.
+
+        Covers the SQLite ``index_text`` builder (the stored ``ready`` artifact) and the
+        ``vfs.write`` decode-error ``unsupported`` builder.  ``is_usable`` compares
+        ``params_hash`` only, so an artifact with the old ``provider_version`` but a current
+        ``params_hash`` stays usable.
+        """
+        from vfs.models import SearchArtifact
+
+        ns, agent = await _setup_vfs(vfs_nts)
+        nts = vfs_nts._meta.native_text_search()
+
+        # index_text builder → ready artifact carries provider_version "2".
+        ver = await vfs_nts.write(ns.id, "/text.txt", b"hello world", principal_id=agent.id)
+        ready = SearchArtifact.from_dict(ver.search_meta[nts.provider_key])
+        assert ready.status == "ready"
+        assert ready.provider_version == "2", "index_text must stamp the bumped provider_version"
+
+        # vfs.write decode-error builder → unsupported artifact carries provider_version "2".
+        bin_ver = await vfs_nts.write(ns.id, "/bin.dat", b"\xff\xfe\x00\x01", principal_id=agent.id)
+        unsupported = SearchArtifact.from_dict(bin_ver.search_meta[nts.provider_key])
+        assert unsupported.status == "unsupported"
+        assert unsupported.provider_version == "2", "the decode-error builder must stamp the bumped version"
+
+        # is_usable is unaffected by provider_version: an old-version record is still usable.
+        old_marker = SearchArtifact(
+            status="ready",
+            schema_version=1,
+            provider_key=nts.provider_key,
+            provider_version="1",
+            params_hash=nts.params_hash,
+            content_hash=ver.content_hash,
+            created_at=_now(),
+            storage="external",
+            artifact_ref=None,
+        )
+        assert old_marker.is_usable(current_content_hash=ver.content_hash, active_params_hash=nts.params_hash), (
+            "provider_version must not participate in is_usable"
+        )
+
+
+class TestDerivedIndexRebuild:
+    """DerivedIndexRebuild: the word index is rebuilt from raw_text at init, idempotently."""
+
+    async def _word_row_count(self, store, content_hash: str) -> int:
+        rows = await store._execute_fetchall(
+            "SELECT COUNT(*) FROM search_fts_words WHERE provider_key=? AND content_hash=?",
+            (store.native_text_search().provider_key, content_hash),
+        )
+        return rows[0][0]
+
+    @pytest.mark.asyncio
+    async def test_word_index_backfilled_from_raw_text_without_blob_reads(self, vfs_nts):
+        """WordIndexBackfilledFromRawTextWithoutBlobReads: rebuild from raw_text, zero blob reads."""
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/doc.txt", b"hello s3 bucket", principal_id=agent.id)
+        store = vfs_nts._meta
+        nts = store.native_text_search()
+        ch = (await store.get_version(ns.id, "/doc.txt")).content_hash
+
+        # Simulate content indexed before the word table existed: drop its word rows,
+        # leaving the content-addressed raw_text record in place.
+        async with store._lock:
+            await store._conn.exec_driver_sql(
+                "DELETE FROM search_fts_words WHERE provider_key=? AND content_hash=?",
+                (nts.provider_key, ch),
+            )
+            await store._conn.commit()
+        assert await self._word_row_count(store, ch) == 0
+
+        # Re-run the init-time backfill: it rebuilds from raw_text only.
+        await store._backfill_word_index()
+        assert await self._word_row_count(store, ch) == 1
+
+        # FULLTEXT now serves the rebuilt content with zero blob reads.
+        counting = _CountingBlobStore(vfs_nts._blob)
+        vfs_nts._blob = counting
+        results = await vfs_nts.search(ns.id, "s3", "/", SearchType.FULLTEXT, principal_id=agent.id)
+        assert {r.path for r in results} == {"/doc.txt"}
+        assert counting.get_count == 0, "rebuild + fresh search must not read the blob store"
+
+    @pytest.mark.asyncio
+    async def test_derived_index_rebuild_is_idempotent_and_resumable(self, vfs_nts):
+        """DerivedIndexRebuildIsIdempotentAndResumable: no duplicate rows / occurrences on re-run."""
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/a.txt", b"alpha unique", principal_id=agent.id)
+        await vfs_nts.write(ns.id, "/b.txt", b"beta unique", principal_id=agent.id)
+        store = vfs_nts._meta
+        nts = store.native_text_search()
+        ch_a = (await store.get_version(ns.id, "/a.txt")).content_hash
+        ch_b = (await store.get_version(ns.id, "/b.txt")).content_hash
+
+        # A re-run with everything already present inserts nothing (idempotent).
+        await store._backfill_word_index()
+        assert await self._word_row_count(store, ch_a) == 1
+        assert await self._word_row_count(store, ch_b) == 1
+
+        # Simulate a partially-built index: drop only /a.txt's word row, then resume.
+        async with store._lock:
+            await store._conn.exec_driver_sql(
+                "DELETE FROM search_fts_words WHERE provider_key=? AND content_hash=?",
+                (nts.provider_key, ch_a),
+            )
+            await store._conn.commit()
+        await store._backfill_word_index()
+        # Only the missing row is filled; the present row is not duplicated.
+        assert await self._word_row_count(store, ch_a) == 1
+        assert await self._word_row_count(store, ch_b) == 1
+
+        # The shared term returns exactly one occurrence per path (no duplicate results).
+        results = await vfs_nts.search(ns.id, "unique", "/", SearchType.FULLTEXT, principal_id=agent.id)
+        assert sorted(r.path for r in results) == ["/a.txt", "/b.txt"]
+
+    @pytest.mark.asyncio
+    async def test_backfill_failure_fails_closed(self, monkeypatch):
+        """A failed word-index rebuild must NOT expose native search (fail closed).
+
+        If the rebuild raises after the FTS5 tables are created, exposing the capability would
+        let FULLTEXT serve from an incomplete word table — silent false negatives, violating
+        the DerivedIndexRebuild "rebuild completes before serving" invariant.  native_text_search()
+        must return None instead, so fulltext is unsupported and regex falls back to brute-force.
+        """
+        store = SQLiteMetadataStore(":memory:")
+
+        async def _boom() -> None:
+            raise RuntimeError("simulated word-index backfill failure")
+
+        monkeypatch.setattr(store, "_backfill_word_index", _boom)
+        await store.initialize()
+        try:
+            assert store.native_text_search() is None, "a failed word-index backfill must not expose native search"
+        finally:
+            await store.close()
+
+
+class TestFulltextTermCap:
+    """FulltextMatchMode boundary: reject FULLTEXT queries above the term cap."""
+
+    @pytest.mark.asyncio
+    async def test_fulltext_rejects_too_many_terms(self, vfs_nts):
+        """FulltextRejectsTooManyTerms: > 128 terms raises at the boundary; <= 128 succeeds."""
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/doc.txt", b"hello world", principal_id=agent.id)
+
+        over = " ".join(f"term{i}" for i in range(129))
+        with pytest.raises(ValueError, match="too many terms"):
+            await vfs_nts.search(ns.id, over, "/", SearchType.FULLTEXT, principal_id=agent.id)
+
+        # At the cap (128 terms) the search runs without the boundary error.
+        at_cap = " ".join(f"term{i}" for i in range(128))
+        results = await vfs_nts.search(ns.id, at_cap, "/", SearchType.FULLTEXT, principal_id=agent.id)
+        assert isinstance(results, list)
+
+    @pytest.mark.asyncio
+    async def test_term_cap_ignored_for_non_fulltext(self, vfs_nts):
+        """The cap is FULLTEXT-only: an over-long REGEX query is not rejected by the boundary."""
+        ns, agent = await _setup_vfs(vfs_nts)
+        await vfs_nts.write(ns.id, "/doc.txt", b"hello world", principal_id=agent.id)
+
+        # 200 whitespace-separated tokens as a regex pattern — not subject to the FULLTEXT cap.
+        over = " ".join(f"term{i}" for i in range(200))
+        results = await vfs_nts.search(ns.id, over, "/", SearchType.REGEX, principal_id=agent.id)
+        assert isinstance(results, list)
