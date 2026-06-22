@@ -199,8 +199,9 @@ The trigram regex index, the `raw_text` records, and per-version `search_meta` a
 
 **Freshness blind spot (load-bearing).**
 The straggler classifier proves index presence via the per-version artifact manifest (`search_meta`), which reflects the `search_text_artifacts` record only and has **no visibility into the word table**.
-A `content_hash` with a `raw_text` row therefore classifies as _fresh_ regardless of whether its word-table row exists — so if the backfill has not completed, `_fulltext_search` queries an incomplete word table and silently returns empty/wrong fulltext with no straggler fallback.
+A `content_hash` with a `raw_text` row therefore classifies as _fresh_ regardless of whether its word-table row exists, and the classifier cannot detect an incomplete word table on its own.
 **Fresh-fulltext correctness depends on the init backfill having run to completion before serving.**
+The implementation makes this fail closed rather than fail silent: `_setup_fts5` runs the backfill synchronously and exposes the `NativeTextSearch` capability **only after the rebuild succeeds**, so a failed rebuild leaves `native_text_search()` returning `None` (FULLTEXT unsupported, REGEX on the brute-force fallback) instead of serving empty/wrong fulltext from a partial word table.
 Because the backfill is anti-join/resumable, an interrupted init self-heals on the next init; the spec states this dependency explicitly rather than relying on the straggler path to cover a missing word-table row.
 
 **Precondition / fallback:** the zero-blob-read backfill holds only where a `raw_text` row is present.
@@ -209,7 +210,7 @@ On its next search such content is a straggler, so the native search **fails lou
 
 **Version bump (policy).**
 The repository requires a version bump of the affected artifact for retrieval-scoring changes.
-`SearchArtifact.provider_version` is bumped (from `"1"`, at the five construction sites: `sqlite_metadata.index_text`, `postgres_metadata.index_text`, and the three `vfs.py` artifact builders) **on new writes** as a forward marker.
+`SearchArtifact.provider_version` is bumped (from `"1"` to `"2"`, at the four construction sites: `sqlite_metadata.index_text`, `postgres_metadata.index_text`, and the two `vfs.py` `unsupported` builders — the write-path decode-error and reindex-path builders; the §12 cull removed the former lazy-backfill builder, so the count is four, not five) **on new writes** as a forward marker.
 Be honest about its limits: it is informational only (`is_usable` compares `params_hash`, never `provider_version`), and because existing records are _not_ rewritten, they keep `provider_version="1"` while serving the new word-token behavior — so the field does **not** distinguish old-vs-new behavior on the pre-existing records that the migration actually covers.
 The load-bearing migration mechanism is the backfill; `provider_version` satisfies the policy's version-field requirement but is not what makes the migration correct.
 `params_hash` is intentionally left unchanged for the reasons above.

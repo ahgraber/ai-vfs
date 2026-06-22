@@ -13,7 +13,11 @@
 > lazily backfill a **bounded** straggler set during search. This change removes the lazy-backfill
 > `MAY` (the search path performs no writes; `reindex` is the sole remedy and a straggler fails
 > loud) and extends `search_meta` propagation from rollback alone to all derived versions —
-> rollback, copy, and move destinations.
+> rollback, copy, and move destinations. The baseline `LazyBackfillIsBoundedAndVfsOwned`
+> scenario is removed (the lazy-backfill `MAY` is gone) and replaced by
+> `SearchPerformsNoLazyBackfill` below.
+
+<!-- modified-removes: LazyBackfillIsBoundedAndVfsOwned -->
 
 The system SHALL provide a reindex operation that backfills search metadata for files written before native text search was activated or whose `params_hash` changed.
 Native text search SHALL NOT trigger **content/metadata** backfill itself: it SHALL NOT read the blob store, call `index_text`, or create `search_meta` artifacts on its own.
