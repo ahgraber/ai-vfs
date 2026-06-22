@@ -215,12 +215,14 @@ class TestNativeTextSearchStorage:
         result = await gc.run()
         assert result.blobs_reclaimed == 1
 
-        # Text artifact must be gone.
-        rows = await nts_store._execute_fetchall(
-            "SELECT COUNT(*) FROM search_text_artifacts WHERE content_hash=?",
-            (content_hash,),
-        )
-        assert rows[0][0] == 0, "text artifact must be deleted when its content_hash is orphaned"
+        # Text artifact must be gone from raw-text store AND both derived representations
+        # (trigram + word) — the requirement deletes the content from all derived indexes.
+        for table in ("search_text_artifacts", "search_fts", "search_fts_words"):
+            rows = await nts_store._execute_fetchall(
+                f"SELECT COUNT(*) FROM {table} WHERE content_hash=?",  # noqa: S608 — table is a test-local literal
+                (content_hash,),
+            )
+            assert rows[0][0] == 0, f"{table} row must be deleted when its content_hash is orphaned"
 
     @pytest.mark.asyncio
     async def test_live_referenced_content_never_swept(self, nts_store, tmp_path):
@@ -859,6 +861,43 @@ class TestDerivedIndexRebuild:
             assert store.native_text_search() is None, "a failed word-index backfill must not expose native search"
         finally:
             await store.close()
+
+    @pytest.mark.asyncio
+    async def test_rebuild_runs_on_reinitialize(self, tmp_path):
+        """The anti-join rebuild runs on a fresh ``initialize()`` (resumable across restarts).
+
+        Exercises the full `initialize()` → `_setup_fts5` → `_backfill_word_index` path on a
+        second store instance over the same database, not a direct `_backfill_word_index()` call.
+        """
+        db_path = str(tmp_path / "reinit.db")
+        store = SQLiteMetadataStore(db_path)
+        await store.initialize()
+        nts = store.native_text_search()
+        if nts is None:
+            await store.close()
+            pytest.skip("FTS5 trigram tokenizer not available (SQLite < 3.34)")
+        ch = _hash("hello s3 bucket")
+        await nts.index_text(str(ULID()), ch, nts.params_hash, "hello s3 bucket")
+        # Simulate content indexed before the word table existed: drop its word rows only.
+        async with store._lock:
+            await store._conn.exec_driver_sql(
+                "DELETE FROM search_fts_words WHERE provider_key=? AND content_hash=?",
+                (nts.provider_key, ch),
+            )
+            await store._conn.commit()
+        await store.close()
+
+        # A fresh store over the same DB runs the rebuild during initialize().
+        store2 = SQLiteMetadataStore(db_path)
+        await store2.initialize()
+        try:
+            rows = await store2._execute_fetchall(
+                "SELECT COUNT(*) FROM search_fts_words WHERE provider_key=? AND content_hash=?",
+                (store2.native_text_search().provider_key, ch),
+            )
+            assert rows[0][0] == 1, "re-initialize() must rebuild the missing word-index row via the anti-join"
+        finally:
+            await store2.close()
 
 
 class TestFulltextTermCap:
