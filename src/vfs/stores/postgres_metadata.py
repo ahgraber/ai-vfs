@@ -34,6 +34,10 @@ _log = logging.getLogger(__name__)
 _PG_PROVIDER_KEY: str = "vfs.postgres_fts"
 
 #: Short hex digest of the tokenizer/index configuration — bump when config changes.
+#: Deliberately frozen across the FULLTEXT ``'english'``→``'simple'`` switch: ``params_hash``
+#: keys the tokenizer-independent ``raw_text`` and is shared with the trigram REGEX
+#: representation, so the seed string is left as-is to avoid re-keying stored records (the
+#: tsvector is computed inline, so the config change needs no stored-state migration).
 _PG_PARAMS_HASH: str = hashlib.sha256(b"postgres:tsvector+trgm:english:v1").hexdigest()[:16]
 
 
@@ -41,15 +45,19 @@ def _build_fulltext_tsquery(query: str, mode: FullTextMatchMode) -> tuple[str, d
     """Build the tsquery SQL fragment and its bound params for a fulltext query.
 
     Returns ``(fragment, bindparams)`` where ``fragment`` is a SQL expression containing
-    only ``plainto_tsquery('english', :tN)`` calls referencing named placeholders, and
+    only ``plainto_tsquery('simple', :tN)`` calls referencing named placeholders, and
     ``bindparams`` maps each placeholder to the user term it binds.  Returns ``None`` when
     the query has no terms (empty or whitespace-only), so callers can short-circuit to an
     empty response rather than emit invalid SQL.
 
-    - ``ALL`` (default): a single ``plainto_tsquery('english', :query)`` over the whole
+    The ``'simple'`` config is non-stemming and removes no stop-words — the Postgres analog
+    of SQLite's ``unicode61`` word tokenizer — so per-term presence is exact and a sub-trigram
+    term such as ``s3`` is representable.
+
+    - ``ALL`` (default): a single ``plainto_tsquery('simple', :query)`` over the whole
       query string — every term must appear (``plainto_tsquery`` AND-combines its lexemes).
     - ``ANY``: the query is split on whitespace and each term gets its own
-      ``plainto_tsquery('english', :tN)`` call, OR-combined with the tsquery ``||``
+      ``plainto_tsquery('simple', :tN)`` call, OR-combined with the tsquery ``||``
       operator.  A single-term query reduces to exactly one ``plainto_tsquery`` call,
       identical to ``ALL``.
 
@@ -62,9 +70,9 @@ def _build_fulltext_tsquery(query: str, mode: FullTextMatchMode) -> tuple[str, d
     if not terms:
         return None
     if mode == FullTextMatchMode.ANY:
-        fragment = " || ".join(f"plainto_tsquery('english', :t{i})" for i in range(len(terms)))
+        fragment = " || ".join(f"plainto_tsquery('simple', :t{i})" for i in range(len(terms)))
         return fragment, {f"t{i}": term for i, term in enumerate(terms)}
-    return "plainto_tsquery('english', :query)", {"query": query}
+    return "plainto_tsquery('simple', :query)", {"query": query}
 
 
 class _PostgresNativeTextSearch:
@@ -84,9 +92,11 @@ class _PostgresNativeTextSearch:
     a sequential scan of ``search_text_artifacts`` — correctness and zero-blob-read
     invariant hold; the sub-millisecond latency claim does not.
 
-    Fulltext path: ``plainto_tsquery`` matched against ``to_tsvector('english', raw_text)``,
-    ranked by ``ts_rank``.  In ``ALL`` mode a single ``plainto_tsquery('english', :query)``
-    is used; in ``ANY`` mode per-term ``plainto_tsquery`` calls are OR-combined with ``||``.
+    Fulltext path: ``plainto_tsquery`` matched against ``to_tsvector('simple', raw_text)``,
+    ranked by ``ts_rank``.  The non-stemming ``'simple'`` config (the Postgres analog of
+    SQLite ``unicode61``) gives whole-word, multilingual-neutral matching with no trigram
+    floor.  In ``ALL`` mode a single ``plainto_tsquery('simple', :query)`` is used; in ``ANY``
+    mode per-term ``plainto_tsquery`` calls are OR-combined with ``||``.
     """
 
     provider_key: str = _PG_PROVIDER_KEY
@@ -128,7 +138,7 @@ class _PostgresNativeTextSearch:
             status="ready",
             schema_version=1,
             provider_key=self.provider_key,
-            provider_version="1",
+            provider_version="2",
             params_hash=params_hash,
             content_hash=content_hash,
             created_at=datetime.now(timezone.utc),
@@ -217,15 +227,19 @@ class _PostgresNativeTextSearch:
         ch_to_entries: dict[str, list[Any]],
         mode: FullTextMatchMode = FullTextMatchMode.ALL,
     ) -> SearchResponse:
-        """``ts_rank`` ranked fulltext search via ``plainto_tsquery``.
+        """``ts_rank`` ranked fulltext search via ``plainto_tsquery`` over the ``'simple'`` config.
+
+        ``'simple'`` is non-stemming and keeps stop-words — the Postgres analog of SQLite's
+        ``unicode61`` word tokenizer — matched against ``to_tsvector('simple', raw_text)`` in
+        both the ``@@`` predicate and the ``ts_rank`` score.
 
         ``mode`` selects how the query terms are combined:
 
-        - ``ALL`` (default, strict-AND): a single ``plainto_tsquery('english', :query)`` is
+        - ``ALL`` (default, strict-AND): a single ``plainto_tsquery('simple', :query)`` is
           used in both the ``@@`` match predicate and the ``ts_rank`` score — a document
           must contain every term.
         - ``ANY`` (ranked-OR): the query is split on whitespace and each term gets its own
-          ``plainto_tsquery('english', :tN)`` call, OR-combined with the tsquery ``||``
+          ``plainto_tsquery('simple', :tN)`` call, OR-combined with the tsquery ``||``
           operator (``plainto_tsquery(:t0) || plainto_tsquery(:t1) || …``).  The same
           OR-combined tsquery is used in both the ``@@`` predicate and the ``ts_rank``
           score, so ``ts_rank`` scores documents matching more or rarer terms higher,
@@ -257,13 +271,13 @@ class _PostgresNativeTextSearch:
                         # referencing :tN / :query placeholders — never user text.
                         f"""
                         SELECT content_hash,
-                               ts_rank(to_tsvector('english', raw_text),
+                               ts_rank(to_tsvector('simple', raw_text),
                                        {tsquery_fragment}) AS score
                         FROM search_text_artifacts
                         WHERE provider_key = :pk
                           AND params_hash  = :ph
                           AND content_hash = ANY(:hashes)
-                          AND to_tsvector('english', raw_text)
+                          AND to_tsvector('simple', raw_text)
                               @@ ({tsquery_fragment})
                         ORDER BY score DESC
                         """  # noqa: S608 — fragment is module-built placeholders only; terms are bound params

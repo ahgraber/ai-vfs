@@ -108,7 +108,11 @@ def _fts5_literal_from_pattern(pattern: str) -> str | None:
 
 
 class _SQLiteNativeTextSearch:
-    """NativeTextSearch capability backed by SQLite FTS5 with the trigram tokenizer.
+    """NativeTextSearch capability backed by two SQLite FTS5 indexes.
+
+    REGEX prunes candidates via the ``trigram`` table (``search_fts``); FULLTEXT matches
+    whole-word tokens via the ``unicode61`` table (``search_fts_words``).  Both derive from
+    the same content-addressed ``raw_text``.
 
     CONFIDENTIALITY: ``search_text_artifacts`` stores decoded file content (raw text),
     making the metadata database content-bearing at the same sensitivity tier as the blob
@@ -163,22 +167,24 @@ class _SQLiteNativeTextSearch:
                 """,
                 (self.provider_key, params_hash, content_hash, text, now),
             )
-            # Sync the FTS5 derived index: delete any stale entry then insert fresh.
-            await self._store._db.exec_driver_sql(
-                "DELETE FROM search_fts WHERE provider_key=? AND params_hash=? AND content_hash=?",
-                (self.provider_key, params_hash, content_hash),
-            )
-            await self._store._db.exec_driver_sql(
-                "INSERT INTO search_fts(provider_key, params_hash, content_hash, raw_text) VALUES(?,?,?,?)",
-                (self.provider_key, params_hash, content_hash, text),
-            )
+            # Sync both derived indexes (trigram → REGEX, word → FULLTEXT): delete any
+            # stale entry then insert fresh, keeping each consistent with raw_text.
+            for table in ("search_fts", "search_fts_words"):
+                await self._store._db.exec_driver_sql(
+                    f"DELETE FROM {table} WHERE provider_key=? AND params_hash=? AND content_hash=?",  # noqa: S608 — table name is a module literal, not user input
+                    (self.provider_key, params_hash, content_hash),
+                )
+                await self._store._db.exec_driver_sql(
+                    f"INSERT INTO {table}(provider_key, params_hash, content_hash, raw_text) VALUES(?,?,?,?)",  # noqa: S608 — table name is a module literal, not user input
+                    (self.provider_key, params_hash, content_hash, text),
+                )
 
         artifact_ref = f"{self.provider_key}:{params_hash}:{content_hash}"
         return SearchArtifact(
             status="ready",
             schema_version=1,
             provider_key=self.provider_key,
-            provider_version="1",
+            provider_version="2",
             params_hash=params_hash,
             content_hash=content_hash,
             created_at=datetime.now(timezone.utc),
@@ -195,7 +201,7 @@ class _SQLiteNativeTextSearch:
 
         No blob reads are issued for fresh (ready) records — all verification is
         performed against the text stored in ``search_text_artifacts`` (for regex) or the
-        FTS5 autonomous index (for fulltext).
+        ``unicode61`` word FTS5 index (for fulltext).
 
         Regex path:
           - If the pattern contains a literal sequence of ≥ 3 chars, the FTS5 trigram
@@ -284,8 +290,11 @@ class _SQLiteNativeTextSearch:
         ch_to_entries: dict[str, list[Any]],
         mode: FullTextMatchMode = FullTextMatchMode.ALL,
     ) -> SearchResponse:
-        """FTS5 BM25 ranked fulltext search — results ordered by relevance.
+        """FTS5 BM25 ranked fulltext search over the ``unicode61`` word index.
 
+        Queries ``search_fts_words`` (whole-word tokens, no minimum length) rather than the
+        trigram table, so per-term presence is exact and a sub-trigram term such as ``s3``
+        matches the document that contains it.
         The user query is tokenized on whitespace and each token is quoted as an FTS5
         phrase (double-quoted, with internal double-quotes doubled).  Tokens are treated as
         literal words rather than FTS5 operators, so ``c++`` does not raise a syntax error
@@ -318,7 +327,7 @@ class _SQLiteNativeTextSearch:
         results: list[SearchResult] = []
         async with self._store._operation():
             rows = await self._store._execute_fetchall(
-                "SELECT content_hash, rank FROM search_fts "
+                "SELECT content_hash, rank FROM search_fts_words "
                 "WHERE raw_text MATCH ? AND provider_key=? AND params_hash=? "
                 "ORDER BY rank",
                 (fts_query, self.provider_key, self.params_hash),
@@ -339,30 +348,25 @@ class _SQLiteNativeTextSearch:
     ) -> None:
         """Delete text artifacts for orphaned content hashes or retired params profiles.
 
-        Called by the GC sweep.  Both ``search_text_artifacts`` (the raw-text store) and
-        ``search_fts`` (the derived FTS5 index) are pruned to keep them consistent.
+        Called by the GC sweep.  The raw-text store (``search_text_artifacts``) and both
+        derived FTS5 indexes (``search_fts`` trigram, ``search_fts_words`` word) are pruned
+        together to keep all three consistent.
         """
         async with self._store._operation():
             if content_hashes:
                 ph = ",".join("?" * len(content_hashes))
-                await self._store._db.exec_driver_sql(
-                    f"DELETE FROM search_text_artifacts WHERE provider_key=? AND content_hash IN ({ph})",  # noqa: S608 — {ph} is "?,?,?" only; table/column names are module constants
-                    (self.provider_key,) + tuple(content_hashes),
-                )
-                await self._store._db.exec_driver_sql(
-                    f"DELETE FROM search_fts WHERE provider_key=? AND content_hash IN ({ph})",  # noqa: S608
-                    (self.provider_key,) + tuple(content_hashes),
-                )
+                for table in ("search_text_artifacts", "search_fts", "search_fts_words"):
+                    await self._store._db.exec_driver_sql(
+                        f"DELETE FROM {table} WHERE provider_key=? AND content_hash IN ({ph})",  # noqa: S608 — {ph} is "?,?,?" only; table name is a module literal
+                        (self.provider_key,) + tuple(content_hashes),
+                    )
             if retired_params_hashes:
                 ph = ",".join("?" * len(retired_params_hashes))
-                await self._store._db.exec_driver_sql(
-                    f"DELETE FROM search_text_artifacts WHERE provider_key=? AND params_hash IN ({ph})",  # noqa: S608
-                    (self.provider_key,) + tuple(retired_params_hashes),
-                )
-                await self._store._db.exec_driver_sql(
-                    f"DELETE FROM search_fts WHERE provider_key=? AND params_hash IN ({ph})",  # noqa: S608
-                    (self.provider_key,) + tuple(retired_params_hashes),
-                )
+                for table in ("search_text_artifacts", "search_fts", "search_fts_words"):
+                    await self._store._db.exec_driver_sql(
+                        f"DELETE FROM {table} WHERE provider_key=? AND params_hash IN ({ph})",  # noqa: S608 — {ph} is "?,?,?" only; table name is a module literal
+                        (self.provider_key,) + tuple(retired_params_hashes),
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -378,11 +382,12 @@ class SQLiteMetadataStore(BaseSqlMetadataStore):
     construct for ``ON CONFLICT`` upserts, and a post-connect step enabling WAL mode.
     All file/version/permission/audit CRUD and CAS live in the shared base.
 
-    After base initialization this store also attempts to create an FTS5 virtual table
-    ``search_fts`` (``tokenize='trigram'``, requires SQLite ≥ 3.34).  When the trigram
-    tokenizer is available, :meth:`native_text_search` returns a live
-    :class:`_SQLiteNativeTextSearch` capability; otherwise it returns ``None`` and regex
-    falls back to brute-force via the guarded reader.
+    After base initialization this store also attempts to create two FTS5 virtual tables —
+    ``search_fts`` (``tokenize='trigram'``, requires SQLite ≥ 3.34) for REGEX and
+    ``search_fts_words`` (``tokenize='unicode61'``) for FULLTEXT — and backfill the word
+    table from stored ``raw_text``.  When the trigram tokenizer is available,
+    :meth:`native_text_search` returns a live :class:`_SQLiteNativeTextSearch` capability;
+    otherwise it returns ``None`` and regex falls back to brute-force via the guarded reader.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -420,7 +425,16 @@ class SQLiteMetadataStore(BaseSqlMetadataStore):
         await self._setup_fts5()
 
     async def _setup_fts5(self) -> None:
-        """Create the FTS5 autonomous table; set ``_nts`` on success, log and skip on failure."""
+        """Create the FTS5 derived tables; set ``_nts`` on success, log and skip on failure.
+
+        Two derived representations are built over the same ``raw_text``: ``search_fts``
+        (``tokenize='trigram'``) backs REGEX substring pruning, and ``search_fts_words``
+        (``tokenize='unicode61'``) backs whole-word FULLTEXT.  ``unicode61`` is the default
+        FTS5 tokenizer (available wherever FTS5 is), has no minimum token length, and
+        case-folds — so sub-trigram terms such as ``s3`` are first-class word tokens.
+        After the tables exist, :meth:`_backfill_word_index` rebuilds the word table from
+        ``raw_text`` for content indexed before the word representation existed.
+        """
         async with self._lock:
             try:
                 await self._conn.exec_driver_sql(
@@ -432,7 +446,21 @@ class SQLiteMetadataStore(BaseSqlMetadataStore):
                     "tokenize='trigram'"
                     ")"
                 )
+                await self._conn.exec_driver_sql(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts_words USING fts5("
+                    "provider_key UNINDEXED, "
+                    "params_hash UNINDEXED, "
+                    "content_hash UNINDEXED, "
+                    "raw_text, "
+                    "tokenize='unicode61'"
+                    ")"
+                )
                 await self._conn.commit()
+                # Rebuild the word index BEFORE exposing native search, so FULLTEXT never serves
+                # from an incomplete word table (fail closed, not silent false negatives — the
+                # straggler classifier cannot see a missing word-table row).  An interrupted
+                # rebuild is completed by the resumable anti-join on the next init.
+                await self._backfill_word_index()
                 self._nts = _SQLiteNativeTextSearch(self)
             except Exception as exc:  # noqa: BLE001 — graceful degradation, log + continue
                 try:
@@ -440,11 +468,48 @@ class SQLiteMetadataStore(BaseSqlMetadataStore):
                 except Exception as rollback_exc:
                     _log.debug("Rollback after FTS5 setup failure also failed: %s", rollback_exc)
                 _log.warning(
-                    "FTS5 trigram tokenizer unavailable (requires SQLite ≥ 3.34.0); "
-                    "native_text_search() returns None — regex falls back to brute-force. "
+                    "SQLite FTS5 native search unavailable (the trigram tokenizer requires "
+                    "SQLite ≥ 3.34.0, or the word-index rebuild failed); native_text_search() "
+                    "returns None — regex falls back to brute-force and fulltext is unsupported. "
                     "Error: %s",
                     exc,
                 )
+
+    async def _backfill_word_index(self) -> None:
+        """Rebuild the ``unicode61`` word index from stored ``raw_text`` (idempotent, resumable).
+
+        On every init, insert into ``search_fts_words`` each ``search_text_artifacts`` row
+        for the active provider that is absent from the word table, matched on the full
+        identity ``(provider_key, params_hash, content_hash)``.  This anti-join inserts only
+        the missing rows, so a re-run after an interrupted build completes it without
+        duplicating rows — FTS5 has no unique constraint on the identity, so a "run once if
+        empty" guard would double-insert and produce duplicate ``SearchResult``s.
+
+        Reads only the content-addressed text already resident in the metadata store: no blob
+        reads, no content re-decode, and ``params_hash`` is unchanged (it keys the
+        tokenizer-independent ``raw_text`` and is shared with the trigram representation).
+        Keying on the full identity — not ``content_hash`` alone — is required so an old or
+        partial row under a different key cannot mask a missing current row.
+
+        Runs under the ``_setup_fts5`` lock on the live connection; commits so an interrupted
+        init self-heals on the next initialization.
+        """
+        await self._conn.exec_driver_sql(
+            """
+            INSERT INTO search_fts_words(provider_key, params_hash, content_hash, raw_text)
+            SELECT sta.provider_key, sta.params_hash, sta.content_hash, sta.raw_text
+            FROM search_text_artifacts sta
+            WHERE sta.provider_key = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM search_fts_words w
+                  WHERE w.provider_key = sta.provider_key
+                    AND w.params_hash  = sta.params_hash
+                    AND w.content_hash = sta.content_hash
+              )
+            """,
+            (_FTS5_PROVIDER_KEY,),
+        )
+        await self._conn.commit()
 
     def native_text_search(self) -> _SQLiteNativeTextSearch | None:
         """Return the FTS5-backed NativeTextSearch capability, or None if unavailable.

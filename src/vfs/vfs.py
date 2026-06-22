@@ -107,6 +107,14 @@ def _load_optional_adapter(scheme: str, spec: tuple[str, str, str, str]) -> type
 _MAX_WRITE_RETRIES: int = 5
 """Maximum number of times VFS write/copy/move retries on a version-number collision."""
 
+_MAX_FULLTEXT_TERMS: int = 128
+"""Maximum whitespace-split term count accepted for a FULLTEXT query.
+
+ALL mode binds the whole query as one parameter regardless of count, but ANY mode grows one
+SQL expression + bind parameter per term on both backends; this cap bounds that growth and
+stays well below the PostgreSQL ~32767 bind-parameter ceiling that ANY would otherwise approach.
+"""
+
 
 def _require_canonical(path: str) -> None:
     """Reject paths that are not absolute or not in canonical form.
@@ -322,7 +330,7 @@ class VFS:
                         status="unsupported",
                         schema_version=1,
                         provider_key=nts.provider_key,
-                        provider_version="1",
+                        provider_version="2",
                         params_hash=nts.params_hash,
                         content_hash=content_hash,
                         created_at=datetime.now(timezone.utc),
@@ -825,6 +833,17 @@ class VFS:
                     f"Available: {sorted(t.value for t in _supported)}"
                 )
 
+            # Boundary validation: reject an over-long FULLTEXT query before any backend
+            # query is built, bounding ANY's per-term SQL/bind-parameter growth on both
+            # backends (covers SQLite and Postgres uniformly at the public method).
+            if search_type == SearchType.FULLTEXT:
+                term_count = len(query.split())
+                if term_count > _MAX_FULLTEXT_TERMS:
+                    raise ValueError(
+                        f"FULLTEXT query has too many terms ({term_count} > {_MAX_FULLTEXT_TERMS}); "
+                        f"refine the query to at most {_MAX_FULLTEXT_TERMS} whitespace-separated terms."
+                    )
+
             # List all files in scope and permission-prune (invisible)
             all_files = await self._meta.list_dir(namespace_id, scope, recursive=True)
             pruned_files = [
@@ -1167,7 +1186,7 @@ class VFS:
                         status="unsupported",
                         schema_version=1,
                         provider_key=nts.provider_key,
-                        provider_version="1",
+                        provider_version="2",
                         params_hash=nts.params_hash,
                         content_hash=ver.content_hash,
                         created_at=datetime.now(timezone.utc),
