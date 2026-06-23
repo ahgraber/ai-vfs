@@ -98,6 +98,11 @@ Build output is written to `site/`.
 
 For self-hosted Docat packaging and upload handoff, see `docs/docat-handoff.md`.
 
+## AI Disclosure
+
+This project uses spec-driven development to allow AI coding assistance to work on well-specified features.
+See the `sdd-*` family of [ahgraber/skills: Agent skills](https://github.com/ahgraber/skills).
+
 ## Contributing
 
 Contributions and fixes are welcome.
