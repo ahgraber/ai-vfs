@@ -437,4 +437,110 @@ Extend wasmtime-py via PyO3 to expose the virtual filesystem system to Python.
 
 ---
 
+## Turn 6 — OPFS + Pyodide/WASM: client-side inversion
+
+**User:**
+
+> How might OPFS and Pyodide/WASM change this?
+> References: Simon Willison's tools.simonwillison.net colophon; MDN File System API / Origin Private File System
+
+### Key finding: moving the sandbox to the client dissolves the server-side isolation problem
+
+The research's three core tensions were:
+
+1. WASI preopened directories require real OS paths — no Python-level virtual filesystem substitution
+2. Pyodide on a server carries CVE-2025-68668 (CVSS 9.9) — not a security boundary
+3. The staging pattern forces full file download before execution
+
+OPFS (Origin Private File System) + Pyodide running in a browser Worker resolves all three by shifting execution to the client.
+
+---
+
+### OPFS: what it provides
+
+OPFS is the sandboxed, origin-scoped partition of the File System Access API.
+Key properties for this use case:
+
+- **`createSyncAccessHandle()`** (Workers only): Synchronous byte-level read/write with no permission prompts — exactly what Emscripten's POSIX layer needs to emulate `open()`/`read()`/`write()` inside Pyodide.
+  Standard Python `open()` calls work without any staging layer.
+- **Persistent across sessions**: Packages are written to OPFS on first load and skipped on subsequent loads.
+  Simon Willison's tools use this pattern to amortize the ~7MB Pyodide download.
+- **Origin-scoped isolation**: Each browser origin gets a completely separate OPFS partition.
+  Per-user isolation is free — no application-layer path namespacing required.
+
+Pyodide exposes this via `pyodide.mountOPFS()`, making the OPFS partition available as a standard filesystem path inside the Python interpreter.
+
+---
+
+### CVE-2025-68668 reassessment
+
+The CVE is a server-side concern.
+The attack vector (`_pyodide._base.eval_code()` + ctypes indirection → `system()`) is dangerous on a server because the Pyodide process has OS access.
+
+In the browser, Pyodide running inside a Worker is running in its _intended_ deployment target.
+The browser's same-origin policy, process isolation, and Worker sandbox are the security boundary — not Pyodide itself.
+The "Pyodide + Deno subprocess" workaround the earlier research recommended is unnecessary in the browser context.
+
+---
+
+### The architecture inverts
+
+The prior research assumed server-side tiers:
+
+```text
+Server process
+    └── in-process sandbox (Monty / Eryx / wasmtime)
+         └── staged files ──► fsspec ──► cloud storage
+```
+
+OPFS + Pyodide enables a client-side execution tier:
+
+```text
+Browser Worker
+    └── Pyodide (full CPython in WASM)
+         └── OPFS (persistent, synchronous) ◄──fetch──► server API ──► cloud storage
+```
+
+The server no longer needs an in-process code sandbox at all.
+It becomes a thin, authenticated cloud-storage proxy.
+Per-user sandbox isolation is provided by the browser; per-user storage isolation is provided by the existing fsspec + DirFileSystem layer on the server.
+
+---
+
+### Revised tier model
+
+| Tier     | Runtime        | Execution engine                                  | Filesystem                         | Security boundary            |
+| -------- | -------------- | ------------------------------------------------- | ---------------------------------- | ---------------------------- |
+| 1        | Browser Worker | Starlark / CEL — expression eval                  | N/A (no I/O)                       | Hermetic by design           |
+| 2        | Browser Worker | Pyodide + OPFS — full Python, persistent packages | OPFS (sync access handle)          | Browser origin sandbox       |
+| Fallback | Server         | Eryx / wasmtime-py                                | Staging or custom Rust WASI traits | WASM linear memory isolation |
+
+Tier 2 now replaces both Monty (Tier 2 in the old model) and Eryx/wasmtime (Tier 3) for browser-hosted deployments.
+Eryx/wasmtime remains the right choice for headless or server-only execution paths.
+
+---
+
+### Constraints that remain
+
+- **Browser-only:** OPFS is unavailable outside the browser.
+  Server-side runtimes (Node, Deno) lack native OPFS; polyfills exist but are unproven at scale.
+- **No pip-install of C extensions:** `micropip` fetches only pure-Python wheels from CDN.
+  Compiled extensions must be pre-built as Pyodide wheels.
+- **Storage quotas:** Browsers allow roughly 60% of available disk per origin but can evict under pressure.
+  Applications need quota checks and graceful degradation.
+- **Cold-start latency:** Pyodide itself is ~7MB plus packages.
+  The OPFS persistence pattern (write install to OPFS, skip download on subsequent loads) is necessary for acceptable UX.
+- **CORS constraints:**
+  Fetch calls from a Worker are subject to standard CORS; the server API must set appropriate headers.
+
+---
+
+### What does not change
+
+The server-side fsspec + DirFileSystem layer remains the correct answer for durable cloud storage (S3, Azure Blob, GCS).
+OPFS becomes the local cache and execution layer; the VFS API endpoints handle sync to/from cloud.
+This is a cleaner separation than the staging-in-tmpdir pattern described for wasmtime — the sync boundary is an explicit API call rather than an implicit temp-directory lifecycle.
+
+---
+
 _End of conversation_
