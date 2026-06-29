@@ -34,6 +34,12 @@ _EXECUTION_PROVIDERS: dict[str, tuple[str, str, str, str]] = {
         "vfs.execution.monty_provider",
         "MontyExecutionProvider",
     ),
+    "just-bash": (
+        "just-bash",
+        "just_bash",
+        "vfs.execution.just_bash_provider",
+        "JustBashExecutionProvider",
+    ),
 }
 
 
