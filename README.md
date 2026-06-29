@@ -45,7 +45,8 @@ The VFS enforces permissions, manages versioning, and emits OpenTelemetry traces
 - [Code execution with MCP: building more efficient AI agents \\ Anthropic](https://www.anthropic.com/engineering/code-execution-with-mcp)
 - [Introducing smolagents: simple agents that write actions in code.](https://huggingface.co/blog/smolagents)
 - [Forget MCP, Bash Is All You Need - Dead Neurons](https://deadneurons.substack.com/p/forget-mcp-bash-is-all-you-need)
-- [Hash anchors + Myers diff + single-token anchors: 60% cheaper AI code edits - Dirac](https://dirac.run/posts/hash-anchors-myers-diff-single-token#token-efficiency)
+- [I Improved 15 LLMs at Coding in One Afternoon.
+  Only the Harness Changed. | Can.ac](https://blog.can.ac/2026/02/12/the-harness-problem/) and [Hash anchors + Myers diff + single-token anchors: 60% cheaper AI code edits - Dirac](https://dirac.run/posts/hash-anchors-myers-diff-single-token#token-efficiency)
 - [Introducing bash-tool for filesystem-based context retrieval - Vercel](https://vercel.com/changelog/introducing-bash-tool-for-filesystem-based-context-retrieval) and [Testing if "bash is all you need" - Vercel](https://vercel.com/blog/testing-if-bash-is-all-you-need)
 - [strukto-ai/mirage: A Unified Virtual Filesystem For AI Agents](https://github.com/strukto-ai/mirage)
 
