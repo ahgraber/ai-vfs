@@ -1,9 +1,17 @@
 """AI-first virtual file system."""
 
+from vfs.anchored_editing import (
+    AnchoredEditor,
+    AnchoredEditResult,
+    AnchoredReadResult,
+    Hunk,
+    make_anchor,
+)
 from vfs.config import VFSConfig
 from vfs.errors import (
     AnchorConflictError,
     ConflictError,
+    ContentDecodeError,
     IndexUnavailableError,
     NotFoundError,
     OperationBudgetExceededError,
@@ -14,7 +22,6 @@ from vfs.errors import (
     VersionCollisionError,
     VFSError,
 )
-from vfs.execution.anchors import AnchorMap
 from vfs.execution.fs_ops import FsOperations, fs_operations_for
 from vfs.execution.registry import resolve_execution_provider
 from vfs.models import GCResult
@@ -25,8 +32,13 @@ from vfs.vfs import VFS
 __all__ = [
     "VFS",
     "VFSConfig",
+    # Anchored editing (standalone capability)
+    "AnchoredEditor",
+    "AnchoredEditResult",
+    "AnchoredReadResult",
+    "Hunk",
+    "make_anchor",
     # Execution
-    "AnchorMap",
     "ExecutionCapabilities",
     "ExecutionProvider",
     "ExecutionResult",
@@ -41,6 +53,7 @@ __all__ = [
     # Error types callers must catch
     "VFSError",
     "AnchorConflictError",
+    "ContentDecodeError",
     "ConflictError",
     "IndexUnavailableError",
     "NotFoundError",
