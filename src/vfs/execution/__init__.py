@@ -1,1 +1,1 @@
-"""Execution layer: FsOperations, AnchorMap, and provider registry."""
+"""Execution layer: FsOperations, the FS-port, and the provider registry."""

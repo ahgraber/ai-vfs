@@ -71,14 +71,17 @@ class ExecutionProvider(Protocol):
         self,
         code: str,
         fs_ops: Any,
+        fs_port: Any,
         resource_limits: ResourceLimits,
     ) -> ExecutionResult:
-        """Run ``code`` inside the sandbox, with ``fs_ops`` as external functions.
+        """Run ``code`` inside the sandbox over the governed VFS.
 
         ``fs_ops`` is the session-bound :class:`~vfs.execution.fs_ops.FsOperations`
-        instance constructed by ``vfs.execute``.  The end-to-end timeout is
-        enforced by the caller (``asyncio.wait_for``); providers may additionally
-        use ``resource_limits.timeout_seconds`` as an inner limit.
+        instance (the injected verbs); ``fs_port`` is the session-backed
+        :class:`~vfs.protocols.fs_port.FsPort` a provider mounts as the sandbox's
+        native filesystem. Both are constructed by ``vfs.execute``. The end-to-end
+        timeout is enforced by the caller (``asyncio.wait_for``); providers may
+        additionally use ``resource_limits.timeout_seconds`` as an inner limit.
         Returns :class:`ExecutionResult` — never raises for execution-time errors.
         """
         ...

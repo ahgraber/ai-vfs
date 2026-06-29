@@ -26,7 +26,9 @@ import logging
 import posixpath
 from typing import TYPE_CHECKING, Any
 
-from vfs.errors import AnchorConflictError, ConflictError, OperationBudgetExceededError, VersionCollisionError
+from vfs.anchored_editing.anchors import anchors_for_lines
+from vfs.anchored_editing.editor import AnchoredEditor, Hunk
+from vfs.errors import OperationBudgetExceededError
 from vfs.models import SearchType
 from vfs.protocols.search import FindPredicates
 from vfs.session import resolve_path
@@ -126,23 +128,14 @@ def _decode_raw(raw: bytes, max_read_bytes: int | None, path: str) -> str | dict
         return _error_response("binary_content", "File content is not valid UTF-8")
 
 
-async def _allocate_anchors(
-    anchor_map: Any,
-    session: Session,
-    resolved: str,
-    lines: list[str],
-    *,
-    start_index: int = 0,
-) -> dict[int, str]:
-    """Allocate anchor tokens for ``lines`` if ``anchor_map`` is not None.
+def _content_anchors(lines: list[str], *, start_index: int = 0) -> dict[int, str]:
+    """Return content-derived ``{absolute_index: anchor}`` for ``lines``.
 
-    ``start_index`` is the file-absolute index of ``lines[0]``; callers that
-    pass a tail slice must supply the correct offset.
+    Anchors are stateless and computed purely from content (see
+    :mod:`vfs.anchored_editing`); ``start_index`` is the file-absolute index of
+    ``lines[0]`` so that windowed slices (e.g. ``tail``) carry absolute indices.
     """
-    if anchor_map is None:
-        return {}
-    file_meta = await session.stat(resolved)
-    return anchor_map.allocate(resolved, file_meta.current_version_number, lines, start_index=start_index)
+    return anchors_for_lines(lines, start_index=start_index)
 
 
 async def _check_size_before_read(
@@ -229,7 +222,6 @@ async def _op_cat(
     session: Session,
     counter: OperationCounter,
     resource_limits: ResourceLimits,
-    anchor_map: Any,
     path: str,
 ) -> dict:
     r"""cat: read a file as strict UTF-8.
@@ -237,8 +229,8 @@ async def _op_cat(
     Returns a dict with keys:
 
     - ``lines``: list of str (split on ``\n`` only; ``\r`` kept in content)
-    - ``anchors``: dict mapping line index to anchor token (empty when
-      ``anchor_map`` is None)
+    - ``anchors``: dict mapping absolute line index to a stateless,
+      content-derived anchor token (see :mod:`vfs.anchored_editing`)
     - ``error``: None on success, or a dict with ``code`` and ``message`` on failure.
 
     Size check: ``_check_size_before_read`` stats the file first when
@@ -256,19 +248,17 @@ async def _op_cat(
     if isinstance(decoded, dict):
         return decoded
     lines = decoded.split("\n")
-    anchors = await _allocate_anchors(anchor_map, session, resolved, lines)
-    return {"lines": lines, "anchors": anchors, "error": None}
+    return {"lines": lines, "anchors": _content_anchors(lines), "error": None}
 
 
 async def _op_head(
     session: Session,
     counter: OperationCounter,
     resource_limits: ResourceLimits,
-    anchor_map: Any,
     path: str,
     n: int,
 ) -> dict:
-    """head: return first ``n`` lines with optional anchor allocation.
+    """head: return first ``n`` lines with content-derived anchors.
 
     Stats before reading when ``max_read_bytes`` is set (same guard as ``cat``).
     """
@@ -282,25 +272,22 @@ async def _op_head(
     if isinstance(decoded, dict):
         return decoded
     sliced = decoded.split("\n")[:n]
-    anchors = await _allocate_anchors(anchor_map, session, resolved, sliced)
-    return {"lines": sliced, "anchors": anchors, "error": None}
+    return {"lines": sliced, "anchors": _content_anchors(sliced), "error": None}
 
 
 async def _op_tail(
     session: Session,
     counter: OperationCounter,
     resource_limits: ResourceLimits,
-    anchor_map: Any,
     path: str,
     n: int,
 ) -> dict:
-    """tail: return last ``n`` lines with optional anchor allocation.
+    """tail: return last ``n`` lines with content-derived anchors.
 
-    Anchor tokens are keyed by *file-absolute* line index, not slice-relative
-    index.  For example, if a 6-line file is tailed with ``n=3``, the anchors
-    returned are ``{3: tok3, 4: tok4, 5: tok5}`` — matching the actual position
-    of each line in the file.  This is necessary so that ``edit()`` can use a
-    tail anchor to target the correct line.
+    Anchors are keyed by *file-absolute* line index, not slice-relative index.
+    For example, tailing a 6-line file with ``n=3`` yields anchors at indices
+    3, 4, 5 — matching the lines' true positions — so that ``edit`` can target
+    them correctly.
 
     Stats before reading when ``max_read_bytes`` is set (same guard as ``cat``).
     """
@@ -318,8 +305,7 @@ async def _op_tail(
     # File-absolute start index for the slice: tail of n lines on a total of L
     # starts at max(0, L - n).
     offset = max(0, len(all_lines) - n) if n > 0 else 0
-    anchors = await _allocate_anchors(anchor_map, session, resolved, sliced, start_index=offset)
-    return {"lines": sliced, "anchors": anchors, "error": None}
+    return {"lines": sliced, "anchors": _content_anchors(sliced, start_index=offset), "error": None}
 
 
 async def _op_ls(
@@ -480,23 +466,24 @@ async def _op_glob(
 async def _op_write(
     session: Session,
     counter: OperationCounter,
-    anchor_map: Any,
     path: str,
     content: bytes,
 ) -> Any:
-    """write: write ``content`` to ``path`` and invalidate anchors.
+    """write: write ``content`` to ``path``.
 
     Returns a plain marshalable dict ``{"version_number": int, "size": int}``
     rather than the raw ``VersionMeta`` pydantic model.  Returning the model
     directly causes Monty to raise ``TypeError: Cannot convert VersionMeta to
     Monty value`` even when the sandbox discards the return value — and the
     write side-effect has already committed at that point.
+
+    No anchor-map invalidation is performed: anchors are stateless and
+    content-derived, so an anchor over changed content simply fails to resolve
+    at edit time (see :mod:`vfs.anchored_editing`).
     """
     counter.check_and_increment()
     resolved = resolve_path(session.pwd(), path)
     version_meta = await session.write(resolved, content)
-    if anchor_map is not None:
-        anchor_map.invalidate(resolved)
     return {"version_number": version_meta.version_number, "size": version_meta.size}
 
 
@@ -512,13 +499,13 @@ async def _op_stat(session: Session, path: str) -> Any:
     return await session.stat(resolved)
 
 
-async def _op_delete(session: Session, anchor_map: Any, path: str) -> Any:
-    """delete: tombstone path and invalidate anchors; no budget counter (internal)."""
+async def _op_delete(session: Session, path: str) -> Any:
+    """delete: tombstone path; no budget counter (internal).
+
+    No anchor invalidation: anchors are stateless and content-derived.
+    """
     resolved = resolve_path(session.pwd(), path)
-    result = await session.delete(resolved)
-    if anchor_map is not None:
-        anchor_map.invalidate(resolved)
-    return result
+    return await session.delete(resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -529,18 +516,16 @@ async def _op_delete(session: Session, anchor_map: Any, path: str) -> Any:
 def fs_operations_for(
     session: Session,
     resource_limits: ResourceLimits,
-    anchor_map: Any | None = None,
 ) -> FsOperations:
     """Construct a session-bound :class:`FsOperations` with budget enforcement.
 
     All returned callables share a single :class:`OperationCounter` scoped to
     this factory call; separate calls produce independent counters.
 
-    ``anchor_map`` is an optional :class:`~vfs.execution.anchors.AnchorMap`
-    closed over by ``cat``/``head``/``tail`` and ``write``/``edit``.  When
-    ``None`` (this revision), anchor allocation is skipped and ``write`` skips
-    invalidation — designed so the anchored-editing chunk can plug in without
-    changing this module.
+    Anchors are stateless and content-derived (see :mod:`vfs.anchored_editing`),
+    so no per-``execute`` anchor store is constructed: ``cat``/``head``/``tail``
+    compute anchors from content and ``edit`` delegates to the capability's
+    ``edit_anchored``.
 
     Parameters
     ----------
@@ -549,12 +534,10 @@ def fs_operations_for(
     resource_limits:
         Governs ``max_operations`` (shell-op budget), ``max_read_bytes`` (per-read
         content cap), and ``max_result_items`` (truncation cap for ls/grep/find).
-    anchor_map:
-        Optional :class:`~vfs.execution.anchors.AnchorMap`; ``None`` disables
-        anchor tracking (cat/head/tail return plain line lists without tokens).
     """
     counter = OperationCounter(resource_limits.max_operations)
     mi = resource_limits.max_result_items
+    editor = AnchoredEditor(session)
 
     async def _edit(
         path: str,
@@ -564,126 +547,36 @@ def fs_operations_for(
         *,
         expected_version: int | None = None,
     ) -> dict:
-        """Anchor-validated edit per Decision (b).
+        """edit: delegate to the anchored-editing capability's ``edit_anchored``.
 
-        Steps:
-        1. Resolve anchors — unknown token or path mismatch → AnchorConflictError.
-        2. Stat pre-check: current version != anchor version → AnchorConflictError.
-        3. Caller expected_version check: if supplied and differs from anchor's
-           recorded version → AnchorConflictError (before any write).
-        4. Read content; verify line at stored line_index equals line_content for
-           both anchors; start must not be after end.
-        5. Build replacement content; preserve trailing-newline presence.
-        6. session.write with expected_version=anchor_version (CAS always applied).
-           ConflictError / VersionCollisionError → AnchorConflictError (never retry).
-        7. Reconcile anchors atomically; return structured result dict.
+        Builds a single hunk from the start/end anchors and applies it under a
+        strict version check. When ``expected_version`` is omitted, the file's
+        current version is used (the content-derived checksum on each anchor is
+        what guards against editing stale content). The agent-facing result is
+        the new version only — no content or anchors are re-emitted.
         """
-        if anchor_map is None:
-            raise AnchorConflictError("No anchor map available; cannot perform anchored edit.")
-
         counter.check_and_increment()
-        resolved = resolve_path(session.pwd(), path)
-
-        # Stage 1: resolve anchors (raises AnchorConflictError on unknown/wrong-path)
-        anchor_version_start, line_content_start = anchor_map.validate(start_anchor, resolved)
-        anchor_version_end, line_content_end = anchor_map.validate(end_anchor, resolved)
-
-        # Both anchors must agree on version (they're from the same file)
-        anchor_version = anchor_version_start
-        if anchor_version_end != anchor_version:
-            raise AnchorConflictError(
-                f"Start anchor version {anchor_version_start} and end anchor version "
-                f"{anchor_version_end} differ; re-read the file to obtain consistent anchors."
-            )
-
-        # Stage 1b: caller expected_version check (before stat — cheapest first)
-        if expected_version is not None and expected_version != anchor_version:
-            raise AnchorConflictError(
-                f"Caller expected_version {expected_version} differs from anchor version "
-                f"{anchor_version}; re-read the file to obtain fresh anchors."
-            )
-
-        # Stage 2: stat pre-check — current version must match anchor version
-        file_meta = await session.stat(resolved)
-        current_version = file_meta.current_version_number
-        if current_version != anchor_version:
-            raise AnchorConflictError(
-                f"File {resolved!r} is at version {current_version}; anchor records version "
-                f"{anchor_version}. Re-read the file to obtain fresh anchors."
-            )
-
-        # Retrieve the stored line indices for start/end anchors
-        start_entry = anchor_map._entries[start_anchor]
-        end_entry = anchor_map._entries[end_anchor]
-        start_idx = start_entry.line_index
-        end_idx = end_entry.line_index
-
-        if start_idx > end_idx:
-            raise AnchorConflictError(f"Start anchor line_index {start_idx} is after end anchor line_index {end_idx}.")
-
-        # Stage 3: read file and verify line content for both anchors
-        raw = await session.read(resolved)
-        decoded = _decode_raw(raw, resource_limits.max_read_bytes, resolved)
-        if isinstance(decoded, dict):
-            # Binary or oversized — cannot edit
-            raise AnchorConflictError(
-                f"Cannot edit {resolved!r}: file content is not readable as UTF-8 or exceeds size limit."
-            )
-        old_lines = decoded.split("\n")
-
-        # Verify start anchor line content
-        if start_idx >= len(old_lines) or old_lines[start_idx] != line_content_start:
-            raise AnchorConflictError(
-                f"Line content at index {start_idx} has changed; re-read the file to obtain fresh anchors."
-            )
-        # Verify end anchor line content
-        if end_idx >= len(old_lines) or old_lines[end_idx] != line_content_end:
-            raise AnchorConflictError(
-                f"Line content at index {end_idx} has changed; re-read the file to obtain fresh anchors."
-            )
-
-        # Stage 4: build replacement content
-        # Preserve trailing-newline: if original content ended with \n, the last
-        # element of old_lines is ""; we keep that invariant in new_lines.
-        lines_before = old_lines[:start_idx]
-        lines_after = old_lines[end_idx + 1 :]
-        new_lines = lines_before + replacement + lines_after
-        new_content = "\n".join(new_lines).encode("utf-8")
-
-        # Stage 5: write with CAS on anchor_version
-        try:
-            version_meta = await session.write(resolved, new_content, expected_version=anchor_version)
-        except (ConflictError, VersionCollisionError) as exc:
-            raise AnchorConflictError(
-                f"Write conflict on {resolved!r}; re-read the file to obtain fresh anchors."
-            ) from exc
-
-        new_version = version_meta.version_number
-
-        # Stage 6: reconcile anchors atomically (no prior invalidate)
-        new_idx_to_token = anchor_map.reconcile(resolved, old_lines, new_lines, new_version)
-
-        # Build result: new version + anchors for the affected range + all updated anchors
-        # Include anchors keyed by line index (consistent with cat return shape).
-        return {
-            "version_number": new_version,
-            "anchors": new_idx_to_token,
-            "lines": new_lines,
-        }
+        if expected_version is None:
+            resolved = resolve_path(session.pwd(), path)
+            file_meta = await session.stat(resolved)
+            expected_version = file_meta.current_version_number
+        hunk = Hunk(start_anchor=start_anchor, end_anchor=end_anchor, replacement=replacement)
+        result = await editor.edit_anchored(path, [hunk], expected_version)
+        return {"version_number": result.new_version}
 
     return FsOperations(
         cd=lambda path: _op_cd(session, counter, path),
         pwd=lambda: _op_pwd(session, counter),
-        cat=lambda path: _op_cat(session, counter, resource_limits, anchor_map, path),
-        head=lambda path, n: _op_head(session, counter, resource_limits, anchor_map, path, n),
-        tail=lambda path, n: _op_tail(session, counter, resource_limits, anchor_map, path, n),
+        cat=lambda path: _op_cat(session, counter, resource_limits, path),
+        head=lambda path, n: _op_head(session, counter, resource_limits, path, n),
+        tail=lambda path, n: _op_tail(session, counter, resource_limits, path, n),
         ls=lambda path, **kw: _op_ls(session, counter, mi, path, **kw),
         grep=lambda pattern, path, **kw: _op_grep(session, counter, mi, pattern, path, **kw),
         find=lambda path, **kw: _op_find(session, counter, mi, path, **kw),
         glob=lambda pattern: _op_glob(session, counter, mi, pattern),
-        write=lambda path, content: _op_write(session, counter, anchor_map, path, content),
+        write=lambda path, content: _op_write(session, counter, path, content),
         edit=_edit,
         read=lambda path, **kw: _op_read(session, path, **kw),
         stat=lambda path: _op_stat(session, path),
-        delete=lambda path: _op_delete(session, anchor_map, path),
+        delete=lambda path: _op_delete(session, path),
     )

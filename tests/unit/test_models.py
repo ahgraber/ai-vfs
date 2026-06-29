@@ -256,14 +256,20 @@ class TestPublicContractSurface:
     def test_execution_types_importable_from_vfs(self):
         import vfs
 
-        names = ["AnchorMap", "resolve_execution_provider"]
+        names = ["AnchoredEditor", "Hunk", "resolve_execution_provider"]
         for name in names:
             assert hasattr(vfs, name), f"vfs.{name} is not importable"
 
     def test_names_in_all(self):
         import vfs
 
-        for name in ["AnchorMap", "resolve_execution_provider", "AnchorConflictError", "VersionCollisionError"]:
+        for name in [
+            "AnchoredEditor",
+            "Hunk",
+            "resolve_execution_provider",
+            "AnchorConflictError",
+            "VersionCollisionError",
+        ]:
             assert name in vfs.__all__, f"{name!r} missing from vfs.__all__"
 
 

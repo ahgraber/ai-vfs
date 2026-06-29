@@ -38,6 +38,7 @@ Unmapped (unenforced at the provider level):
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import re
@@ -82,20 +83,27 @@ class MontyExecutionProvider:
         self,
         code: str,
         fs_ops: FsOperations,
+        fs_port: Any,
         resource_limits: ResourceLimits,
     ) -> ExecutionResult:
-        """Execute ``code`` in the Monty sandbox with ``fs_ops`` as external functions.
+        """Execute ``code`` in the Monty sandbox with both surfaces wired.
 
-        VFS errors raised inside ``fs_ops`` callables are preserved through
-        Monty's exception downcast via a sentinel variable and re-raised after
-        ``run_async`` returns, so ``vfs.execute``'s translation table handles them.
+        The async ``fs_ops`` callables are passed as ``external_functions`` (the
+        injected verbs, kept additively), and ``fs_port`` is mounted as the
+        sandbox's native filesystem via :class:`~vfs.execution.monty_os.MontyVfsOS`.
+
+        VFS errors raised inside either surface are preserved through Monty's
+        exception downcast via a shared sentinel and re-raised after ``run_async``
+        returns, so ``vfs.execute``'s translation table handles them.
 
         Monty-internal errors (syntax, runtime, timeout, memory) are converted
         to ``ExecutionResult(success=False, error_type="provider_error", ...)``.
         """
+        from vfs.execution.monty_os import MontyVfsOS
         from vfs.protocols.execution import ExecutionResult
 
-        # Sentinel: first VFS error raised by any fs_ops callable during this execution.
+        # Shared sentinel: first VFS error raised by any fs_ops callable OR by the
+        # native filesystem mount during this execution.
         _vfs_error: list[VFSError] = []  # list used as mutable cell for nonlocal capture
 
         def _wrap(fn: Any) -> Any:
@@ -112,6 +120,7 @@ class MontyExecutionProvider:
             return _wrapped
 
         external_functions = {name: _wrap(getattr(fs_ops, name)) for name in _SHELL_FUNCTION_NAMES}
+        mount = MontyVfsOS(fs_port, asyncio.get_running_loop(), _vfs_error)
 
         limits: MontyResourceLimits = {}
         if resource_limits.timeout_seconds is not None:
@@ -123,6 +132,7 @@ class MontyExecutionProvider:
         try:
             output = await runner.run_async(
                 external_functions=external_functions,
+                os=mount,
                 limits=limits if limits else None,
             )
         except MontyRuntimeError as exc:
