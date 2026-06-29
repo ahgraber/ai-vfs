@@ -18,6 +18,7 @@ from vfs.config import VFSConfig
 from vfs.errors import (
     AnchorConflictError,
     ConflictError,
+    ContentDecodeError,
     IndexUnavailableError,
     NotFoundError,
     OperationBudgetExceededError,
@@ -954,8 +955,8 @@ class VFS:
         ``ExecutionResult(success=False, ...)``; no raw traceback, host path, or
         adapter-internal detail appears in ``error_message``.
         """
-        from vfs.execution.anchors import AnchorMap
         from vfs.execution.fs_ops import fs_operations_for
+        from vfs.execution.fs_port import SessionFsPort
         from vfs.execution.registry import resolve_execution_provider
         from vfs.protocols.execution import ExecutionResult, ResourceLimits
         from vfs.session import Session
@@ -983,18 +984,19 @@ class VFS:
         # Resolve provider after permission check (raises ValueError / ImportError — Tier 1).
         provider = resolve_execution_provider(provider_name, self._config)
 
-        # --- Construct session, anchor map, and FsOperations ---
+        # --- Construct session, FsOperations, and the FS-port the provider mounts ---
         session = Session(self, namespace_id, principal_id)
         # session.cd enforces read permission on cwd; permission denied here is a
         # caller-side error, so let it propagate (Tier 1 boundary).
         await session.cd(cwd)
-        anchor_map = AnchorMap()
-        fs_ops = fs_operations_for(session, effective_limits, anchor_map)
+        # Anchors are stateless and content-derived; no AnchorMap is constructed.
+        fs_ops = fs_operations_for(session, effective_limits)
+        fs_port = SessionFsPort(session)
 
         # --- Tier 2: wrap provider dispatch; translate all execution-time exceptions ---
         try:
             result = await asyncio.wait_for(
-                provider.execute(code, fs_ops, effective_limits),
+                provider.execute(code, fs_ops, fs_port, effective_limits),
                 timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
@@ -1030,6 +1032,12 @@ class VFS:
                 success=False,
                 error_type="anchor_conflict",
                 error_message="Anchors stale; re-read file",
+            )
+        except ContentDecodeError:
+            return ExecutionResult(
+                success=False,
+                error_type="decode_error",
+                error_message="File content is not valid UTF-8",
             )
         except ReadBudgetExceededError:
             return ExecutionResult(

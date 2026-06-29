@@ -69,10 +69,10 @@ class FakeProvider:
         self._result = result or ExecutionResult(success=True, output="ok")
         self._raise_exc = raise_exc
         self._sleep_seconds = sleep_seconds
-        self.execute_calls: list[tuple[str, Any, ResourceLimits]] = []
+        self.execute_calls: list[tuple[str, Any, Any, ResourceLimits]] = []
 
-    async def execute(self, code: str, fs_ops: Any, resource_limits: ResourceLimits) -> ExecutionResult:
-        self.execute_calls.append((code, fs_ops, resource_limits))
+    async def execute(self, code: str, fs_ops: Any, fs_port: Any, resource_limits: ResourceLimits) -> ExecutionResult:
+        self.execute_calls.append((code, fs_ops, fs_port, resource_limits))
         if self._sleep_seconds > 0:
             await asyncio.sleep(self._sleep_seconds)
         if self._raise_exc is not None:

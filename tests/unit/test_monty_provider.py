@@ -183,19 +183,19 @@ class TestMontyInternalTimeoutProducesProviderError:
         # The inner MontyResourceLimits timeout fires first — but here we use
         # the MontyExecutionProvider directly with an inner limit to be precise.
         # Drive via the provider directly to set an inner limit independently.
-        from vfs.execution.anchors import AnchorMap
         from vfs.execution.fs_ops import fs_operations_for
+        from vfs.execution.fs_port import SessionFsPort
         from vfs.execution.monty_provider import MontyExecutionProvider
         from vfs.session import Session
 
         provider = MontyExecutionProvider()
         session = Session(vfs, ns.id, agent.id)
         await session.cd("/")
-        anchor_map = AnchorMap()
         limits = ResourceLimits(timeout_seconds=0.1, max_memory_bytes=None)
-        fs_ops = fs_operations_for(session, limits, anchor_map)
+        fs_ops = fs_operations_for(session, limits)
+        fs_port = SessionFsPort(session)
 
-        result = await provider.execute(code, fs_ops, limits)
+        result = await provider.execute(code, fs_ops, fs_port, limits)
 
         assert result.success is False
         assert result.error_type == "provider_error"
@@ -209,8 +209,8 @@ class TestMontyInternalTimeoutProducesProviderError:
     @pytest.mark.asyncio
     async def test_inner_timeout_no_host_path(self, env):
         """Additional check: error_message has no host paths for any Monty error."""
-        from vfs.execution.anchors import AnchorMap
         from vfs.execution.fs_ops import fs_operations_for
+        from vfs.execution.fs_port import SessionFsPort
         from vfs.execution.monty_provider import MontyExecutionProvider
         from vfs.session import Session
 
@@ -218,13 +218,14 @@ class TestMontyInternalTimeoutProducesProviderError:
         provider = MontyExecutionProvider()
         session = Session(vfs, ns.id, agent.id)
         await session.cd("/")
-        anchor_map = AnchorMap()
         limits = ResourceLimits(timeout_seconds=0.05, max_memory_bytes=None)
-        fs_ops = fs_operations_for(session, limits, anchor_map)
+        fs_ops = fs_operations_for(session, limits)
+        fs_port = SessionFsPort(session)
 
         result = await provider.execute(
             "x = 0\nwhile True:\n    x += 1",
             fs_ops,
+            fs_port,
             limits,
         )
 
@@ -313,9 +314,12 @@ edit_result
         )
 
         assert result.success is True, f"edit failed: {result}"
+        # The edit verb delegates to anchored-editing, which returns the new
+        # version only — never the file content or anchors (no re-emit).
         assert isinstance(result.output, dict)
         assert "version_number" in result.output
-        assert "lines" in result.output
+        assert "lines" not in result.output
+        assert "anchors" not in result.output
 
         # Verify the file was actually modified in the VFS
         new_content = await vfs.read(ns.id, "/workspace/edit_target.txt", principal_id=agent.id)
