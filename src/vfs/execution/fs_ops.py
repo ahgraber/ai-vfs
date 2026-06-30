@@ -26,8 +26,6 @@ import logging
 import posixpath
 from typing import TYPE_CHECKING, Any
 
-from vfs.anchored_editing.anchors import anchors_for_lines
-from vfs.anchored_editing.editor import AnchoredEditor, Hunk
 from vfs.errors import OperationBudgetExceededError
 from vfs.models import SearchType
 from vfs.protocols.search import FindPredicates
@@ -67,9 +65,9 @@ class OperationCounter:
 class FsOperations:
     """Session-bound shell-operation callables for sandboxed execution.
 
-    All public fields are async callables corresponding to the eleven shell
+    All public fields are async callables corresponding to the ten shell
     wrappers (``cd``, ``pwd``, ``cat``, ``head``, ``tail``, ``ls``, ``grep``,
-    ``find``, ``glob``, ``write``, ``edit``) plus internal fields (``read``,
+    ``find``, ``glob``, ``write``) plus internal fields (``read``,
     ``stat``, ``delete``) for use within the execution layer.
 
     Every callable (except ``pwd`` and ``cd``, which never touch data) resolves
@@ -91,9 +89,8 @@ class FsOperations:
     find: Any
     glob: Any
     write: Any
-    edit: Any
 
-    # Internal primitives (not part of the shell surface; used by edit and tests)
+    # Internal primitives (not part of the shell surface; used within the execution layer and tests)
     read: Any
     stat: Any
     delete: Any
@@ -105,8 +102,8 @@ class FsOperations:
 
 
 def _error_response(code: str, message: str) -> dict:
-    """Return a structured read-error dict with empty lines and anchors."""
-    return {"lines": [], "anchors": {}, "error": {"code": code, "message": message}}
+    """Return a structured read-error dict with empty lines."""
+    return {"lines": [], "error": {"code": code, "message": message}}
 
 
 def _decode_raw(raw: bytes, max_read_bytes: int | None, path: str) -> str | dict:
@@ -126,16 +123,6 @@ def _decode_raw(raw: bytes, max_read_bytes: int | None, path: str) -> str | dict
     except UnicodeDecodeError:
         _log.debug("read: binary content for %s", path)
         return _error_response("binary_content", "File content is not valid UTF-8")
-
-
-def _content_anchors(lines: list[str], *, start_index: int = 0) -> dict[int, str]:
-    """Return content-derived ``{absolute_index: anchor}`` for ``lines``.
-
-    Anchors are stateless and computed purely from content (see
-    :mod:`vfs.anchored_editing`); ``start_index`` is the file-absolute index of
-    ``lines[0]`` so that windowed slices (e.g. ``tail``) carry absolute indices.
-    """
-    return anchors_for_lines(lines, start_index=start_index)
 
 
 async def _check_size_before_read(
@@ -229,8 +216,6 @@ async def _op_cat(
     Returns a dict with keys:
 
     - ``lines``: list of str (split on ``\n`` only; ``\r`` kept in content)
-    - ``anchors``: dict mapping absolute line index to a stateless,
-      content-derived anchor token (see :mod:`vfs.anchored_editing`)
     - ``error``: None on success, or a dict with ``code`` and ``message`` on failure.
 
     Size check: ``_check_size_before_read`` stats the file first when
@@ -248,7 +233,7 @@ async def _op_cat(
     if isinstance(decoded, dict):
         return decoded
     lines = decoded.split("\n")
-    return {"lines": lines, "anchors": _content_anchors(lines), "error": None}
+    return {"lines": lines, "error": None}
 
 
 async def _op_head(
@@ -258,7 +243,7 @@ async def _op_head(
     path: str,
     n: int,
 ) -> dict:
-    """head: return first ``n`` lines with content-derived anchors.
+    """head: return first ``n`` lines.
 
     Stats before reading when ``max_read_bytes`` is set (same guard as ``cat``).
     """
@@ -272,7 +257,7 @@ async def _op_head(
     if isinstance(decoded, dict):
         return decoded
     sliced = decoded.split("\n")[:n]
-    return {"lines": sliced, "anchors": _content_anchors(sliced), "error": None}
+    return {"lines": sliced, "error": None}
 
 
 async def _op_tail(
@@ -282,12 +267,7 @@ async def _op_tail(
     path: str,
     n: int,
 ) -> dict:
-    """tail: return last ``n`` lines with content-derived anchors.
-
-    Anchors are keyed by *file-absolute* line index, not slice-relative index.
-    For example, tailing a 6-line file with ``n=3`` yields anchors at indices
-    3, 4, 5 — matching the lines' true positions — so that ``edit`` can target
-    them correctly.
+    """tail: return last ``n`` lines.
 
     Stats before reading when ``max_read_bytes`` is set (same guard as ``cat``).
     """
@@ -302,10 +282,7 @@ async def _op_tail(
         return decoded
     all_lines = decoded.split("\n")
     sliced = all_lines[-n:] if n > 0 else []
-    # File-absolute start index for the slice: tail of n lines on a total of L
-    # starts at max(0, L - n).
-    offset = max(0, len(all_lines) - n) if n > 0 else 0
-    return {"lines": sliced, "anchors": _content_anchors(sliced, start_index=offset), "error": None}
+    return {"lines": sliced, "error": None}
 
 
 async def _op_ls(
@@ -476,10 +453,6 @@ async def _op_write(
     directly causes Monty to raise ``TypeError: Cannot convert VersionMeta to
     Monty value`` even when the sandbox discards the return value — and the
     write side-effect has already committed at that point.
-
-    No anchor-map invalidation is performed: anchors are stateless and
-    content-derived, so an anchor over changed content simply fails to resolve
-    at edit time (see :mod:`vfs.anchored_editing`).
     """
     counter.check_and_increment()
     resolved = resolve_path(session.pwd(), path)
@@ -488,7 +461,7 @@ async def _op_write(
 
 
 async def _op_read(session: Session, path: str, *, version_number: int | None = None) -> bytes:
-    """read: raw byte read; no anchor allocation, no budget counter."""
+    """read: raw byte read; no budget counter."""
     resolved = resolve_path(session.pwd(), path)
     return await session.read(resolved, version_number=version_number)
 
@@ -500,10 +473,7 @@ async def _op_stat(session: Session, path: str) -> Any:
 
 
 async def _op_delete(session: Session, path: str) -> Any:
-    """delete: tombstone path; no budget counter (internal).
-
-    No anchor invalidation: anchors are stateless and content-derived.
-    """
+    """delete: tombstone path; no budget counter (internal)."""
     resolved = resolve_path(session.pwd(), path)
     return await session.delete(resolved)
 
@@ -522,11 +492,6 @@ def fs_operations_for(
     All returned callables share a single :class:`OperationCounter` scoped to
     this factory call; separate calls produce independent counters.
 
-    Anchors are stateless and content-derived (see :mod:`vfs.anchored_editing`),
-    so no per-``execute`` anchor store is constructed: ``cat``/``head``/``tail``
-    compute anchors from content and ``edit`` delegates to the capability's
-    ``edit_anchored``.
-
     Parameters
     ----------
     session:
@@ -537,32 +502,6 @@ def fs_operations_for(
     """
     counter = OperationCounter(resource_limits.max_operations)
     mi = resource_limits.max_result_items
-    editor = AnchoredEditor(session)
-
-    async def _edit(
-        path: str,
-        start_anchor: str,
-        end_anchor: str,
-        replacement: list[str],
-        *,
-        expected_version: int | None = None,
-    ) -> dict:
-        """edit: delegate to the anchored-editing capability's ``edit_anchored``.
-
-        Builds a single hunk from the start/end anchors and applies it under a
-        strict version check. When ``expected_version`` is omitted, the file's
-        current version is used (the content-derived checksum on each anchor is
-        what guards against editing stale content). The agent-facing result is
-        the new version only — no content or anchors are re-emitted.
-        """
-        counter.check_and_increment()
-        if expected_version is None:
-            resolved = resolve_path(session.pwd(), path)
-            file_meta = await session.stat(resolved)
-            expected_version = file_meta.current_version_number
-        hunk = Hunk(start_anchor=start_anchor, end_anchor=end_anchor, replacement=replacement)
-        result = await editor.edit_anchored(path, [hunk], expected_version)
-        return {"version_number": result.new_version}
 
     return FsOperations(
         cd=lambda path: _op_cd(session, counter, path),
@@ -575,7 +514,6 @@ def fs_operations_for(
         find=lambda path, **kw: _op_find(session, counter, mi, path, **kw),
         glob=lambda pattern: _op_glob(session, counter, mi, pattern),
         write=lambda path, content: _op_write(session, counter, path, content),
-        edit=_edit,
         read=lambda path, **kw: _op_read(session, path, **kw),
         stat=lambda path: _op_stat(session, path),
         delete=lambda path: _op_delete(session, path),

@@ -15,7 +15,6 @@ Covers:
   ShellOperationsLayer/OversizedStatBeforeRead   [reviewer finding 5]
   ShellOperationsLayer/BinaryFileReturnsError
   ShellOperationsLayer/HeadTailSlice
-  ShellOperationsLayer/EditDelegatesToAnchoredEditing
   ShellOperationsLayer/WriteReturnsMarshalableDict  [reviewer finding 1]
   ShellOperationsLayer/GrepRecursiveParam           [reviewer finding 7]
 """
@@ -23,14 +22,12 @@ Covers:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 
-from vfs.anchored_editing import resolve_anchor
 from vfs.config import VFSConfig
-from vfs.errors import AnchorConflictError, OperationBudgetExceededError, ReindexRequiredError
+from vfs.errors import OperationBudgetExceededError, ReindexRequiredError
 from vfs.execution.fs_ops import FsOperations, OperationCounter, fs_operations_for
 from vfs.protocols.execution import ResourceLimits
 from vfs.session import Session
@@ -398,7 +395,7 @@ class TestOversizedReadReturnsError:
 
     @pytest.mark.asyncio
     async def test_cat_oversized_returns_structured_error(self, env):
-        """cat on a file exceeding max_read_bytes returns error dict; no anchors."""
+        """cat on a file exceeding max_read_bytes returns error dict."""
         vfs_obj, session, ns, agent = env
 
         content = b"a" * 1000
@@ -411,7 +408,6 @@ class TestOversizedReadReturnsError:
         assert result["error"] is not None
         assert result["error"]["code"] == "oversized_read"
         assert result["lines"] == []
-        assert result["anchors"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +420,7 @@ class TestBinaryFileReturnsError:
 
     @pytest.mark.asyncio
     async def test_cat_binary_returns_structured_error(self, env):
-        """cat on non-UTF-8 content returns error dict; no anchors."""
+        """cat on non-UTF-8 content returns error dict."""
         vfs_obj, session, ns, agent = env
 
         binary_content = bytes(range(256))  # guaranteed non-UTF-8
@@ -437,7 +433,6 @@ class TestBinaryFileReturnsError:
         assert result["error"] is not None
         assert result["error"]["code"] == "binary_content"
         assert result["lines"] == []
-        assert result["anchors"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -479,87 +474,6 @@ class TestHeadTailSlice:
         result = await fs_ops.tail("/lines.txt", 5)
         assert result["error"] is None
         assert result["lines"] == lines[-5:]
-
-    @pytest.mark.asyncio
-    async def test_head_anchors_sliced_lines_only(self, env):
-        """head returns content-derived anchors for exactly the returned lines."""
-        vfs_obj, session, ns, agent = env
-
-        lines = [f"line {i}" for i in range(10)]
-        content = "\n".join(lines).encode()
-        await vfs_obj.write(ns.id, "/lines.txt", content, principal_id=agent.id)
-
-        fs_ops = fs_operations_for(session, ResourceLimits())
-
-        result = await fs_ops.head("/lines.txt", 3)
-        assert result["error"] is None
-        assert result["lines"] == lines[:3]
-        # Anchors for exactly the 3 returned lines, keyed by absolute index, resolvable.
-        assert set(result["anchors"]) == {0, 1, 2}
-        assert resolve_anchor(result["anchors"][1], result["lines"]) == 1
-
-
-# ---------------------------------------------------------------------------
-# ShellOperationsLayer: content-derived anchors + edit delegation
-#
-# The prior `WriteInvalidatesAnchors` behavior is dropped: anchors are now
-# stateless and content-derived, so `write` has nothing to invalidate. An anchor
-# over changed content simply fails to resolve at edit time — covered by the
-# anchored-editing conflict scenarios.
-# ---------------------------------------------------------------------------
-
-
-class TestContentDerivedAnchors:
-    @pytest.mark.asyncio
-    async def test_cat_returns_resolvable_content_anchors(self, env):
-        """cat returns content-derived anchors keyed by absolute index, no shared state."""
-        vfs_obj, session, ns, agent = env
-        await vfs_obj.write(ns.id, "/t.txt", b"l0\nl1\nl2", principal_id=agent.id)
-        fs_ops = fs_operations_for(session, ResourceLimits())
-        result = await fs_ops.cat("/t.txt")
-        assert result["error"] is None
-        assert set(result["anchors"]) == {0, 1, 2}
-        for idx, anchor in result["anchors"].items():
-            assert resolve_anchor(anchor, result["lines"]) == idx
-
-    @pytest.mark.asyncio
-    async def test_tail_anchors_are_file_absolute(self, env):
-        """tail anchors carry file-absolute indices, not slice-relative ones."""
-        vfs_obj, session, ns, agent = env
-        lines = [f"line{i}" for i in range(6)]
-        await vfs_obj.write(ns.id, "/t.txt", "\n".join(lines).encode(), principal_id=agent.id)
-        fs_ops = fs_operations_for(session, ResourceLimits())
-        result = await fs_ops.tail("/t.txt", 3)
-        assert set(result["anchors"]) == {3, 4, 5}
-
-
-class TestEditDelegatesToAnchoredEditing:
-    """ShellOperationsLayer/EditDelegatesToAnchoredEditing."""
-
-    @pytest.mark.asyncio
-    async def test_edit_round_trips_through_capability(self, env):
-        """edit delegates to anchored-editing and writes a new version; returns version only."""
-        vfs_obj, session, ns, agent = env
-        await vfs_obj.write(ns.id, "/t.txt", b"l0\nl1\nl2", principal_id=agent.id)
-        fs_ops = fs_operations_for(session, ResourceLimits())
-        cat = await fs_ops.cat("/t.txt")
-        result = await fs_ops.edit("/t.txt", cat["anchors"][1], cat["anchors"][1], ["NEW"])
-        assert result == {"version_number": 2}
-        again = await fs_ops.cat("/t.txt")
-        assert again["lines"] == ["l0", "NEW", "l2"]
-
-    @pytest.mark.asyncio
-    async def test_edit_stale_anchor_conflicts(self, env):
-        """An edit whose anchor no longer matches current content conflicts (no write)."""
-        vfs_obj, session, ns, agent = env
-        await vfs_obj.write(ns.id, "/t.txt", b"l0\nl1\nl2", principal_id=agent.id)
-        fs_ops = fs_operations_for(session, ResourceLimits())
-        cat = await fs_ops.cat("/t.txt")
-        stale_anchor = cat["anchors"][1]
-        # Concurrent change invalidates the captured anchor's content.
-        await fs_ops.write("/t.txt", b"l0\nCHANGED\nl2")
-        with pytest.raises(AnchorConflictError):
-            await fs_ops.edit("/t.txt", stale_anchor, stale_anchor, ["x"])
 
 
 # ---------------------------------------------------------------------------

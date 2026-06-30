@@ -91,7 +91,7 @@ class TestNativeFilesystemMount:
         """MontyProviderIntegration/NativeFilesystemAccessFromSandbox."""
         vfs, ns, _, agent = env
         await vfs.write(ns.id, "/ws/data.txt", b"42", principal_id=agent.id)
-        # Uses pathlib only — no cat/grep/edit injected verb.
+        # Uses pathlib only — no injected shell verb.
         code = "from pathlib import Path\nint(Path('/ws/data.txt').read_text())"
         result = await vfs.execute(code, ns.id, agent.id, "monty", cwd="/ws/")
         assert result.success is True

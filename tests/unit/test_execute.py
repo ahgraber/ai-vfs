@@ -32,7 +32,6 @@ import pytest_asyncio
 
 from vfs.config import VFSConfig
 from vfs.errors import (
-    AnchorConflictError,
     ConflictError,
     IndexUnavailableError,
     NotFoundError,
@@ -476,7 +475,6 @@ _TRANSLATION_TABLE = [
     (ConflictError("MARKER_cas"), "conflict"),
     (VersionCollisionError("MARKER_collision"), "conflict"),
     (OperationBudgetExceededError("MARKER_opbudget"), "budget_exceeded"),
-    (AnchorConflictError("MARKER_anchor"), "anchor_conflict"),
     (ReadBudgetExceededError("MARKER_readbgt"), "search_unavailable"),
     (ReindexRequiredError("MARKER_reindex"), "search_unavailable"),
     (IndexUnavailableError("MARKER_idxdown"), "search_unavailable"),
