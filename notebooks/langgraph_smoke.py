@@ -1,5 +1,5 @@
 # %% [markdown]
-# # ai-vfs — LangGraph mount + edit gut-check (DISPOSABLE SKETCH)
+# # ai-vfs — LangGraph mount + write gut-check (DISPOSABLE SKETCH)
 #
 # **This file is a disposable falsification sketch, not a shipped integration.**
 # Its only job is to answer one question: *does the same public `vfs` surface
@@ -21,7 +21,7 @@ from typing import TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from vfs import VFS, AnchoredEditor, Hunk, ResourceLimits, Session, VFSConfig
+from vfs import VFS, ResourceLimits, VFSConfig
 
 
 class MountState(TypedDict):
@@ -30,7 +30,7 @@ class MountState(TypedDict):
     namespace_id: str
     principal_id: str
     execute_output: str
-    new_version: int
+    written: str
 
 
 async def _make_vfs(tmp_dir: str) -> tuple[VFS, str, str]:
@@ -52,11 +52,10 @@ async def _make_vfs(tmp_dir: str) -> tuple[VFS, str, str]:
 
 
 async def main() -> None:
-    """Run a two-node graph: mount-and-execute, then anchored-edit."""
+    """Run a two-node graph: mount-and-execute, then native write through the mount."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         vfs, namespace_id, principal_id = await _make_vfs(tmp_dir)
         try:
-            await vfs.write(namespace_id, "/note.txt", b"draft\n", principal_id=principal_id)
 
             async def mount_and_execute(state: MountState) -> MountState:
                 result = await vfs.execute(
@@ -69,28 +68,30 @@ async def main() -> None:
                 )
                 return {**state, "execute_output": repr(result.output)}
 
-            async def anchored_edit(state: MountState) -> MountState:
-                editor = AnchoredEditor(Session(vfs, state["namespace_id"], state["principal_id"]))
-                read = await editor.read_anchored("/note.txt")
-                anchor = read.anchors[0]
-                result = await editor.edit_anchored(
-                    "/note.txt",
-                    [Hunk(start_anchor=anchor, end_anchor=anchor, replacement=["final"])],
-                    expected_version=read.version,
+            async def native_write(state: MountState) -> MountState:
+                # The sandbox writes a file with plain native I/O through the governed mount.
+                await vfs.execute(
+                    "open('/note.txt', 'w').write('final\\n')",
+                    state["namespace_id"],
+                    state["principal_id"],
+                    "monty",
+                    resource_limits=ResourceLimits(timeout_seconds=10.0),
+                    cwd="/",
                 )
-                return {**state, "new_version": result.new_version}
+                content = await vfs.read(state["namespace_id"], "/note.txt", principal_id=state["principal_id"])
+                return {**state, "written": content.decode()}
 
             graph = StateGraph(MountState)
             graph.add_node("mount_and_execute", mount_and_execute)
-            graph.add_node("anchored_edit", anchored_edit)
+            graph.add_node("native_write", native_write)
             graph.set_entry_point("mount_and_execute")
-            graph.add_edge("mount_and_execute", "anchored_edit")
-            graph.add_edge("anchored_edit", END)
+            graph.add_edge("mount_and_execute", "native_write")
+            graph.add_edge("native_write", END)
             app = graph.compile()
 
             final = await app.ainvoke({"namespace_id": namespace_id, "principal_id": principal_id})
             print("execute output:", final["execute_output"])
-            print("edited to version:", final["new_version"])
+            print("file written:", repr(final["written"]))
         finally:
             await vfs.close()
 
