@@ -736,20 +736,36 @@ if HAS_MONTY:
         print(f"grep: {result.error_type} — {result.error_message}")
 
 # %% [markdown]
-# ### cat + anchored edit
+# ### cat — read a file from inside the sandbox
 #
-# `cat()` returns lines and anchor tokens keyed by line index.  Anchor tokens
-# are short opaque strings that carry a content hash; `edit()` verifies them
-# before writing to detect any concurrent modification and refuse stale edits.
+# `cat(path)` returns `{"lines": [...], "error": None}` — the decoded UTF-8 lines
+# of the file (or a structured error dict for binary/oversize content).
 
 # %%
 if HAS_MONTY:
-    code = (
-        "cat_result = await cat('/ws/greet.py')\n"
-        "start = cat_result['anchors'][1]\n"
-        "end   = cat_result['anchors'][1]\n"
-        "await edit('/ws/greet.py', start, end, ['def greet(name, greeting=\"Hello\"):'])\n"
+    result = await vfs.execute(
+        code="await cat('/ws/greet.py')",
+        namespace_id=ns_id,
+        principal_id=admin_id,
+        provider_name="monty",
+        resource_limits=limits,
     )
+    if result.success:
+        print(f"cat /ws/greet.py: {len(result.output['lines'])} line(s)")
+        for line in result.output["lines"]:
+            print(f"  {line!r}")
+    else:
+        print(f"cat: {result.error_type} — {result.error_message}")
+
+# %% [markdown]
+# ### write — native file editing from inside the sandbox
+#
+# Editing is plain Python I/O: the sandbox opens the file and writes new content.
+# The write flows through the VFS with full versioning and permission checks.
+
+# %%
+if HAS_MONTY:
+    code = "from pathlib import Path\nPath('/ws/greet.py').write_text('def greet(name, greeting=\"Hello\"):\\n')\n"
     result = await vfs.execute(
         code=code,
         namespace_id=ns_id,
@@ -758,9 +774,9 @@ if HAS_MONTY:
         resource_limits=limits,
     )
     if result.success:
-        print(f"anchored edit: new version={result.output['version_number']}")
+        print("native write: /ws/greet.py updated via Path.write_text")
     else:
-        print(f"anchored edit: {result.error_type} — {result.error_message}")
+        print(f"native write: {result.error_type} — {result.error_message}")
 
 # %% [markdown]
 # ### permission gate — Tier 1

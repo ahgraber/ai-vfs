@@ -1,21 +1,19 @@
 # %% [markdown]
 # # ai-vfs — Code-mode tools for a pydantic-ai agent
 #
-# An agent that edits files needs two things you normally have to build yourself:
-# a place to *run code* against those files, and a way to *change a line* without
-# re-emitting the whole document. ai-vfs gives both over a **governed** store —
-# every read, write, and sandbox call is checked against the calling principal's
-# permissions and audited — and a consumer reaches all of it through the public
-# `vfs` package alone, never a `vfs.*` submodule. This notebook wires those two
-# capabilities onto a [pydantic-ai](https://ai.pydantic.dev) agent as tools.
+# An agent that works with files needs a place to *run code* against those files
+# that you normally have to build yourself. ai-vfs gives that over a **governed**
+# store — every read, write, and sandbox call is checked against the calling
+# principal's permissions and audited — and a consumer reaches all of it through
+# the public `vfs` package alone, never a `vfs.*` submodule. This notebook wires
+# that capability onto a [pydantic-ai](https://ai.pydantic.dev) agent as a tool.
 #
 # A few terms used throughout:
 # - **code mode** — instead of one tool per operation, give the agent a sandbox
 #   and let it *write code* that calls the filesystem; `vfs.execute` runs it.
 # - **sandbox mount** — the sandbox sees the governed VFS as its filesystem, not
-#   the host's; it can only touch what the principal may.
-# - **anchor** — a line locator `index:checksum` derived from file content, the
-#   unit an anchored edit targets.
+#   the host's; it can only touch what the principal may. Native I/O inside the
+#   sandbox (`open(path).read()`, `open(path, 'w').write(...)`) routes through it.
 # It deliberately is **not** a shipped pydantic-ai integration — it is the wiring,
 # small enough to read, so you can lift the pattern into your own agent.
 #
@@ -33,7 +31,7 @@ import importlib.util
 import shutil
 import tempfile
 
-from vfs import VFS, AnchorConflictError, AnchoredEditor, Hunk, ResourceLimits, Session, VFSConfig
+from vfs import VFS, ResourceLimits, VFSConfig
 
 HAS_MONTY: bool = importlib.util.find_spec("pydantic_monty") is not None
 HAS_PYDANTIC_AI: bool = importlib.util.find_spec("pydantic_ai") is not None
@@ -104,7 +102,7 @@ else:
 # read permission — the host filesystem is never mounted. We seed a file as the
 # agent, then read it back with native `open` from inside the sandbox; the content
 # crosses storage → permission check → sandbox, and comes back as an ordinary
-# string (anchored, addressable reads are §3's job).
+# string. Writing back through the same mount is §3.
 
 # %%
 # not idempotent: re-running adds a version of /work/notes.txt
@@ -130,90 +128,44 @@ if HAS_MONTY:
 # the boundary contract is `src/vfs/protocols/fs_port.py`.
 
 # %% [markdown]
-# ## 3. Anchored editing — change a line without re-sending the file
+# ## 3. Writing back through the mount — native I/O, governed
 #
-# `AnchoredEditor` is the standalone, **stateless** edit surface: `read_anchored`
-# returns the file's version plus a content-derived `index:checksum` anchor for
-# every line, and `edit_anchored` replaces an anchored span — applying only when
-# the file is still at the version you read (a stale edit is rejected, not merged).
-# Nothing is stored between calls; the anchors are recomputed from content each
-# time, which is why an agent can read, edit, and re-read across independent turns.
+# Editing in code mode is just native file I/O against the mount: the sandbox does
+# `open(path, 'w').write(...)` and the bytes land as a new governed version, routed
+# through the principal's *write* permission. No special edit verb, no separate
+# surface — the same `open` you'd use on any filesystem, except this one is the VFS.
+# We rewrite the file the sandbox seeded in §2, then read it back through the public
+# `vfs.read` to prove the new bytes committed.
 
 # %%
-# not idempotent: re-running adds a version of /src/greeting.py
-await vfs.write(
-    namespace_id=ns_id,
-    path="/src/greeting.py",
-    content=b"def greet(name):\n    return 'hello ' + name\n",
-    principal_id=agent_id,
-)
-editor = AnchoredEditor(Session(vfs, ns_id, agent_id))
-read = await editor.read_anchored(path="/src/greeting.py")
-print(f"version {read.version}")
-for index, anchor in read.anchors.items():
-    print(f"  {anchor}  ->  {read.lines[index]!r}")
-
-# %% [markdown]
-# ### One edit writes a new version under the version it read
-#
-# We replace the body line (its anchor from the read above) with an f-string. The
-# edit carries `expected_version`, so it commits only against the exact content
-# the anchor came from; the read-back proves the new bytes landed.
-
-# %%
-# not idempotent: succeeds once (v1 -> v2), then conflicts because the file moved on
-body_index = 1
-result = await editor.edit_anchored(
-    path="/src/greeting.py",
-    hunks=[
-        Hunk(
-            start_anchor=read.anchors[body_index],
-            end_anchor=read.anchors[body_index],
-            replacement=["    return f'hello {name}'"],
-        )
-    ],
-    expected_version=read.version,
-)
-after = await vfs.read(namespace_id=ns_id, path="/src/greeting.py", principal_id=agent_id)
-print(f"new version {result.new_version}\n--- file now ---\n{after.decode()}")
-
-# %% [markdown]
-# ### A stale anchor is rejected, not applied to the wrong line
-#
-# `read.version` is now behind the file. Re-using it asks to edit content that no
-# longer exists at that version, so the editor raises `AnchorConflictError` and
-# writes nothing — the guarantee that makes anchored editing safe for concurrent
-# or multi-turn agents. Re-running this cell always rejects, changing nothing.
-
-# %%
-try:
-    await editor.edit_anchored(
-        path="/src/greeting.py",
-        hunks=[
-            Hunk(
-                start_anchor=read.anchors[body_index],
-                end_anchor=read.anchors[body_index],
-                replacement=["    return name"],
-            )
-        ],
-        expected_version=read.version,  # stale on purpose
+# not idempotent: re-running adds a version of /work/notes.txt
+if HAS_MONTY:
+    wrote = await vfs.execute(
+        code="open('/work/notes.txt', 'w').write('alpha\\nBETA\\ngamma\\n')",
+        namespace_id=ns_id,
+        principal_id=agent_id,
+        provider_name="monty",
+        resource_limits=ResourceLimits(timeout_seconds=10.0),
     )
-except AnchorConflictError as exc:
-    print(f"AnchorConflictError (expected): {exc}")
+    print("sandbox write outcome:", wrote.success, wrote.error_type)
+    after = await vfs.read(namespace_id=ns_id, path="/work/notes.txt", principal_id=agent_id)
+    print(f"--- file now ---\n{after.decode()}")
 
 # %% [markdown]
-# The capability is `src/vfs/anchored_editing/editor.py` (`read_anchored`,
-# `edit_anchored`); the anchor format and strict-conflict contract are specified in
-# `.specs/changes/2026-06-28-sandbox-fs-mount/specs/anchored-editing/spec.md`.
+# The mount is `src/vfs/execution/monty_os.py`; the boundary contract every native
+# read/write crosses is `src/vfs/protocols/fs_port.py`, and the dispatch that wires
+# it into a sandbox is `vfs.execute` in `src/vfs/vfs.py`.
 
 # %% [markdown]
-# ## 4. Compose the two into pydantic-ai tools
+# ## 4. Compose into a pydantic-ai tool
 #
-# A code-mode tool is just an async function the agent can call. We close the two
-# patterns above over `(vfs, ns_id, agent_id)` and hand them to an `Agent` as
-# `Tool`s — using only names imported from the top-level `vfs` package. `TestModel`
-# lets the agent construct with no credentials; swap in `"anthropic:claude-sonnet-4-6"`
-# to drive a real loop.
+# A code-mode tool is just an async function the agent can call. We close the
+# execute pattern above over `(vfs, ns_id, agent_id)` and hand it to an `Agent` as
+# a `Tool` — using only names imported from the top-level `vfs` package. With a
+# single sandbox tool the agent both reads and writes files by emitting native
+# Python; no per-operation tool surface is needed. `TestModel` lets the agent
+# construct with no credentials; swap in `"anthropic:claude-sonnet-4-6"` to drive a
+# real loop.
 
 
 # %%
@@ -229,24 +181,12 @@ async def execute_python(code: str) -> str:
     return repr(outcome.output) if outcome.success else f"error[{outcome.error_type}]: {outcome.error_message}"
 
 
-async def edit_line(path: str, anchor: str, replacement: str) -> str:
-    """Replace the line at ``anchor`` with ``replacement`` (a fresh read+edit each call)."""
-    line_editor = AnchoredEditor(Session(vfs, ns_id, agent_id))
-    current = await line_editor.read_anchored(path=path)
-    outcome = await line_editor.edit_anchored(
-        path=path,
-        hunks=[Hunk(start_anchor=anchor, end_anchor=anchor, replacement=[replacement])],
-        expected_version=current.version,
-    )
-    return f"ok: /{path} now at version {outcome.new_version}"
-
-
 # %%
 if HAS_PYDANTIC_AI:
     from pydantic_ai import Agent, Tool
     from pydantic_ai.models.test import TestModel
 
-    agent_tools = [Tool(execute_python, takes_ctx=False), Tool(edit_line, takes_ctx=False)]
+    agent_tools = [Tool(execute_python, takes_ctx=False)]
     agent = Agent(TestModel(), tools=agent_tools)
     print("agent built; tools the model can call:", [tool.name for tool in agent_tools])
 else:

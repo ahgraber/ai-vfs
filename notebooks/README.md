@@ -8,7 +8,7 @@ Hands-on demos for the ai-vfs library.
 | ---------------------------- | ---------------------------------------------------- | ------------------------ |
 | `01_vfs_tour.py`             | Full VFS API walkthrough                             | None (SQLite + local FS) |
 | `02_remote_backends.py`      | Postgres + MinIO tour                                | Demo stack required      |
-| `03_pydantic_ai_codemode.py` | Sandbox execute + anchored edit as pydantic-ai tools | None (SQLite + local FS) |
+| `03_pydantic_ai_codemode.py` | Sandbox execute + native write as a pydantic-ai tool | None (SQLite + local FS) |
 
 `langgraph_smoke.py` is a disposable falsification sketch (does the public surface
 plug into a LangGraph node?), not a shipped integration; it needs `langgraph`
