@@ -57,37 +57,6 @@ class OperationBudgetExceededError(VFSError):
     """
 
 
-class AnchorConflictError(VFSError):
-    """An anchored edit could not be applied safely and was rejected without writing.
-
-    Anchors are stateless ``{absolute_line_index}:{checksum}`` tokens derived
-    purely from file content (see :mod:`vfs.anchored_editing`). This error is
-    raised when:
-
-    - The file's current version differs from the edit's ``expected_version``
-      (the file changed since the anchors were read).
-    - An anchor's checksum does not match the content at its index (a fabricated
-      anchor, an index transposition, or an anchor pasted from another file).
-    - An anchor's index is out of range, or a hunk's end anchor resolves before
-      its start anchor (inverted range), or hunks overlap.
-    - An anchor token is malformed (not ``index:checksum``).
-    - ``session.write`` raises ``ConflictError`` or ``VersionCollisionError``
-      during the CAS write (always surfaced as ``AnchorConflictError`` — never
-      retried).
-
-    The caller should re-read the file (``read_anchored``) to obtain fresh
-    anchors and the current version before retrying the edit.
-    """
-
-
-class ContentDecodeError(VFSError):
-    """File content could not be decoded as strict UTF-8 for an anchored read/edit.
-
-    Anchored editing operates on text lines; binary or non-UTF-8 content cannot
-    be anchored. The operation yields no anchors and writes nothing.
-    """
-
-
 class UnsupportedOperationError(VFSError):
     """A filesystem operation with no VFS equivalent was requested.
 

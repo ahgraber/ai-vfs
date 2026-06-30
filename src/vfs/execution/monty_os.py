@@ -121,6 +121,30 @@ class MontyVfsOS(AbstractOS):
         self._await(self._fs.write(self._path(path), encoded))
         return len(data)
 
+    def path_append_text(self, path: PurePosixPath | MontyFileHandle, data: str) -> int:
+        """Append UTF-8 ``data`` to ``path``; return the character count.
+
+        Monty routes writes to an ``open(path, 'w'|'a')`` handle through append
+        (the open-time effect truncated/created the file). The whole-file FS-port
+        has no append primitive, so this reads the current bytes and rewrites.
+        """
+        self._append(self._path(path), data.encode("utf-8"))
+        return len(data)
+
+    def path_append_bytes(self, path: PurePosixPath | MontyFileHandle, data: bytes) -> int:
+        """Append ``data`` bytes to ``path``; return the byte count."""
+        self._append(self._path(path), data)
+        return len(data)
+
+    def _append(self, path: str, data: bytes) -> None:
+        from vfs.errors import NotFoundError
+
+        try:
+            existing = self._await(self._fs.read(path))
+        except NotFoundError:
+            existing = b""
+        self._await(self._fs.write(path, existing + data))
+
     def path_open(self, path: PurePosixPath, mode: str) -> MontyFileHandle:
         """Perform the ``open(path, mode)`` open-time effect against the VFS.
 

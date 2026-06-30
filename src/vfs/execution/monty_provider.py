@@ -67,7 +67,6 @@ _SHELL_FUNCTION_NAMES = (
     "find",
     "glob",
     "write",
-    "edit",
 )
 
 

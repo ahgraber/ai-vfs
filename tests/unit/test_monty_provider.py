@@ -7,7 +7,6 @@ environments without the ``monty`` extra and run normally in dev
 Covers (tasks.md group "Monty Adapter + Packaging"):
   MontyProviderIntegration/SimpleExpressionReturnsOutput
   MontyProviderIntegration/GrepBridgesAsyncSearch
-  MontyProviderIntegration/EditFromSandboxWorks
   MontyProviderIntegration/MontyInternalTimeoutProducesProviderError
   MontyProviderIntegration/EventLoopHeartbeatDuringExecution
   ExecutionProviderRegistry/RegistryResolvesMonty
@@ -276,55 +275,6 @@ class TestGrepBridgesAsyncSearch:
         else:
             # search_unavailable is acceptable on SQLite without FTS
             assert result.error_type in ("search_unavailable", "provider_error", "not_found")
-
-
-# ---------------------------------------------------------------------------
-# MontyProviderIntegration/EditFromSandboxWorks
-# ---------------------------------------------------------------------------
-
-
-class TestEditFromSandboxWorks:
-    """Sandbox edit() modifies a file and returns updated anchors."""
-
-    @skip_no_monty
-    @pytest.mark.asyncio
-    async def test_edit_modifies_file(self, env):
-        vfs, ns, admin, agent = env
-
-        # Write a file (agent has write permission)
-        content = b"line one\nline two\nline three\n"
-        await vfs.write(ns.id, "/workspace/edit_target.txt", content, principal_id=agent.id)
-
-        # Sandbox: cat the file (allocates anchors), then edit line two
-        code = """
-result = await cat('/workspace/edit_target.txt')
-anchors = result['anchors']
-lines = result['lines']
-# find the anchor for "line two" (line index 1)
-anchor_1 = anchors[1]
-edit_result = await edit('/workspace/edit_target.txt', anchor_1, anchor_1, ['REPLACED'])
-edit_result
-"""
-        result = await vfs.execute(
-            code,
-            ns.id,
-            agent.id,
-            "monty",
-            resource_limits=ResourceLimits(timeout_seconds=10.0),
-        )
-
-        assert result.success is True, f"edit failed: {result}"
-        # The edit verb delegates to anchored-editing, which returns the new
-        # version only — never the file content or anchors (no re-emit).
-        assert isinstance(result.output, dict)
-        assert "version_number" in result.output
-        assert "lines" not in result.output
-        assert "anchors" not in result.output
-
-        # Verify the file was actually modified in the VFS
-        new_content = await vfs.read(ns.id, "/workspace/edit_target.txt", principal_id=agent.id)
-        assert b"REPLACED" in new_content
-        assert b"line two" not in new_content
 
 
 # ---------------------------------------------------------------------------

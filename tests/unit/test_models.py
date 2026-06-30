@@ -238,7 +238,6 @@ class TestPublicContractSurface:
         import vfs
 
         names = [
-            "AnchorConflictError",
             "ConflictError",
             "IndexUnavailableError",
             "NotFoundError",
@@ -256,7 +255,7 @@ class TestPublicContractSurface:
     def test_execution_types_importable_from_vfs(self):
         import vfs
 
-        names = ["AnchoredEditor", "Hunk", "resolve_execution_provider"]
+        names = ["resolve_execution_provider"]
         for name in names:
             assert hasattr(vfs, name), f"vfs.{name} is not importable"
 
@@ -264,10 +263,7 @@ class TestPublicContractSurface:
         import vfs
 
         for name in [
-            "AnchoredEditor",
-            "Hunk",
             "resolve_execution_provider",
-            "AnchorConflictError",
             "VersionCollisionError",
         ]:
             assert name in vfs.__all__, f"{name!r} missing from vfs.__all__"

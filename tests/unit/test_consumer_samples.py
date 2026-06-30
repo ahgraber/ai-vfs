@@ -8,8 +8,8 @@ through a kernel — not by importing its cells):
    top-level ``vfs`` package; reaching into a ``vfs.*`` submodule is a coupling
    violation. Static AST check over the source, so it runs without any optional dep.
 2. **Consumer integration** — the pattern the pydantic-ai sample teaches (drive a
-   sandbox execute and a standalone anchored edit through the public ``vfs`` API)
-   works end-to-end against an in-memory VFS.
+   sandbox execute, then a native write through the governed mount via the public
+   ``vfs`` API) works end-to-end against an in-memory VFS.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import pytest
 import pytest_asyncio
 
 import vfs as vfs_pkg
-from vfs import VFS, AnchoredEditor, Hunk, ResourceLimits, Session, VFSConfig
+from vfs import VFS, ResourceLimits, VFSConfig
 
 HAS_MONTY = importlib.util.find_spec("pydantic_monty") is not None
 
@@ -92,10 +92,10 @@ async def env(tmp_path):
 
 @pytest.mark.skipif(not HAS_MONTY, reason="pydantic-monty not installed")
 class TestConsumerCodeModePattern:
-    """The public-surface consumer pattern: one sandbox execute + one anchored edit."""
+    """The public-surface consumer pattern: one sandbox execute + one native write."""
 
     @pytest.mark.asyncio
-    async def test_execute_and_anchored_edit(self, env):
+    async def test_execute_and_native_write(self, env):
         vfs, namespace_id, principal_id = env
 
         async with no_task_leaks(action="raise"):
@@ -109,21 +109,22 @@ class TestConsumerCodeModePattern:
             )
             assert result.success and result.output == 42
 
-            # One standalone anchored edit through the public AnchoredEditor surface.
+            # A native write through the governed mount: the sandbox uses plain
+            # open().write(), and the bytes land as a new governed version.
             await vfs.write(
                 namespace_id=namespace_id,
                 path="/greeting.txt",
                 content=b"hello\nworld\n",
                 principal_id=principal_id,
             )
-            editor = AnchoredEditor(Session(vfs, namespace_id, principal_id))
-            read = await editor.read_anchored(path="/greeting.txt")
-            edit = await editor.edit_anchored(
-                path="/greeting.txt",
-                hunks=[Hunk(start_anchor=read.anchors[0], end_anchor=read.anchors[0], replacement=["HELLO"])],
-                expected_version=read.version,
+            wrote = await vfs.execute(
+                code="open('/greeting.txt', 'w').write('HELLO\\nworld\\n')",
+                namespace_id=namespace_id,
+                principal_id=principal_id,
+                provider_name="monty",
+                resource_limits=ResourceLimits(timeout_seconds=10.0),
             )
-            assert edit.new_version == read.version + 1
+            assert wrote.success
 
             content = await vfs.read(namespace_id=namespace_id, path="/greeting.txt", principal_id=principal_id)
             assert content == b"HELLO\nworld\n"

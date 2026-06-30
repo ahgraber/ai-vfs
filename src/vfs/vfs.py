@@ -16,9 +16,7 @@ from ulid import ULID
 
 from vfs.config import VFSConfig
 from vfs.errors import (
-    AnchorConflictError,
     ConflictError,
-    ContentDecodeError,
     IndexUnavailableError,
     NotFoundError,
     OperationBudgetExceededError,
@@ -989,7 +987,6 @@ class VFS:
         # session.cd enforces read permission on cwd; permission denied here is a
         # caller-side error, so let it propagate (Tier 1 boundary).
         await session.cd(cwd)
-        # Anchors are stateless and content-derived; no AnchorMap is constructed.
         fs_ops = fs_operations_for(session, effective_limits)
         fs_port = SessionFsPort(session)
 
@@ -1026,18 +1023,6 @@ class VFS:
                 success=False,
                 error_type="budget_exceeded",
                 error_message="Operation limit reached",
-            )
-        except AnchorConflictError:
-            return ExecutionResult(
-                success=False,
-                error_type="anchor_conflict",
-                error_message="Anchors stale; re-read file",
-            )
-        except ContentDecodeError:
-            return ExecutionResult(
-                success=False,
-                error_type="decode_error",
-                error_message="File content is not valid UTF-8",
             )
         except ReadBudgetExceededError:
             return ExecutionResult(

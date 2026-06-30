@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from vfs.errors import AnchorConflictError, OperationBudgetExceededError, VFSError
+from vfs.errors import OperationBudgetExceededError, VFSError
 from vfs.protocols.execution import ExecutionCapabilities, ExecutionResult, ResourceLimits
 
 
@@ -84,14 +84,9 @@ class TestResourceLimitsDefaults:
 
 
 class TestNewErrors:
-    """OperationBudgetExceededError and AnchorConflictError are VFSError subclasses."""
+    """OperationBudgetExceededError is a VFSError subclass."""
 
     def test_operation_budget_exceeded_is_vfs_error(self):
         err = OperationBudgetExceededError("budget gone")
         assert isinstance(err, VFSError)
         assert "budget gone" in str(err)
-
-    def test_anchor_conflict_is_vfs_error(self):
-        err = AnchorConflictError("stale anchor")
-        assert isinstance(err, VFSError)
-        assert "stale anchor" in str(err)

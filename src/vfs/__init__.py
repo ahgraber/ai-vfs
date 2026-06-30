@@ -1,17 +1,8 @@
 """AI-first virtual file system."""
 
-from vfs.anchored_editing import (
-    AnchoredEditor,
-    AnchoredEditResult,
-    AnchoredReadResult,
-    Hunk,
-    make_anchor,
-)
 from vfs.config import VFSConfig
 from vfs.errors import (
-    AnchorConflictError,
     ConflictError,
-    ContentDecodeError,
     IndexUnavailableError,
     NotFoundError,
     OperationBudgetExceededError,
@@ -32,12 +23,6 @@ from vfs.vfs import VFS
 __all__ = [
     "VFS",
     "VFSConfig",
-    # Anchored editing (standalone capability)
-    "AnchoredEditor",
-    "AnchoredEditResult",
-    "AnchoredReadResult",
-    "Hunk",
-    "make_anchor",
     # Execution
     "ExecutionCapabilities",
     "ExecutionProvider",
@@ -52,8 +37,6 @@ __all__ = [
     "resolve_path",
     # Error types callers must catch
     "VFSError",
-    "AnchorConflictError",
-    "ContentDecodeError",
     "ConflictError",
     "IndexUnavailableError",
     "NotFoundError",
