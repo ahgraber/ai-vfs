@@ -46,8 +46,8 @@ flagged on the result object.
 
 ### Requirement: FsOperationsFactory
 
-The system SHALL provide an `FsOperations` dataclass whose fields are async callables corresponding to the eleven shell wrappers (`cd`, `pwd`, `cat`, `head`, `tail`, `ls`, `grep`, `find`, `glob`, `write`, `edit`) plus internal fields (`read`, `stat`, `delete`) for use within the execution layer.
-The system SHALL provide a `fs_operations_for(session, resource_limits, anchor_map)` factory that constructs all wrappers bound to the session, wires the shared `OperationCounter`, and returns an `FsOperations` instance.
+The system SHALL provide an `FsOperations` dataclass whose fields are async callables corresponding to the ten shell wrappers (`cd`, `pwd`, `cat`, `head`, `tail`, `ls`, `grep`, `find`, `glob`, `write`) plus internal fields (`read`, `stat`, `delete`) for use within the execution layer.
+The system SHALL provide a `fs_operations_for(session, resource_limits)` factory that constructs all wrappers bound to the session, wires the shared `OperationCounter`, and returns an `FsOperations` instance.
 All shell wrappers except `pwd` and `cd` SHALL resolve relative paths through `session.cwd` before invoking the underlying VFS operation.
 
 Each invocation of any shell wrapper SHALL increment a shared `OperationCounter`.
@@ -81,18 +81,16 @@ The `FsOperations` shell wrappers SHALL implement the following dispatch:
   When `recursive=False`, results are post-filtered to depth-1 files only (files whose path has no additional `/` segment after the resolved scope); the underlying `session.search` always scans recursively.
 - `find(path, **predicates)` → `session.search(scope=path, search_type=FIND, find_predicates=FindPredicates(**predicates))`.
 - `glob(pattern)` → `session.search` with `search_type=GLOB`.
-- `cat(path)` → `session.read(path)` decoded as strict UTF-8; undecodable content yields a structured error and no anchors.
+- `cat(path)` → `session.read(path)` decoded as strict UTF-8, returning `{"lines": [...], "error": None}`; undecodable content yields a structured error dict instead.
   Content split on `\n` only (`\r` kept in line content); trailing-newline presence preserved.
-  `anchor_map.allocate` on all lines; returns content with a separate `anchors` dict mapping `line_index → anchor_token` (not inline tokens in the line text).
   A path beginning with `//` is accepted as a canonical absolute path by the POSIX path resolver and is permission-checked like any other absolute path.
   Raises a structured error (not host OOM) if content exceeds `resource_limits.max_read_bytes`; the size check is performed via `stat` before the blob is fetched when `max_read_bytes` is set.
-- `head(path, n)` / `tail(path, n)` → same UTF-8 decode and line model as `cat`; line slicing applied before anchor allocation; `anchor_map.allocate` on the sliced lines only.
-  For `tail`, anchor `line_index` values are file-absolute (offset from the start of the full file, not the slice).
+- `head(path, n)` / `tail(path, n)` → same UTF-8 decode and line model as `cat`; line slicing applied to the decoded lines.
+  For `tail`, the returned lines are the last `n` lines of the full file.
 - `ls(path)` → `session.list(path)` mapped to a list of dicts with fields `name`, `path`, `is_dir` (synthesized for implicit directory prefixes via an internal recursive scan), `version_number`, and `updated_at`.
   `size` is included only when `ls(path, long=True)` is called, which performs a batched `VersionMeta` lookup (`size` lives on `VersionMeta`, not `FileMeta`).
   Result count is capped by `resource_limits.max_result_items` with a truncation flag when exceeded.
-- `write(path, data)` → `session.write(path, data)` followed by `anchor_map.invalidate(path)` on success; returns `{"version_number": int, "size": int}` (a plain marshalable dict, not the raw `VersionMeta` model).
-- `edit(path, start_anchor, end_anchor, replacement, expected_version=None)` → anchor validation then `session.write`; see `AnchoredEditing` requirement.
+- `write(path, data)` → `session.write(path, data)`; returns `{"version_number": int, "size": int}` (a plain marshalable dict, not the raw `VersionMeta` model).
 
 **Budget independence:** `grep` and `find` each count as ONE operation against `ResourceLimits.max_operations`.
 Their internal blob I/O is governed exclusively by the search layer's own `SearchLimits` budget (per the design's budget-independence decision); it does not draw from `max_read_bytes`.
@@ -138,111 +136,21 @@ Their internal blob I/O is governed exclusively by the search layer's own `Searc
 
 - **GIVEN** a file with 20 lines
 - **WHEN** `head(path, 5)` is called
-- **THEN** the first 5 lines are returned (with anchors for those 5 lines only)
+- **THEN** the first 5 lines are returned
 - **WHEN** `tail(path, 5)` is called
-- **THEN** the last 5 lines are returned (with anchors for those 5 lines only)
+- **THEN** the last 5 lines are returned
 
 #### Scenario: OversizedReadReturnsError
 
 - **GIVEN** a file whose content size exceeds `resource_limits.max_read_bytes`
 - **WHEN** `cat(path)` is called
-- **THEN** a structured error is returned and no anchors are emitted; the host does not OOM
+- **THEN** a structured error is returned; the host does not OOM
 
 #### Scenario: BinaryFileReturnsError
 
 - **GIVEN** a file whose content is not valid UTF-8
 - **WHEN** `cat(path)` is called
-- **THEN** a structured error is returned and no anchors are emitted
-
-#### Scenario: WriteInvalidatesAnchors
-
-- **GIVEN** anchors have been allocated for a path via `cat`
-- **WHEN** `write(path, new_content)` is called through `FsOperations`
-- **THEN** `anchor_map.invalidate(path)` is called and subsequent `validate` calls for that path's old anchors raise `AnchorConflictError`
-
-### Requirement: AnchoredEditing
-
-The system SHALL provide an `AnchorMap` object, constructed inside `fs_operations_for` and closed over by the shell wrappers.
-Its lifetime SHALL match the `FsOperations` instance (one `execute` call).
-Anchors SHALL be allocated from a fixed single-token pool on first use; when the pool is exhausted the allocator SHALL fall back to short (2–4 character) random strings that do not collide with pool entries.
-Each anchor entry SHALL bind `(path, version_number, line_index, line_content)`.
-Validation: resolve the anchor, check the file's current version equals the recorded `version_number`, then check that the line at `line_index` in the current content equals `line_content`.
-Anchored operations (`cat`/`head`/`tail`, `edit`) SHALL decode content as strict UTF-8; undecodable content SHALL yield a structured error and no anchors.
-Line model: content is split on `\n` only; `\r` is kept as part of line content; the presence or absence of a trailing newline is preserved through `edit()`.
-
-`edit(path, start_anchor, end_anchor, replacement, expected_version=None)` SHALL proceed in two stages:
-
-1. **Anchor validation (pre-write):** Resolve start/end anchors; if the file's current version (via `session.stat`) differs from the anchor's recorded version, raise `AnchorConflictError`.
-   Then verify that the line at the stored `line_index` still equals the recorded `line_content`; if not, raise `AnchorConflictError`.
-   If the caller supplies `expected_version` and it differs from the anchor's recorded `version_number`, raise `AnchorConflictError` immediately, before any write.
-2. **Write:** Construct replacement content; `edit()` SHALL always pass the anchor-validated `version_number` as `expected_version` to `session.write`.
-   If `session.write` raises `ConflictError` or `VersionCollisionError`, surface it as `AnchorConflictError` — never retried.
-   On success, the path's anchor state is atomically REPLACED with the longest-common-block (`difflib.SequenceMatcher`) reconciliation result (no prior `invalidate` call).
-
-`reconcile` SHALL run a longest-common-block diff (via `difflib.SequenceMatcher`); unchanged lines SHALL keep their existing anchor tokens with updated `line_index` and the new `version_number`; changed or inserted lines SHALL receive new tokens from the pool; dropped lines SHALL be removed from the map.
-A raw `write()` or `delete()` through `FsOperations` SHALL call `anchor_map.invalidate(path)`; a successful `edit()` SHALL call `anchor_map.reconcile(...)` without a prior invalidation.
-
-#### Scenario: SingleTokenPoolFirst
-
-- **GIVEN** a fresh `AnchorMap` and a 5-line file
-- **WHEN** anchors are allocated for those 5 lines
-- **THEN** the first allocations use entries from the single-token pool (not multi-character fallback strings)
-
-#### Scenario: ValidateKnownAnchor
-
-- **GIVEN** an anchor allocated for line 3 of `/src/a.py` at version 2 with content `"  return x"`
-- **WHEN** `validate(anchor_token, "/src/a.py")` is called
-- **THEN** `(2, "  return x")` is returned
-
-#### Scenario: ValidateWrongPathConflict
-
-- **GIVEN** an anchor allocated for `/src/a.py`
-- **WHEN** `validate(anchor_token, "/src/b.py")` is called (different path)
-- **THEN** `AnchorConflictError` is raised
-
-#### Scenario: StaleVersionConflict
-
-- **GIVEN** an anchor allocated at version 2 of `/src/a.py`
-- **WHEN** the file has since been written to version 3 and `edit()` is called using the version-2 anchor
-- **THEN** `AnchorConflictError` is raised during the stat pre-check before any write is attempted
-
-#### Scenario: StaleLineContentConflict
-
-- **GIVEN** an anchor allocated for a line with content `"  return x"` at the current version
-- **WHEN** a concurrent edit changes that line's content (same version, shifted line)
-- **THEN** `AnchorConflictError` is raised during the line content check
-
-#### Scenario: SuccessfulEditReturnsUpdatedAnchors
-
-- **GIVEN** a file with 10 lines and anchors for all lines
-- **WHEN** `edit()` replaces lines 4–6 with 2 new lines
-- **THEN** the write succeeds, the result carries updated anchors, lines 1–3 and 7–10 keep their
-  original anchor tokens, and lines 4–5 (the replaced range) have new tokens
-
-#### Scenario: CasConflictSurfacesAsAnchorConflict
-
-- **GIVEN** `session.write` raises `ConflictError` (CAS mismatch on `expected_version`)
-- **WHEN** `edit()` propagates the error
-- **THEN** the caller receives `AnchorConflictError` (not a raw `ConflictError`)
-
-#### Scenario: InvalidatedAnchorRejected
-
-- **GIVEN** anchors have been allocated for `/src/a.py`
-- **WHEN** a raw `write(path, ...)` through `FsOperations` calls `anchor_map.invalidate("/src/a.py")`
-- **THEN** a subsequent `validate` call for any of that path's old anchor tokens raises `AnchorConflictError`
-
-#### Scenario: EditReconcilesAnchorsAtomically
-
-- **GIVEN** a file with anchors allocated for all lines
-- **WHEN** `edit()` succeeds and replaces lines 3–5
-- **THEN** the path's anchor state is replaced atomically (reconcile, no prior invalidate);
-  unchanged-line anchors remain valid with updated `line_index` and the new `version_number`
-
-#### Scenario: DifflibReconcilePreservesUnchangedAnchors
-
-- **GIVEN** a 10-line file with anchors allocated for all lines
-- **WHEN** `reconcile` is called with lines 4–6 replaced by 2 new lines
-- **THEN** anchors for lines 1–3 and 7–10 are preserved (same tokens), and lines 4–5 have new tokens
+- **THEN** a structured error is returned
 
 ### Requirement: VfsExecutePermission
 
@@ -259,8 +167,8 @@ The system SHALL provide `vfs.execute(code, namespace_id, principal_id, provider
 **Tier 2 — returns `ExecutionResult(success=False, ...)` for errors arising during execution.**
 
 If the caller-side checks pass, `vfs.execute` SHALL construct a `Session` bound to `cwd` via
-`session.cd(cwd)` (which also enforces read permission on `cwd`), construct an `AnchorMap` and
-`FsOperations`, resolve the named provider via `resolve_execution_provider`, and dispatch to
+`session.cd(cwd)` (which also enforces read permission on `cwd`), construct an
+`FsOperations` instance, resolve the named provider via `resolve_execution_provider`, and dispatch to
 the provider's `execute` method wrapped in `asyncio.wait_for(..., timeout=timeout)`.
 
 Sandbox filesystem access is NOT confined to the execute scope (`cwd`); it is governed by the principal's normal read/write/delete permissions.
@@ -300,7 +208,6 @@ The translation table is:
 | `ConflictError`                | `"conflict"`           |
 | `VersionCollisionError`        | `"conflict"`           |
 | `OperationBudgetExceededError` | `"budget_exceeded"`    |
-| `AnchorConflictError`          | `"anchor_conflict"`    |
 | `ReadBudgetExceededError`      | `"search_unavailable"` |
 | `ReindexRequiredError`         | `"search_unavailable"` |
 | `IndexUnavailableError`        | `"search_unavailable"` |
@@ -406,8 +313,8 @@ Monty-internal errors (sandbox timeout, memory limit, syntax error) SHALL be map
 - **WHEN** `vfs.execute` runs a compute-heavy sandbox script via `MontyExecutionProvider`
 - **THEN** the heartbeat task continues ticking throughout execution (event loop is not starved)
 
-#### Scenario: EditFromSandboxWorks
+#### Scenario: WriteFromSandboxWorks
 
 - **GIVEN** a file exists in the VFS and the sandbox has `execute` and `write` permissions
-- **WHEN** Monty sandbox code calls `edit(path, start_anchor, end_anchor, replacement)`
-- **THEN** the file is modified in the VFS and updated anchors are returned to the sandbox
+- **WHEN** Monty sandbox code calls `write(path, new_content)`
+- **THEN** the file is modified in the VFS and `{"version_number", "size"}` is returned to the sandbox

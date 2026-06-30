@@ -105,7 +105,7 @@ The Session SHALL provide a `pwd()` operation that returns the current `cwd` str
 
 The Session SHALL expose the same file operations as VFS (`read`, `write`, `delete`, `stat`, `list`, `search`, `versions`, `rollback`, `copy`, `move`, `execute`), each resolving path arguments through `cwd` before delegating to the underlying VFS instance.
 `session.execute(code, ...)` SHALL resolve the caller's namespace and principal from the session context and delegate to `vfs.execute` with the session's current `cwd` as the `cwd` argument.
-The `execute` permission check is performed inside `vfs.execute`, not on the `Session`; the `AnchorMap` and `FsOperations` instances are constructed inside `vfs.execute`, not on the `Session`.
+The `execute` permission check is performed inside `vfs.execute`, not on the `Session`; the `FsOperations` instance is constructed inside `vfs.execute`, not on the `Session`.
 
 #### Scenario: AllPathArgsResolved
 

@@ -1,9 +1,10 @@
 # Delta for execution
 
-> This change adds a native filesystem mount and a second sandbox provider, and promotes
-> hash-anchored editing out of `execution` into its own `anchored-editing` capability.
-> Mechanism (the `AbstractOS` sync→async bridge, `commands=` overrides, anchor-encoding details)
-> lives in `design.md`.
+> This change adds a native filesystem mount and a second sandbox provider so sandboxed code
+> reads and writes the governed VFS through native file I/O.
+> Mechanism (the `AbstractOS` sync→async bridge, `commands=` overrides) lives in `design.md`.
+> Hash-anchored editing is removed here and deferred to a future change at
+> `.specs/changes/2026-06-30-anchored-editing/`.
 
 ## ADDED Requirements
 
@@ -60,7 +61,8 @@ Serves: monty-code-mode, governed-mount
 #### Scenario: NativeWritePersistsVersion
 
 - **GIVEN** the principal has write permission on a path
-- **WHEN** sandboxed Monty code writes to that path via native filesystem calls
+- **WHEN** sandboxed Monty code writes to that path via native filesystem calls — both
+  `open(path, "w").write(...)` (the append-callback path) and `pathlib.Path.write_text`
 - **THEN** a new VFS version is created with the written content
 
 #### Scenario: MountEnforcesPermissions
@@ -126,32 +128,21 @@ Serves: just-bash-shell-tool, portable-sandboxes
 
 ### Requirement: ShellOperationsLayer
 
-> Previously: the `edit` wrapper performed anchor validation against a per-`execute`
-> `AnchorMap` and then `session.write`; `write`/`delete` called `anchor_map.invalidate(path)`;
-> `cat`/`head`/`tail` allocated anchors from the `AnchorMap` token pool.
-
-<!-- modified-removes: WriteInvalidatesAnchors -->
-
 The `FsOperations` shell wrappers SHALL implement the following dispatch:
 
 - `grep(pattern, path, recursive=True)` → `session.search(query=pattern, scope=resolved_path, search_type=SearchType.REGEX)`, returning structured match dicts; re-raises `ReadBudgetExceededError`, `ReindexRequiredError`, and `IndexUnavailableError` unchanged.
   When `recursive=False`, results are post-filtered to depth-1 files only (files whose path has no additional `/` segment after the resolved scope); the underlying `session.search` always scans recursively.
 - `find(path, **predicates)` → `session.search(scope=path, search_type=FIND, find_predicates=FindPredicates(**predicates))`.
 - `glob(pattern)` → `session.search` with `search_type=GLOB`.
-- `cat(path)` → `session.read(path)` decoded as strict UTF-8; undecodable content yields a structured error and no anchors.
-  Content split on `\n` only (`\r` kept in line content); trailing-newline presence preserved.
-  Content-derived anchors (from the `anchored-editing` capability) are computed for all lines; returns content with a separate `anchors` dict mapping `line_index → anchor` (not inline tokens in the line text).
+- `cat(path)` → `session.read(path)` decoded as strict UTF-8; undecodable content yields a structured error.
+  Returns `{"lines": [...], "error": None}`; content split on `\n` only (`\r` kept in line content); trailing-newline presence preserved.
   A path beginning with `//` is accepted as a canonical absolute path by the POSIX path resolver and is permission-checked like any other absolute path.
   Raises a structured error (not host OOM) if content exceeds `resource_limits.max_read_bytes`; the size check is performed via `stat` before the blob is fetched when `max_read_bytes` is set.
-- `head(path, n)` / `tail(path, n)` → same UTF-8 decode and line model as `cat`; line slicing applied before anchor computation; content-derived anchors computed for the sliced lines only.
-  For `tail`, anchor `line_index` values are file-absolute (offset from the start of the full file, not the slice).
+- `head(path, n)` / `tail(path, n)` → same UTF-8 decode and line model as `cat`, returning the sliced lines as `{"lines": [...], "error": None}`.
 - `ls(path)` → `session.list(path)` mapped to a list of dicts with fields `name`, `path`, `is_dir` (synthesized for implicit directory prefixes via an internal recursive scan), `version_number`, and `updated_at`.
   `size` is included only when `ls(path, long=True)` is called, which performs a batched `VersionMeta` lookup (`size` lives on `VersionMeta`, not `FileMeta`).
   Result count is capped by `resource_limits.max_result_items` with a truncation flag when exceeded.
 - `write(path, data)` → `session.write(path, data)`; returns `{"version_number": int, "size": int}` (a plain marshalable dict, not the raw `VersionMeta` model).
-  No anchor-map invalidation is performed: anchors are stateless and content-derived, so an anchor over changed content simply fails to resolve at edit time.
-- `edit(path, start_anchor, end_anchor, replacement, expected_version=None)` → delegates to the
-  `anchored-editing` capability's `edit_anchored`; see the `anchored-editing` spec.
 
 **Budget independence:** `grep` and `find` each count as ONE operation against `ResourceLimits.max_operations`.
 Their internal blob I/O is governed exclusively by the search layer's own `SearchLimits` budget; it does not draw from `max_read_bytes`.
@@ -200,37 +191,26 @@ Serves: monty-code-mode
 
 - **GIVEN** a file with 20 lines
 - **WHEN** `head(path, 5)` is called
-- **THEN** the first 5 lines are returned (with anchors for those 5 lines only)
+- **THEN** the first 5 lines are returned
 - **WHEN** `tail(path, 5)` is called
-- **THEN** the last 5 lines are returned (with anchors for those 5 lines only)
+- **THEN** the last 5 lines are returned
 
 #### Scenario: OversizedReadReturnsError
 
 - **GIVEN** a file whose content size exceeds `resource_limits.max_read_bytes`
 - **WHEN** `cat(path)` is called
-- **THEN** a structured error is returned and no anchors are emitted; the host does not OOM
+- **THEN** a structured error is returned; the host does not OOM
 
 #### Scenario: BinaryFileReturnsError
 
 - **GIVEN** a file whose content is not valid UTF-8
 - **WHEN** `cat(path)` is called
-- **THEN** a structured error is returned and no anchors are emitted
-
-#### Scenario: EditDelegatesToAnchoredEditing
-
-- **GIVEN** a session-backed `FsOperations` and anchors obtained from `cat`
-- **WHEN** `edit(path, start_anchor, end_anchor, replacement)` is called
-- **THEN** the call is served by the `anchored-editing` capability's `edit_anchored`, and a
-  successful edit writes a new version
+- **THEN** a structured error is returned
 
 ### Requirement: FsOperationsFactory
 
-> Previously: the factory signature was `fs_operations_for(session, resource_limits, anchor_map)`
-> and constructed wrappers closed over a per-`execute` `AnchorMap`.
-
-The system SHALL provide an `FsOperations` dataclass whose fields are async callables corresponding to the eleven shell wrappers (`cd`, `pwd`, `cat`, `head`, `tail`, `ls`, `grep`, `find`, `glob`, `write`, `edit`) plus internal fields (`read`, `stat`, `delete`) for use within the execution layer.
+The system SHALL provide an `FsOperations` dataclass whose fields are async callables corresponding to the ten shell wrappers (`cd`, `pwd`, `cat`, `head`, `tail`, `ls`, `grep`, `find`, `glob`, `write`) plus internal fields (`read`, `stat`, `delete`) for use within the execution layer.
 The system SHALL provide a `fs_operations_for(session, resource_limits)` factory that constructs all wrappers bound to the session, wires the shared `OperationCounter`, and returns an `FsOperations` instance.
-No `AnchorMap` is constructed: anchors are stateless and content-derived (see the `anchored-editing` capability), so the `edit`/`cat`/`head`/`tail` wrappers reach the capability directly rather than a per-`execute` store.
 All shell wrappers except `pwd` and `cd` SHALL resolve relative paths through `session.cwd` before invoking the underlying VFS operation.
 
 Each invocation of any shell wrapper SHALL increment a shared `OperationCounter`.
@@ -260,9 +240,6 @@ Serves: monty-code-mode
 
 ### Requirement: VfsExecutePermission
 
-> Previously: after the caller-side checks, `vfs.execute` constructed "an `AnchorMap` and
-> `FsOperations`"; there was no FS-port mount.
-
 The system SHALL provide `vfs.execute(code, namespace_id, principal_id, provider_name, timeout, resource_limits, cwd="/")`.
 `cwd` must be a canonical path and defaults to `"/"`.
 `vfs.execute` uses a two-tier error contract:
@@ -276,7 +253,6 @@ The system SHALL provide `vfs.execute(code, namespace_id, principal_id, provider
 **Tier 2 — returns `ExecutionResult(success=False, ...)` for errors arising during execution.**
 
 If the caller-side checks pass, `vfs.execute` SHALL construct a `Session` bound to `cwd` via `session.cd(cwd)` (which also enforces read permission on `cwd`), construct an `FsOperations` and the FS-port the provider mounts, resolve the named provider via `resolve_execution_provider`, and dispatch to the provider's `execute` method wrapped in `asyncio.wait_for(..., timeout=timeout)`.
-No `AnchorMap` is constructed (anchors are stateless; see the `anchored-editing` capability).
 Sandbox filesystem access is NOT confined to the execute scope (`cwd`); it is governed by the principal's normal read/write/delete permissions.
 The `execute` permission gates entry at a scope; per-operation permissions gate every FS call inside.
 
@@ -312,7 +288,7 @@ Serves: monty-code-mode, governed-mount
 > `pytest.mark.skipif(not HAS_MONTY, reason="pydantic-monty not installed")`.
 
 The system SHALL provide `MontyExecutionProvider` as an optional execution provider behind the `monty` extra.
-Its `execute` method SHALL run the sandboxed code with both surfaces wired: the async `FsOperations` callables passed as `external_functions` (the injected verbs, kept additively — `grep`/`find`/`glob`/`edit` and the file-I/O verbs), and the FS-port mounted as the sandbox's native filesystem (see `MontyNativeFilesystemMount`). pydantic-monty awaits coroutine-returning external functions on the host event loop, so no thread bridging is used for `external_functions`; the native filesystem mount uses the FS-port bridge.
+Its `execute` method SHALL run the sandboxed code with both surfaces wired: the async `FsOperations` callables passed as `external_functions` (the injected verbs, kept additively — `grep`/`find`/`glob` and the file-I/O verbs), and the FS-port mounted as the sandbox's native filesystem (see `MontyNativeFilesystemMount`). pydantic-monty awaits coroutine-returning external functions on the host event loop, so no thread bridging is used for `external_functions`; the native filesystem mount uses the FS-port bridge.
 The provider SHALL resolve directly to the output value and construct `ExecutionResult` from it.
 VFS `ResourceLimits` SHALL be mapped onto pydantic-monty's `ResourceLimits`: `timeout_seconds` → `max_duration_secs`; `max_memory_bytes` → `max_memory`.
 Field names are verified against the installed package at integration time; unmapped fields are documented as unenforced at the provider level.
@@ -329,9 +305,10 @@ Serves: monty-code-mode
 #### Scenario: NativeFilesystemAccessFromSandbox
 
 - **GIVEN** a file exists in the VFS and the principal has read permission
-- **WHEN** Monty sandbox code reads it via native `open`/`pathlib` (no injected verb)
-- **THEN** the VFS content is returned, demonstrating the mount is wired alongside
-  `external_functions`
+- **WHEN** Monty sandbox code reads it via native `open`/`pathlib` and writes it back via
+  native `open(path, "w").write(...)` (no injected verb)
+- **THEN** the VFS content is returned and the native write persists a new version,
+  demonstrating the mount is wired alongside `external_functions`
 
 #### Scenario: GrepBridgesAsyncSearch
 
@@ -352,13 +329,6 @@ Serves: monty-code-mode
 - **GIVEN** a concurrent `asyncio.Task` that records ticks at a regular interval
 - **WHEN** `vfs.execute` runs a compute-heavy sandbox script via `MontyExecutionProvider`
 - **THEN** the heartbeat task continues ticking throughout execution (event loop is not starved)
-
-#### Scenario: EditFromSandboxWorks
-
-- **GIVEN** a file exists in the VFS and the sandbox has `execute` and `write` permissions
-- **WHEN** Monty sandbox code calls `edit(path, start_anchor, end_anchor, replacement)`
-- **THEN** the file is modified in the VFS (via the `anchored-editing` capability) and updated
-  anchors are returned to the sandbox
 
 ### Requirement: ExecutionProviderRegistry
 
@@ -404,6 +374,6 @@ Serves: portable-sandboxes, just-bash-shell-tool
 
 ### Requirement: AnchoredEditing
 
-Removed because: hash-anchored editing is promoted to its own `anchored-editing` capability as a stateless, content-derived redesign usable without a sandbox (see `specs/anchored-editing/spec.md`).
-The per-`execute` `AnchorMap` (token pool, stored `(path, version_number, line_index, line_content)` entries, difflib reconciliation, invalidate-on-write) is replaced by content-derived anchors.
-The Monty `edit` verb now delegates to the new capability (see the modified `ShellOperationsLayer`).
+Removed because: hash-anchored editing is deferred to a future change at `.specs/changes/2026-06-30-anchored-editing/`, whose design space is unresolved.
+This change removes the baseline anchored-edit surface — the per-`execute` `AnchorMap` (token pool, stored `(path, version_number, line_index, line_content)` entries, difflib reconciliation, invalidate-on-write), the `edit` verb, and the out-of-band anchors on `cat`/`head`/`tail`.
+Code-mode editing is done with native file I/O through the mount (see the modified `ShellOperationsLayer` and `MontyNativeFilesystemMount`).
