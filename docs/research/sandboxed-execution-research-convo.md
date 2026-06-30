@@ -258,8 +258,9 @@ fs_funcs = {
     "file_write": lambda path, data: fs.pipe(path, data.encode("utf-8")),
     "file_list": lambda path: fs.ls(path, detail=False),
 }
-m = pydantic_monty.Monty(code, external_functions=list(fs_funcs.keys()))
-result = m.run(external_functions=fs_funcs)
+# pydantic-monty 0.0.18: async, and `os=` mounts a native filesystem.
+m = pydantic_monty.Monty(code)
+result = await m.run_async(external_functions=fs_funcs, os=mount)
 ```
 
 Monty's **snapshot capability** is particularly valuable: a sandbox can pause mid-execution when it needs a file, serialize its state, and resume when the I/O completes — enabling non-blocking, event-driven execution across many tenants.

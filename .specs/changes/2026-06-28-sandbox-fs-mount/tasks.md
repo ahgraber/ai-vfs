@@ -75,11 +75,11 @@
 
 ## docs & cleanup
 
-- [ ] Docstrings on the FS-port, `MontyVfsOS`, and the just-bash adapter stating the
+- [x] Docstrings on the FS-port, `MontyVfsOS`, and the just-bash adapter stating the
   proxy-not-OS-mount model and the permission/audit inheritance.
-- [ ] Update stale Monty API prose in `docs/research/fsspec and tigerfs research.md` and
-  `docs/research/sandboxed-execution-research-convo.md` (the pool-based `AsyncMonty()` snippet
-  is unreleased; 0.0.18 uses `Monty(code).run_async(...)` + `os=`).
-- [ ] Add a CHANGELOG `Unreleased` entry: native filesystem mount (Monty), just-bash provider,
+- [x] Update stale Monty API prose in `docs/research/fsspec and tigerfs research.md` and
+  `docs/research/sandboxed-execution-research-convo.md` (the sync `Monty(...).run(...)` snippet
+  predates 0.0.18, which uses `Monty(code).run_async(...)` + `os=`).
+- [x] Add a CHANGELOG `Unreleased` entry: native filesystem mount (Monty), just-bash provider,
   sandboxes moved to optional extras.
   </content>
