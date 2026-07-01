@@ -42,6 +42,9 @@ There is no `edit` verb and no anchored read/edit surface in this change.
 Making `open(path, "w")` work end-to-end required the Monty mount adapter to implement `path_append_text`/`path_append_bytes` on the `AbstractOS`; without those callbacks the sandbox's write path raised `PermissionError`.
 Native-mount writes are last-writer-wins (no version stamp on `open(...).write()`); compare-and-swap semantics for code-mode editing are out of scope and tracked with the deferred anchored-editing change.
 
+**Dropped scenario (deliberate):** the baseline `MontyProviderIntegration` scenario `WriteFromSandboxWorks` (an injected `edit`/`write` verb persisting a version) is replaced by `NativeFilesystemAccessFromSandbox`, which exercises native read **and** write (including `open(path, "w").write(...)`) through the mount.
+Marked in the delta with `<!-- modified-removes: WriteFromSandboxWorks -->`.
+
 ### Decision: KeepInjectedVerbsAdditive
 
 **Chosen:** Add the native mount **alongside** the existing injected verbs on Monty; do not shrink the verb set.
