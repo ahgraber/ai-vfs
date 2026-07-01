@@ -40,7 +40,7 @@ s3 = ["aiobotocore>=2.15.0"]
 # Execution providers (code-mode sandboxes). Optional — the VFS layer runs standalone;
 # providers resolve lazily by name (see vfs.execution.registry) and a missing extra raises
 # an actionable install hint. `codemode` is the umbrella over every sandbox.
-monty = ["pydantic-monty>=0.0.18,<0.1"]
+monty = ["pydantic-monty>=0.0.1"]
 just-bash = ["just-bash>=0.2.1"]
 codemode = ["ai-vfs[monty,just-bash]"]
 
@@ -49,7 +49,7 @@ codemode = ["ai-vfs[monty,just-bash]"]
 # not exposed to user-facing install api
 # e.g., cannot do `uv add aifs[dev]`
 dev = [
-    "pydantic-ai>=0.8.1",
+    "pydantic-ai>=2.0",
     "uv-ship>=0.3.0",
 ]
 docs = [
