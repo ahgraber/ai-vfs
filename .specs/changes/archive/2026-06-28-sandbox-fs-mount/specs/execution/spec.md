@@ -128,6 +128,10 @@ Serves: just-bash-shell-tool, portable-sandboxes
 
 ### Requirement: ShellOperationsLayer
 
+> Previously: `cat`/`head`/`tail` returned content plus per-line anchors allocated from an
+> `AnchorMap`, `write`/`delete` invalidated anchors, and the wrappers included an `edit` verb.
+> The anchors, invalidation, and the `edit` verb are removed (see REMOVED `AnchoredEditing`).
+
 The `FsOperations` shell wrappers SHALL implement the following dispatch:
 
 - `grep(pattern, path, recursive=True)` → `session.search(query=pattern, scope=resolved_path, search_type=SearchType.REGEX)`, returning structured match dicts; re-raises `ReadBudgetExceededError`, `ReindexRequiredError`, and `IndexUnavailableError` unchanged.
@@ -209,6 +213,10 @@ Serves: monty-code-mode
 
 ### Requirement: FsOperationsFactory
 
+> Previously: the dataclass exposed eleven wrappers including `edit`, and
+> `fs_operations_for` took an `anchor_map` parameter; the `edit` verb and the
+> `anchor_map` parameter are removed.
+
 The system SHALL provide an `FsOperations` dataclass whose fields are async callables corresponding to the ten shell wrappers (`cd`, `pwd`, `cat`, `head`, `tail`, `ls`, `grep`, `find`, `glob`, `write`) plus internal fields (`read`, `stat`, `delete`) for use within the execution layer.
 The system SHALL provide a `fs_operations_for(session, resource_limits)` factory that constructs all wrappers bound to the session, wires the shared `OperationCounter`, and returns an `FsOperations` instance.
 All shell wrappers except `pwd` and `cd` SHALL resolve relative paths through `session.cwd` before invoking the underlying VFS operation.
@@ -239,6 +247,9 @@ Serves: monty-code-mode
 - **THEN** calls against one instance do not affect the counter of the other
 
 ### Requirement: VfsExecutePermission
+
+> Previously: `vfs.execute` constructed an `AnchorMap` alongside `FsOperations` and translated
+> `AnchorConflictError` to `anchor_conflict` in its error table; both are removed.
 
 The system SHALL provide `vfs.execute(code, namespace_id, principal_id, provider_name, timeout, resource_limits, cwd="/")`.
 `cwd` must be a canonical path and defaults to `"/"`.
@@ -286,6 +297,8 @@ Serves: monty-code-mode, governed-mount
 > **Note:** All scenarios in this requirement depend on the `monty` optional extra
 > (`pydantic-monty>=0.0.18,<0.1`). Tests are marked
 > `pytest.mark.skipif(not HAS_MONTY, reason="pydantic-monty not installed")`.
+
+<!-- modified-removes: WriteFromSandboxWorks -->
 
 The system SHALL provide `MontyExecutionProvider` as an optional execution provider behind the `monty` extra.
 Its `execute` method SHALL run the sandboxed code with both surfaces wired: the async `FsOperations` callables passed as `external_functions` (the injected verbs, kept additively — `grep`/`find`/`glob` and the file-I/O verbs), and the FS-port mounted as the sandbox's native filesystem (see `MontyNativeFilesystemMount`). pydantic-monty awaits coroutine-returning external functions on the host event loop, so no thread bridging is used for `external_functions`; the native filesystem mount uses the FS-port bridge.
