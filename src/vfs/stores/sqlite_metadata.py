@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import logging
-import re
 from typing import TYPE_CHECKING, Any, Callable
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -14,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from vfs.models import FullTextMatchMode, SearchArtifact, SearchResult, SearchType
 from vfs.protocols.search import SearchResponse
+from vfs.search._regex import RegexCompileError, compile_line_regex
 from vfs.stores.sql_metadata import BaseSqlMetadataStore
 
 if TYPE_CHECKING:
@@ -37,7 +37,7 @@ def _fts5_literal_from_pattern(pattern: str) -> str | None:
 
     Used as a FTS5 trigram prefilter: a literal of ≥ 3 chars can be handed to
     ``search_fts MATCH '"literal"'`` to prune candidate rows before the full
-    in-process ``re.search`` verification.  Returns ``None`` (fall back to full scan)
+    in-process linear-time (RE2) verification.  Returns ``None`` (fall back to full scan)
     when:
 
     - The pattern contains alternation ``|`` outside a character class — the literal
@@ -207,7 +207,7 @@ class _SQLiteNativeTextSearch:
           - If the pattern contains a literal sequence of ≥ 3 chars, the FTS5 trigram
             index is used to prune candidates.  Trigram-unfriendly patterns (e.g.
             ``[0-9]+``) skip the FTS5 prune and scan ``search_text_artifacts`` directly.
-          - Pruned candidates are verified in-process with ``re.search``.
+          - Pruned candidates are verified in-process with linear-time (RE2) matching.
 
         Fulltext path:
           - FTS5 BM25 ranking via the ``rank`` auxiliary column (lower = more relevant).
@@ -236,8 +236,8 @@ class _SQLiteNativeTextSearch:
         DefaultSearchProvider._regex_search exactly (GrepMatchesContent spec contract).
         """
         try:
-            compiled = re.compile(pattern)
-        except re.error:
+            compiled = compile_line_regex(pattern)
+        except RegexCompileError:
             return SearchResponse()
 
         literal = _fts5_literal_from_pattern(pattern)
@@ -245,7 +245,7 @@ class _SQLiteNativeTextSearch:
 
         async with self._store._operation():
             if literal and '"' not in literal:
-                # FTS5 trigram prune: phrase-query the literal, then verify with re.
+                # FTS5 trigram prune: phrase-query the literal, then verify with RE2.
                 fts_query = f'"{literal}"'
                 rows = await self._store._execute_fetchall(
                     "SELECT content_hash, raw_text FROM search_fts "

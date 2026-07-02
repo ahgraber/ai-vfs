@@ -520,6 +520,25 @@ class TestNativeTextSearchCapability:
         assert by_line[1].match_context == "gamma TODO second"
 
     @pytest.mark.asyncio
+    async def test_anchored_pattern_matches_non_first_line(self, vfs_nts):
+        """Cross-backend identity / anchoring: `^`-anchored regex matches per line, not per document.
+
+        Guards the fix that dropped PostgreSQL's whole-document anchor-sensitive `~` prune
+        (a `~` prune anchors `^`/`$` to the whole text, so it would false-negative a file
+        whose match is on a non-first line). RE2 per-line verification finds it. The SQLite
+        leg exercises the shared per-line logic here; the PostgreSQL SQL path is verified by
+        the podman integration suite.
+        """
+        ns, agent = await _setup_vfs(vfs_nts)
+        content = b"header line\nimport os\nimport sys\n"
+        await vfs_nts.write(ns.id, "/mod.py", content, principal_id=agent.id)
+
+        results = await vfs_nts.search(ns.id, r"^import", "/", SearchType.REGEX, principal_id=agent.id)
+
+        lines = sorted(r.line_number for r in results)
+        assert lines == [2, 3], f"expected ^import to match lines 2 and 3, got {lines}"
+
+    @pytest.mark.asyncio
     async def test_alternation_no_false_negatives(self, vfs_nts):
         """Regression: alternation in pattern must not cause false negatives.
 

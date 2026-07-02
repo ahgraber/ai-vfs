@@ -9,7 +9,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import logging
-import re
 from typing import TYPE_CHECKING, Any, Callable
 
 import sqlalchemy as sa
@@ -19,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from vfs.models import FullTextMatchMode, SearchArtifact, SearchResult, SearchType
 from vfs.protocols.search import SearchResponse
+from vfs.search._regex import RegexCompileError, compile_line_regex
 from vfs.stores.sql_metadata import BaseSqlMetadataStore
 
 if TYPE_CHECKING:
@@ -172,17 +172,25 @@ class _PostgresNativeTextSearch:
             return await self._regex_search(request.query, ch_to_entries)
 
     async def _regex_search(self, pattern: str, ch_to_entries: dict[str, list[Any]]) -> SearchResponse:
-        """In-engine regex via ``text ~ :pattern``; GIN index prunes trigram candidates.
+        """Line-oriented regex verification over DB-resident text (zero blob reads).
 
-        raw_text is fetched for matched rows so per-occurrence SearchResults can be emitted
-        — one per matching line — with line_number and match_context populated.  The in-engine
-        ``~`` operator still prunes/filters; line extraction is done in-process from the stored
-        text (preserves the zero-blob-read invariant).  Semantics mirror
+        raw_text for the visible candidate rows is fetched and each is verified
+        line-by-line with the linear-time RE2 engine, emitting one SearchResult per
+        matching line (line_number + match_context).  Semantics mirror
         DefaultSearchProvider._regex_search exactly (GrepMatchesContent spec contract).
+
+        No server-side ``raw_text ~ :pattern`` prune is used: PostgreSQL's ``~``
+        anchors ``^``/``$`` to the whole document, so an anchored pattern (e.g.
+        ``^import``) would prune out rows whose match is on a non-first line —
+        a false negative versus the per-line brute-force contract.
+
+        TODO(perf): reintroduce a *newline-insensitive* prune (e.g. a GIN-trigram
+        ``raw_text LIKE '%literal%'`` on the longest mandatory literal, mirroring
+        the SQLite FTS5 prefilter) to avoid fetching every visible row's text.
         """
         try:
-            compiled = re.compile(pattern)
-        except re.error:
+            compiled = compile_line_regex(pattern)
+        except RegexCompileError:
             return SearchResponse()
 
         visible_hashes = list(ch_to_entries.keys())
@@ -198,13 +206,11 @@ class _PostgresNativeTextSearch:
                         WHERE provider_key = :pk
                           AND params_hash  = :ph
                           AND content_hash = ANY(:hashes)
-                          AND raw_text ~ :pattern
                         """
                     ).bindparams(
                         pk=self.provider_key,
                         ph=self.params_hash,
                         hashes=visible_hashes,
-                        pattern=pattern,
                     )
                 )
             ).fetchall()

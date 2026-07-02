@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`FullTextMatchMode` (`ALL`/`ANY`)**: new enum on `SearchRequest`; `vfs.search` and `session.search` gain a `match_mode` keyword (default `ALL`, backward-compatible). `ANY` returns the ranked-OR union (a document matching at least one term), ranked by descending relevance (FTS5 BM25 / Postgres `ts_rank`). Applies only to FULLTEXT; ignored for GLOB/FIND/REGEX.
 - **Word-tokenized FULLTEXT representation**, distinct from the trigram representation used for REGEX: SQLite `unicode61` FTS5 table, Postgres `'simple'` config — both non-stemming and language-neutral, with no minimum token length so short terms like `s3` are matchable. Built once from the stored `raw_text` at store init via an idempotent, crash-resumable anti-join (no blob reads); `params_hash` is unchanged.
 - **FULLTEXT query term cap (128)** enforced at the `vfs.search` boundary, bounding `ANY`-mode per-term query growth.
+- **`vfs.execute` observability**: each invocation opens a `vfs.execute` OTel span that parents the inner file-operation spans, records an operation-count/duration metric, and emits a single invocation-level audit event (`operation="execute"`, `path=cwd`, `detail` = provider + outcome + `error_type` on failure) — distinct from and in addition to the per-operation audit events of any files the code mutates. Tier-1 rejections (denied permission, unknown provider, non-canonical cwd) are not audited (no code ran).
+- **Resource-limit surface for sandboxed execution**: `ResourceLimits.max_write_bytes` caps a single write; `ExecutionCapabilities.enforces_memory_limit` lets callers feature-detect which provider honours `max_memory_bytes`; `ResourceLimitExceededError` is raised by the FS-port on an oversized native read/write (mapped to `error_type="budget_exceeded"`).
+- **`google-re2`** core dependency: content regex search now uses the linear-time RE2 engine (see Security).
 
 ### Changed
 
@@ -33,11 +36,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Search dispatch for regex/fulltext**: when `NativeTextSearch` is present, the VFS dispatches to `search_text` (fresh path zero-blob-read; any straggler fails loud with `ReindexRequiredError`); when absent, fulltext raises `SearchTypeUnsupportedError` and regex falls back to brute-force via the guarded reader.
 - **FULLTEXT now matches whole word tokens, not trigram substrings or English stems** (behavior change): `cat` no longer matches `category`, `databases` no longer matches `database` on Postgres, and short terms like `s3` now match correctly. REGEX still matches substrings via the unchanged trigram representation. On upgrade, the SQLite word index is rebuilt from stored text automatically (no blob reads); Postgres needs no migration (its tsvector is computed inline). SemVer: MINOR (additive API; the result-set change is a deliberate, documented correctness fix, permitted pre-1.0).
 - **Blob GC reference-check and text-artifact deletion are now atomic** (one metadata transaction): a `content_hash` with a live version reference is never swept. The subsequent blob delete is best-effort; the cross-store revive race is an accepted PoC limitation.
+- **FS-port native mount now enforces `ResourceLimits`**: the operation budget and `max_read_bytes`/`max_write_bytes` caps are enforced by a single counter shared between the injected `FsOperations` verbs and the `SessionFsPort` native mount, so sandboxed `open`/`pathlib` file I/O — the primary interaction surface — is governed identically to the injected verbs (previously the mount was ungoverned).
+- **just-bash provider reflects the script's exit code**: a script that runs to completion but exits non-zero now returns `ExecutionResult(success=False, error_type="nonzero_exit")` with its stderr in `error_message` (previously every run reported `success=True` and discarded `exit_code`/`stderr`).
+- **Content REGEX semantics (RE2)**: patterns are matched line-by-line with RE2, so backreferences and lookaround are unsupported (an unusable pattern yields no matches rather than raising); REGEX results are now identical across SQLite/Postgres/in-memory backends (Postgres no longer applies an anchor-sensitive whole-document `~` prune that could differ from per-line matching).
 
 ### Removed
 
 - **Query-time search self-healing**: native search no longer verifies stragglers via blob reads, lazily backfills the index, re-checks external-record existence, or approximates FULLTEXT in-process. A fresh index is authoritative; a stale one fails loud (`ReindexRequiredError`) and `vfs.reindex(scope=…)` is the remedy. The guarded reader and `max_content_reads` budget survive only on the brute-force fallback path (REGEX with no native capability).
 - **`SearchArtifact.is_usable()` external-record parameters** (`external_readable` / `external_identity_match`) and the `has_text_artifacts` store method — the text record is content-addressed and resident in the metadata store, so an identity-current artifact's record is always present.
+
+### Security
+
+- **ReDoS in content regex closed**: agent-supplied `grep` patterns previously ran on Python's backtracking `re` engine synchronously on the host event loop, where a catastrophic pattern (e.g. `(a+)+$`) could hang the process past the execution timeout (`asyncio.wait_for` cannot interrupt synchronous CPU work). All in-process regex verification (SQLite/Postgres/in-memory) now uses the linear-time RE2 engine, so no pattern can be super-linear.
+- **Sandbox host-OOM / budget-bypass closed**: the native filesystem mount (`open`/`pathlib`/bash redirection) no longer bypasses `max_read_bytes`/`max_write_bytes` or the operation budget — a large native read/write is refused before the blob reaches host memory, for both the Monty and just-bash providers.
+- **`vfs.execute` now attributable**: an invocation running arbitrary code that mutates files emits its own audit event and span, closing the accountability gap where only the inner writes were recorded.
 
 ### Deferred / Not Pursued
 

@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 from vfs.models import FullTextMatchMode
 
 if TYPE_CHECKING:
-    from vfs.models import ExecutionResult, FileMeta, SearchResult, SearchType, VersionMeta
-    from vfs.protocols.execution import ResourceLimits
+    from vfs.models import FileMeta, SearchResult, SearchType, VersionMeta
+    from vfs.protocols.execution import ExecutionResult, ResourceLimits
     from vfs.protocols.search import FindPredicates
     from vfs.vfs import VFS
 

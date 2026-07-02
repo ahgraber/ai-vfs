@@ -410,6 +410,36 @@ class TestOversizedReadReturnsError:
         assert result["lines"] == []
 
 
+class TestOversizedWriteReturnsError:
+    """The injected write verb enforces max_write_bytes (parity with the native mount)."""
+
+    @pytest.mark.asyncio
+    async def test_write_oversized_returns_structured_error_and_writes_nothing(self, env):
+        vfs_obj, session, ns, agent = env
+
+        limits = ResourceLimits(max_write_bytes=8)
+        fs_ops = fs_operations_for(session, limits)
+
+        result = await fs_ops.write("/big.txt", b"x" * 9)
+        assert result["error"] is not None
+        assert result["error"]["code"] == "oversized_write"
+        assert result["version_number"] is None
+        # Nothing was written — the file does not exist.
+        from vfs.errors import NotFoundError
+
+        with pytest.raises(NotFoundError):
+            await vfs_obj.read(ns.id, "/big.txt", principal_id=agent.id)
+
+    @pytest.mark.asyncio
+    async def test_write_within_cap_succeeds(self, env):
+        vfs_obj, session, ns, agent = env
+        limits = ResourceLimits(max_write_bytes=8)
+        fs_ops = fs_operations_for(session, limits)
+        result = await fs_ops.write("/ok.txt", b"12345678")
+        assert result["error"] is None
+        assert result["version_number"] == 1
+
+
 # ---------------------------------------------------------------------------
 # ShellOperationsLayer/BinaryFileReturnsError
 # ---------------------------------------------------------------------------
@@ -563,6 +593,26 @@ class TestLsSynthesizesDirectories:
         assert dir_entry["updated_at"] is None
 
     @pytest.mark.asyncio
+    async def test_ls_unslashed_scope_does_not_bleed_into_sibling_prefix(self, env):
+        """ls("/proj") must not list files under a sibling prefix like "/projector/"."""
+        vfs_obj, session, ns, agent = env
+
+        await vfs_obj.write(ns.id, "/proj/file.txt", b"in proj", principal_id=agent.id)
+        await vfs_obj.write(ns.id, "/projector/other.txt", b"sibling", principal_id=agent.id)
+
+        limits = ResourceLimits()
+        fs_ops = fs_operations_for(session, limits)
+
+        result = await fs_ops.ls("/proj")  # no trailing slash
+        paths = {e["path"] for e in result["entries"]}
+        names = {e["name"] for e in result["entries"]}
+
+        assert "/proj/file.txt" in paths
+        assert "/projector/other.txt" not in paths
+        # No bogus synthesized dir from slicing "/projector/other.txt".
+        assert "ector" not in names
+
+    @pytest.mark.asyncio
     async def test_ls_deduplicates_synthesized_dirs(self, env):
         """Multiple files under the same subdir produce exactly one synthesized entry."""
         vfs_obj, session, ns, agent = env
@@ -709,3 +759,20 @@ class TestGrepRecursiveParam:
         # Both files should appear
         assert "/dir2/top.py" in paths
         assert "/dir2/sub/nested.py" in paths
+
+    @pytest.mark.asyncio
+    async def test_grep_unslashed_scope_does_not_bleed_into_sibling_prefix(self, env):
+        """grep(pattern, "/proj") must not match files under a sibling prefix like "/projector/"."""
+        vfs_obj, session, ns, agent = env
+
+        await vfs_obj.write(ns.id, "/proj/a.py", b"needle here", principal_id=agent.id)
+        await vfs_obj.write(ns.id, "/projector/b.py", b"needle here", principal_id=agent.id)
+
+        limits = ResourceLimits()
+        fs_ops = fs_operations_for(session, limits)
+
+        result = await fs_ops.grep("needle", "/proj")  # no trailing slash
+        paths = {r["path"] for r in result["results"]}
+
+        assert "/proj/a.py" in paths
+        assert "/projector/b.py" not in paths

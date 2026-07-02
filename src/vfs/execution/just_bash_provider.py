@@ -187,9 +187,17 @@ class JustBashExecutionProvider:
         code: str,
         fs_ops: FsOperations,
         fs_port: Any,
-        resource_limits: ResourceLimits,  # noqa: ARG002
+        resource_limits: ResourceLimits,  # noqa: ARG002 — VFS limits are enforced by the FS-port
     ) -> ExecutionResult:
-        """Run bash ``code`` over the VFS; route search builtins to the index."""
+        """Run bash ``code`` over the VFS; route search builtins to the index.
+
+        VFS ``ResourceLimits`` (operation budget, ``max_read_bytes``,
+        ``max_write_bytes``) are enforced by the ``fs_port``/``fs_ops`` pair that
+        ``vfs.execute`` constructs from ``resource_limits`` — every bash file
+        operation routes through them — so this provider does not re-enforce them.
+        just-bash's own ``ExecutionLimits`` (call depth, command/loop counts) apply
+        with their library defaults as an independent guard against runaway scripts.
+        """
         from vfs.protocols.execution import ExecutionResult
 
         cwd = getattr(fs_port, "cwd", "/")
@@ -205,13 +213,26 @@ class JustBashExecutionProvider:
         # A VFS error raised inside the FS-port adapter (e.g. PermissionDeniedError)
         # propagates out of ``shell.exec`` so ``vfs.execute``'s translation table owns it.
         result = await shell.exec(code)
-        return ExecutionResult(success=True, output=result.stdout)
+        if result.exit_code == 0:
+            return ExecutionResult(success=True, output=result.stdout)
+        # Non-zero exit: the script ran but signalled failure. Surface the exit code
+        # and stderr so the caller can diagnose it instead of seeing a false success.
+        # (bash stderr references VFS paths only — the host filesystem is never exposed.)
+        message = result.stderr.strip() or f"Command exited with status {result.exit_code}"
+        return ExecutionResult(
+            success=False,
+            output=result.stdout,
+            error_type="nonzero_exit",
+            error_message=message,
+        )
 
     def capabilities(self) -> ExecutionCapabilities:  # noqa: F821 — forward ref resolved below
         """Return just-bash provider capabilities (async, bash, tier ``just-bash``)."""
         from vfs.protocols.execution import ExecutionCapabilities
 
-        return ExecutionCapabilities(supports_async=True, language="bash", tier="just-bash")
+        return ExecutionCapabilities(
+            supports_async=True, language="bash", tier="just-bash", enforces_memory_limit=False
+        )
 
     def reset(self) -> None:
         """No-op: JustBashExecutionProvider is stateless per-execution."""

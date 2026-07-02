@@ -58,6 +58,15 @@ class TestExecutionCapabilities:
         assert caps.language == "python"
         assert caps.tier == "monty"
 
+    def test_enforces_memory_limit_defaults_false_and_is_queryable(self):
+        """Callers can feature-detect which provider honours max_memory_bytes."""
+        assert (
+            ExecutionCapabilities(supports_async=True, language="bash", tier="just-bash").enforces_memory_limit
+            is False
+        )
+        monty = ExecutionCapabilities(supports_async=True, language="python", tier="monty", enforces_memory_limit=True)
+        assert monty.enforces_memory_limit is True
+
     def test_frozen(self):
         caps = ExecutionCapabilities(supports_async=False, language="python", tier="test")
         with pytest.raises((AttributeError, TypeError)):

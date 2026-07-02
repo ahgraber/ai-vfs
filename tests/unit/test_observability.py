@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from vfs.models import AuditEvent
-from vfs.observability.audit import _current_trace_id, audit, audit_write
+from vfs.observability.audit import _current_trace_id, audit, audit_execute, audit_write
 from vfs.observability.tracing import (
     blob_histogram,
     op_counter,
@@ -176,6 +176,43 @@ class TestAuditLog:
         assert not hasattr(audit_mod, "audit_read")
 
     @pytest.mark.asyncio
+    async def test_audit_execute_records_success(self):
+        mock_store = AsyncMock()
+        await audit_execute(
+            mock_store,
+            namespace_id="ns1",
+            principal_id="p1",
+            path="/",
+            provider="monty",
+            success=True,
+            audit_log_enabled=True,
+        )
+        event = mock_store.append_audit_event.call_args[0][0]
+        assert event.operation == "execute"
+        assert event.path == "/"
+        assert event.detail["provider"] == "monty"
+        assert event.detail["outcome"] == "success"
+        assert "error_type" not in event.detail
+
+    @pytest.mark.asyncio
+    async def test_audit_execute_records_failure_with_error_type(self):
+        mock_store = AsyncMock()
+        await audit_execute(
+            mock_store,
+            namespace_id="ns1",
+            principal_id="p1",
+            path="/work",
+            provider="just-bash",
+            success=False,
+            error_type="nonzero_exit",
+            audit_log_enabled=True,
+        )
+        event = mock_store.append_audit_event.call_args[0][0]
+        assert event.operation == "execute"
+        assert event.detail["outcome"] == "failure"
+        assert event.detail["error_type"] == "nonzero_exit"
+
+    @pytest.mark.asyncio
     async def test_trace_id_in_audit(self):
         """Active OTel span → trace_id populated."""
         mock_store = AsyncMock()
@@ -232,7 +269,7 @@ class TestSpanAttributes:
         admin = await vfs.create_principal("admin-span")
         await vfs.bootstrap_admin(admin.id, ns.id)
         principal = await vfs.create_principal("agent-span")
-        await vfs.grant(admin.id, principal.id, ns.id, "/", {"read", "write", "delete"})
+        await vfs.grant(admin.id, principal.id, ns.id, "/", {"read", "write", "delete", "execute"})
         # Pre-populate state required by read/list/stat/delete/copy/move/versions/rollback/search.
         await vfs.write(ns.id, "/a.py", b"v1", principal_id=principal.id)
         await vfs.write(ns.id, "/a.py", b"v2", principal_id=principal.id)
@@ -263,6 +300,17 @@ class TestSpanAttributes:
 
             await vfs.search(ns.id, "*.py", "/", SearchType.GLOB, principal_id=principal.id)
 
+            # Drive vfs.execute with a fake provider so no optional extra is needed.
+            from vfs.execution import registry
+            from vfs.protocols.execution import ExecutionResult
+
+            class _FakeProvider:
+                async def execute(self, code, fs_ops, fs_port, resource_limits):  # noqa: ARG002
+                    return ExecutionResult(success=True, output=None)
+
+            with patch.object(registry, "resolve_execution_provider", return_value=_FakeProvider()):
+                await vfs.execute("noop", ns.id, principal.id, "fake", cwd="/")
+
         # Group captured spans by operation name.
         by_op: dict[str, list[dict]] = defaultdict(list)
         for name, attrs in captured:
@@ -279,6 +327,7 @@ class TestSpanAttributes:
             "vfs.rollback",
             "vfs.delete",
             "vfs.search",
+            "vfs.execute",
         }
         missing = expected_ops - set(by_op)
         assert not missing, f"VFS ops missing span coverage: {missing}"
@@ -290,3 +339,216 @@ class TestSpanAttributes:
                 assert attrs.get("vfs.principal_id") == principal.id, (
                     f"{op} missing or wrong principal_id attr: {attrs}"
                 )
+
+
+class _FakeExecProvider:
+    """Minimal ExecutionProvider for observability tests (no optional extra needed).
+
+    When ``inner_write`` is set, ``execute`` performs a write through the injected
+    ``FsOperations`` so an inner ``vfs.write`` span/audit event is produced.
+    """
+
+    def __init__(self, inner_write: str | None = None):
+        self._inner_write = inner_write
+
+    async def execute(self, code, fs_ops, fs_port, resource_limits):  # noqa: ARG002
+        from vfs.protocols.execution import ExecutionResult
+
+        if self._inner_write is not None:
+            await fs_ops.write(self._inner_write, b"data")
+        return ExecutionResult(success=True, output=None)
+
+
+def _install_sdk_exporter():
+    """Install an in-memory SDK tracer provider; return (exporter, restore_fn).
+
+    OpenTelemetry's module-level ``ProxyTracer`` (``tracing._tracer``) caches the
+    first real provider it resolves in ``_real_tracer`` and never re-resolves. An
+    earlier test that installed a provider therefore poisons this one — spans go to
+    the stale (torn-down) provider and never reach ``exporter``. Clearing the cache
+    on install forces re-resolution against the provider just set; clearing it on
+    restore leaves no stale delegate for the next test.
+    """
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from vfs.observability import tracing
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    prior = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    tracing._tracer._real_tracer = None  # type: ignore[attr-defined]  # force re-resolve to `provider`
+
+    def _restore():
+        otel_trace._TRACER_PROVIDER = prior  # type: ignore[attr-defined]
+        tracing._tracer._real_tracer = None  # type: ignore[attr-defined]
+
+    return exporter, _restore
+
+
+def _spy_audit(vfs):
+    """Wrap the store's append_audit_event with a capturing spy; return the events list."""
+    events: list = []
+    original = vfs._meta.append_audit_event
+
+    async def _spy(event):
+        events.append(event)
+        return await original(event)
+
+    vfs._meta.append_audit_event = _spy
+    return events
+
+
+async def _bootstrap(vfs, ns_name, perms):
+    ns = await vfs.create_namespace(ns_name, "admin")
+    admin = await vfs.create_principal(f"admin-{ns_name}")
+    await vfs.bootstrap_admin(admin.id, ns.id)
+    agent = await vfs.create_principal(f"agent-{ns_name}")
+    await vfs.grant(admin.id, agent.id, ns.id, "/", perms)
+    return ns, agent
+
+
+class TestExecuteObservabilityContract:
+    """OTelSpansOnAllOperations + AuditLogStateChanges for vfs.execute."""
+
+    @pytest.mark.asyncio
+    async def test_execute_span_parents_inner_write(self, otel_vfs_instance):
+        """ExecuteSpanParentsInnerOperations: the inner vfs.write span is a descendant."""
+        from vfs.execution import registry
+
+        exporter, restore = _install_sdk_exporter()
+        try:
+            vfs = otel_vfs_instance
+            ns, agent = await _bootstrap(vfs, "exectrace", {"read", "write", "execute"})
+            with patch.object(
+                registry, "resolve_execution_provider", return_value=_FakeExecProvider(inner_write="/inner.txt")
+            ):
+                await vfs.execute("noop", ns.id, agent.id, "fake", cwd="/")
+
+            finished = exporter.get_finished_spans()
+            exec_spans = [s for s in finished if s.name == "vfs.execute"]
+            write_spans = [s for s in finished if s.name == "vfs.write"]
+            assert exec_spans and write_spans
+            exec_span = exec_spans[0]
+            assert any(w.context.trace_id == exec_span.context.trace_id for w in write_spans)
+            assert any(w.parent is not None and w.parent.span_id == exec_span.context.span_id for w in write_spans), (
+                "inner vfs.write should be a child of the vfs.execute span"
+            )
+        finally:
+            restore()
+
+    @pytest.mark.asyncio
+    async def test_execute_creates_no_span_when_otel_disabled(self, otel_vfs_instance):
+        """NoOpWhenDisabled regression for execute: no span, no error."""
+        from vfs.execution import registry
+
+        vfs = otel_vfs_instance
+        vfs._config.otel_enabled = False
+        ns, agent = await _bootstrap(vfs, "execnoop", {"read", "write", "execute"})
+
+        captured: list[str] = []
+
+        def _capture(name, attributes=None, **kwargs):
+            captured.append(name)
+            from unittest.mock import MagicMock
+
+            cm = MagicMock()
+            cm.__enter__ = MagicMock(return_value=MagicMock())
+            cm.__exit__ = MagicMock(return_value=False)
+            return cm
+
+        with (
+            patch("vfs.observability.tracing._tracer.start_as_current_span", side_effect=_capture),
+            patch.object(registry, "resolve_execution_provider", return_value=_FakeExecProvider()),
+        ):
+            result = await vfs.execute("noop", ns.id, agent.id, "fake", cwd="/")
+
+        assert result.success is True
+        assert "vfs.execute" not in captured
+
+    @pytest.mark.asyncio
+    async def test_execute_and_inner_write_share_trace_and_both_audited(self, otel_vfs_instance):
+        """ExecuteInnerWritesIndependentlyAudited: write + execute events, one shared trace_id."""
+        from vfs.execution import registry
+
+        exporter, restore = _install_sdk_exporter()
+        try:
+            vfs = otel_vfs_instance
+            ns, agent = await _bootstrap(vfs, "execaudit", {"read", "write", "execute"})
+            events = _spy_audit(vfs)
+            with patch.object(
+                registry, "resolve_execution_provider", return_value=_FakeExecProvider(inner_write="/inner.txt")
+            ):
+                await vfs.execute("noop", ns.id, agent.id, "fake", cwd="/")
+
+            exec_events = [e for e in events if e.operation == "execute"]
+            write_events = [e for e in events if e.operation == "write"]
+            assert len(exec_events) == 1
+            assert write_events, "the inner write must be audited independently"
+            assert exec_events[0].trace_id is not None
+            assert write_events[0].trace_id == exec_events[0].trace_id
+        finally:
+            restore()
+
+    @pytest.mark.asyncio
+    async def test_tier1_permission_denial_not_audited(self, otel_vfs_instance):
+        """A Tier-1 execute-permission denial raises and audits nothing (no code ran)."""
+        from vfs.errors import PermissionDeniedError
+        from vfs.execution import registry
+
+        vfs = otel_vfs_instance
+        ns, agent = await _bootstrap(vfs, "execdeny", {"read", "write"})  # no execute
+        events = _spy_audit(vfs)
+        with (
+            patch.object(registry, "resolve_execution_provider", return_value=_FakeExecProvider()),
+            pytest.raises(PermissionDeniedError),
+        ):
+            await vfs.execute("noop", ns.id, agent.id, "fake", cwd="/")
+        assert not [e for e in events if e.operation == "execute"]
+
+    @pytest.mark.asyncio
+    async def test_execute_not_audited_when_disabled(self, otel_vfs_instance):
+        """No execute audit event is persisted when audit_log_enabled is False."""
+        from vfs.execution import registry
+
+        vfs = otel_vfs_instance
+        vfs._config.audit_log_enabled = False
+        ns, agent = await _bootstrap(vfs, "execauditoff", {"read", "write", "execute"})
+        events = _spy_audit(vfs)
+        with patch.object(registry, "resolve_execution_provider", return_value=_FakeExecProvider()):
+            await vfs.execute("noop", ns.id, agent.id, "fake", cwd="/")
+        assert not [e for e in events if e.operation == "execute"]
+
+
+class TestCopyMoveAuditRegression:
+    """Pins the already-implemented copy/move audit events to the now-explicit contract."""
+
+    @pytest.mark.asyncio
+    async def test_copy_audited(self, otel_vfs_instance):
+        vfs = otel_vfs_instance
+        ns, agent = await _bootstrap(vfs, "copyaud", {"read", "write", "delete"})
+        await vfs.write(ns.id, "/src.txt", b"x", principal_id=agent.id)
+        events = _spy_audit(vfs)
+        new_ver = await vfs.copy(ns.id, "/src.txt", "/dst.txt", principal_id=agent.id)
+        copy_events = [e for e in events if e.operation == "copy"]
+        assert len(copy_events) == 1
+        assert copy_events[0].path == "/dst.txt"
+        assert copy_events[0].version_id == new_ver.id
+        assert copy_events[0].detail.get("src_path") == "/src.txt"
+
+    @pytest.mark.asyncio
+    async def test_move_audited_exactly_once(self, otel_vfs_instance):
+        vfs = otel_vfs_instance
+        ns, agent = await _bootstrap(vfs, "moveaud", {"read", "write", "delete"})
+        await vfs.write(ns.id, "/src.txt", b"x", principal_id=agent.id)
+        events = _spy_audit(vfs)
+        new_ver = await vfs.move(ns.id, "/src.txt", "/dst.txt", principal_id=agent.id)
+        move_events = [e for e in events if e.operation == "move"]
+        assert len(move_events) == 1
+        assert move_events[0].path == "/dst.txt"
+        assert move_events[0].version_id == new_ver.id
+        assert move_events[0].detail.get("src_path") == "/src.txt"

@@ -11,8 +11,8 @@ Registry shape
 adapter_module, class_name)``.  ``resolve_execution_provider`` looks up the
 name, imports the driver guard module, then imports the adapter class.
 
-Adding a new provider (e.g. chunk 4's Monty adapter) requires only inserting
-a row in ``_EXECUTION_PROVIDERS`` — no changes to this function.
+Adding a new provider requires only inserting a row in
+``_EXECUTION_PROVIDERS`` — no changes to this function.
 """
 
 from __future__ import annotations

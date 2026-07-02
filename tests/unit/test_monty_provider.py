@@ -120,6 +120,8 @@ class TestRegistryResolvesMonty:
         assert caps.supports_async is True
         assert caps.language == "python"
         assert caps.tier == "monty"
+        # Monty maps max_memory_bytes onto its runtime, so it declares memory enforcement.
+        assert caps.enforces_memory_limit is True
 
     @skip_no_monty
     def test_reset_is_noop(self):

@@ -81,6 +81,32 @@ Tier-1 failures that raise before dispatch (non-canonical cwd, unknown provider,
 Tier-1 failures occur before any code runs — no state can change — so not auditing them is consistent with the existing contract, where denied or malformed writes/deletes are likewise not audited.
 The single emission point (after dispatch, before returning) covers both Tier-2 branches without risking a double event.
 
+### Decision: RegexEngineIsLinearTimeRE2NotThreadOffload
+
+**Chosen:** Evaluate content regex with the linear-time RE2 engine (`google-re2`) uniformly across every backend's in-process verification, rather than keeping Python's backtracking `re` and offloading the verification loop to a worker thread.
+
+**Rationale:** The threat is untrusted `grep` patterns wedging the host event loop (a synchronous CPU loop has no `await` point, so `asyncio.wait_for` cannot cancel it).
+RE2 _eliminates_ the failure mode — no pattern can be super-linear — with no thread leak and no per-call scheduling cost.
+Thread-offload only _contains_ it: the loop stays responsive, but a Python thread cannot be cancelled, so an adversarial pattern pins a core until it finishes, and under repeated attack pinned threads accumulate.
+Thread-offload is the right general discipline for _trusted_ heavy CPU work (hashing, large decode), but that is a separate, profile-gated change (and materially more attractive on free-threaded builds); it is not needed here now that RE2 removes the safety driver.
+The cost accepted: patterns using backreferences/lookaround are unsupported and yield no matches — acceptable for grep.
+
+### Decision: FsPortIsTheSingleResourceEnforcementChokePoint
+
+**Chosen:** Enforce the operation budget and `max_read_bytes`/`max_write_bytes` at the `SessionFsPort` boundary, with a single `OperationCounter` constructed in `vfs.execute` and shared with both the injected `FsOperations` verbs and the mount.
+
+**Rationale:** Both sandbox providers (Monty `AbstractOS` mount, just-bash `IFileSystem`) already route native file I/O through `SessionFsPort`, so enforcing there governs both with one implementation.
+Making the budget a property of the session boundary (not of `FsOperations` alone) closes the gap where native `open`/`pathlib` — the primary interaction surface — bypassed the caps entirely.
+The native-mount read/write must _raise_ (`ResourceLimitExceededError`) rather than return a structured error dict like the injected verbs, because its contract returns raw `bytes`/version numbers.
+
+### Decision: PostgresRegexDropsAnchoredPruneForCrossBackendIdentity
+
+**Chosen:** Drop PostgreSQL's server-side `raw_text ~ :pattern` prune; fetch the visible candidate rows and verify per-line in-process with RE2, matching the SQLite/in-memory path exactly.
+
+**Rationale:** PostgreSQL's `~` anchors `^`/`$` to the whole document, so an anchored pattern (e.g. `^import`) pruned out rows whose match was on a non-first line — a false negative versus the per-line brute-force contract, breaking cross-backend result identity (the contract floor).
+Correctness-first: uniform per-line RE2 verification.
+A newline-insensitive trigram `LIKE` prune to avoid fetching every visible row is a noted perf follow-up (`TODO(perf)` in `postgres_metadata.py`).
+
 ## Architecture
 
 ```text

@@ -29,11 +29,19 @@ class ExecutionCapabilities:
     ``supports_async`` indicates whether the provider can await coroutines from
     external functions on the host event loop.  ``language`` names the scripting
     language (e.g. ``"python"``).  ``tier`` is a short identifier (e.g. ``"monty"``).
+
+    ``enforces_memory_limit`` reports whether the provider honours
+    ``ResourceLimits.max_memory_bytes`` inside the sandbox.  The other limits are
+    enforced uniformly regardless of provider — the operation budget and
+    ``max_read_bytes``/``max_write_bytes`` by the shared ``SessionFsPort``/counter,
+    and ``timeout_seconds`` by ``vfs.execute``'s wall-clock ``asyncio.wait_for`` —
+    so memory is the only provider-variable guarantee callers must feature-detect.
     """
 
     supports_async: bool
     language: str
     tier: str
+    enforces_memory_limit: bool = False
 
 
 @dataclass
@@ -43,17 +51,21 @@ class ResourceLimits:
     ``timeout_seconds`` is the end-to-end wall-clock budget enforced by
     ``vfs.execute`` via ``asyncio.wait_for``; providers may use it as an inner
     secondary limit too.  ``max_operations`` caps the number of VFS callbacks
-    (one call to any shell wrapper = one operation); the ``OperationCounter`` in
-    ``fs_operations_for`` enforces this.  ``max_read_bytes`` caps the content
-    returned by a single ``cat``/``head``/``tail`` call; an oversized file yields
-    a structured error rather than a host OOM.  ``max_result_items`` caps items
-    returned by ``grep``/``find``/``ls``.  ``None`` means unlimited.
+    (one call to any shell wrapper, or one native-mount file operation, = one
+    operation); a single ``OperationCounter`` shared by ``FsOperations`` and the
+    ``SessionFsPort`` mount enforces this across both surfaces.  ``max_read_bytes``
+    caps the content returned by a single direct read (``cat``/``head``/``tail`` or
+    a native-mount read); ``max_write_bytes`` caps the bytes accepted by a single
+    write; an oversized read/write is refused rather than causing a host OOM.
+    ``max_result_items`` caps items returned by ``grep``/``find``/``ls``.  ``None``
+    means unlimited.
     """
 
     timeout_seconds: float = 30.0
     max_memory_bytes: int | None = None
     max_operations: int = 1000
     max_read_bytes: int | None = None
+    max_write_bytes: int | None = None
     max_result_items: int | None = None
 
 
