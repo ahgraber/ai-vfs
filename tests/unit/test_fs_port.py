@@ -14,8 +14,16 @@ import pytest
 import pytest_asyncio
 
 from vfs.config import VFSConfig
-from vfs.errors import NotFoundError, PermissionDeniedError, UnsupportedOperationError
+from vfs.errors import (
+    NotFoundError,
+    OperationBudgetExceededError,
+    PermissionDeniedError,
+    ResourceLimitExceededError,
+    UnsupportedOperationError,
+)
+from vfs.execution.fs_ops import OperationCounter, fs_operations_for
 from vfs.execution.fs_port import SessionFsPort
+from vfs.protocols.execution import ResourceLimits
 from vfs.protocols.fs_port import FsStat
 from vfs.session import Session
 from vfs.vfs import VFS
@@ -108,3 +116,50 @@ class TestFsPortContract:
         # /etc/hosts exists on the host but is not a VFS path → NotFoundError, not host bytes.
         with pytest.raises(NotFoundError):
             await port.read("/etc/hosts")
+
+
+class TestFsPortResourceGovernance:
+    """The native mount enforces ResourceLimits: read/write size caps and the shared budget.
+
+    Guards against the native-mount OOM/budget-bypass: ``open().read()`` /
+    redirection route through this port, not the injected verbs, so it — not only
+    ``FsOperations`` — must enforce the caps.
+    """
+
+    @pytest.mark.asyncio
+    async def test_read_over_max_read_bytes_is_refused_without_fetching(self, env):
+        vfs_inst, ns, _, agent, _ = env
+        session = Session(vfs_inst, ns.id, agent.id)
+        await SessionFsPort(session).write("/big.txt", b"x" * 100)
+        limited = SessionFsPort(session, ResourceLimits(max_read_bytes=10))
+        with pytest.raises(ResourceLimitExceededError):
+            await limited.read("/big.txt")
+
+    @pytest.mark.asyncio
+    async def test_write_over_max_write_bytes_is_refused(self, env):
+        vfs_inst, ns, _, agent, _ = env
+        port = SessionFsPort(Session(vfs_inst, ns.id, agent.id), ResourceLimits(max_write_bytes=8))
+        with pytest.raises(ResourceLimitExceededError):
+            await port.write("/big.txt", b"x" * 9)
+
+    @pytest.mark.asyncio
+    async def test_native_mount_and_verbs_share_one_operation_budget(self, env):
+        vfs_inst, ns, _, agent, _ = env
+        session = Session(vfs_inst, ns.id, agent.id)
+        # A budget of 2 shared between the injected verbs and the port: the port
+        # spends one on write, fs_ops spends the second on cat, the third is refused.
+        limits = ResourceLimits(max_operations=2)
+        counter = OperationCounter(limits.max_operations)
+        fs_ops = fs_operations_for(session, limits, counter)
+        port = SessionFsPort(session, limits, counter)
+        await port.write("/a.txt", b"hi")  # op 1 (via the mount)
+        await fs_ops.cat("/a.txt")  # op 2 (via a verb)
+        with pytest.raises(OperationBudgetExceededError):
+            await port.read("/a.txt")  # op 3 — over the shared budget
+
+    @pytest.mark.asyncio
+    async def test_no_limits_means_no_enforcement(self, env):
+        """Direct construction without limits/counter keeps the port unrestricted."""
+        _, _, _, _, port = env  # constructed with no limits
+        await port.write("/big.txt", b"x" * 10_000)
+        assert await port.read("/big.txt") == b"x" * 10_000

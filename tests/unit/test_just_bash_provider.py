@@ -225,6 +225,33 @@ class TestBashRespectsPermissions:
         assert "top secret" not in (result.output or "")
 
 
+class TestBashNonZeroExitReportsFailure:
+    """A script that exits non-zero is reported as a failure with its stderr.
+
+    Regression: the provider previously hardcoded ``success=True`` and discarded
+    ``exit_code``/``stderr``, so a failing command looked successful.
+    """
+
+    @skip_no_just_bash
+    @pytest.mark.asyncio
+    async def test_nonzero_exit_surfaces_stderr(self, env):
+        vfs, ns, admin, agent = env
+
+        async with no_task_leaks(action="raise"):
+            result = await vfs.execute(
+                "echo oops >&2; exit 3",
+                ns.id,
+                agent.id,
+                "just-bash",
+                resource_limits=ResourceLimits(timeout_seconds=10.0),
+                cwd="/",
+            )
+
+        assert result.success is False
+        assert result.error_type == "nonzero_exit"
+        assert "oops" in (result.error_message or "")
+
+
 # ---------------------------------------------------------------------------
 # JustBashProvider capabilities / registry resolution
 # ---------------------------------------------------------------------------
@@ -242,6 +269,8 @@ class TestProviderCapabilities:
         assert caps.supports_async is True
         assert caps.language == "bash"
         assert caps.tier == "just-bash"
+        # just-bash has no in-sandbox memory limit to enforce.
+        assert caps.enforces_memory_limit is False
 
     @skip_no_just_bash
     def test_reset_is_noop(self):

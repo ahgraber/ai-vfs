@@ -1,4 +1,4 @@
-# Proposal: Audit and Trace copy, move, and execute
+# Proposal: Audit/trace copy, move, execute — and harden the execution & search contracts
 
 ## Intent
 
@@ -7,8 +7,11 @@ The observability contract is internally inconsistent with the product's trust b
 `OTelSpansOnAllOperations` omits `execute`, `copy`, and `move`.
 Worst of all, `vfs.execute` — an agent running arbitrary code that mutates files — has no audit event and no span of its own, so the invocation ("principal X ran this code at cwd Y") is not attributable as a unit even though its inner writes are individually audited.
 
-This change closes that gap so the audit and span contracts match what a state-changing operation actually is.
-It is an additive correctness fix.
+The phase-3 pre-merge review surfaced adjacent gaps in the same trust bet (#2: contained + attributable): the sandbox's native filesystem mount (`open`/`pathlib`) bypassed the `ResourceLimits` operation budget and read/write size caps (a host-OOM / budget-bypass vector); agent-supplied `grep` patterns ran on a backtracking regex engine that an adversarial pattern could hang the host with; and the just-bash provider reported every run as a success, hiding failures.
+These are contract-level hardening of the same execution surface this change already touches, so they ride along as `execution` and `search` delta specs and sync together with the observability delta.
+
+This change closes those gaps so the audit, span, resource-limit, and regex contracts match what a safe, attributable, contained state-changing operation actually is.
+It is an additive correctness/security fix.
 
 ## User Stories
 
@@ -25,6 +28,25 @@ recorded as a single attributable audit event and a single trace that parents th
 inner file operations, so that I can answer "which principal ran what code, where, and did
 it succeed" as one unit — even when the code mutates many files.
 
+### Story: bounded-sandbox-resources
+
+As an operator, I want a sandboxed agent's file operations to be bounded by `ResourceLimits`
+(operation count, read size, write size) even when the agent uses native file I/O (`open`,
+`pathlib`) rather than the injected shell verbs, so that a runaway or adversarial agent cannot
+exhaust host memory or the operation budget through the native mount.
+
+### Story: dos-resistant-search
+
+As an operator, I want agent-supplied regex search patterns to be evaluated in bounded
+(linear) time, so that an adversarial pattern cannot hang the workspace's host process and deny
+service to every other in-flight operation.
+
+### Story: honest-execution-outcomes
+
+As an operator, I want a sandboxed command that fails (non-zero exit) reported as a failure with
+its diagnostics, so that I can trust the recorded outcome of code an agent ran instead of seeing
+a false success.
+
 ## Scope
 
 **In scope:**
@@ -39,6 +61,14 @@ it succeed" as one unit — even when the code mutates many files.
   (success / structured-failure), distinct from the inner per-operation audit events.
 - Regression tests that lock in the already-implemented `copy`/`move` audit events and
   spans against the newly-explicit contract.
+- `execution` delta: the FS-port native mount enforces `ResourceLimits` (shared operation
+  budget + `max_read_bytes`/`max_write_bytes`), `ResourceLimits` gains `max_write_bytes`,
+  `ExecutionCapabilities` gains `enforces_memory_limit`, the `execute` protocol signature gains
+  `fs_port`, the error table gains `ResourceLimitExceededError`, and the just-bash provider
+  reports non-zero exits as failures (`error_type="nonzero_exit"`).
+- `search` delta: regex content search uses a linear-time (RE2) engine — no catastrophic
+  backtracking, unsupported features (backreferences/lookaround) yield no matches, and REGEX
+  results are identical across backends.
 
 **Out of scope:**
 
@@ -66,7 +96,11 @@ Emit it once after provider dispatch resolves — covering both the success and 
 Add a `record_op("execute", ...)` call for metric parity with the other operations.
 
 The audit and span contracts live in the `observability` capability (as write/delete/
-rollback audit already do); no change to the `execution` capability spec is needed.
+rollback audit already do).
 `append_audit_event` is part of the `MetadataStore` protocol satisfied by every backend
 family (relational + document), so the contract holds at the floor without a
 backend-specific clause.
+
+The hardening deltas live in the `execution` and `search` capabilities.
+The FS-port resource enforcement is applied at the single `SessionFsPort` boundary that both sandbox providers (Monty mount, just-bash `IFileSystem`) already route through, so one change governs both — the operation budget becomes a property of the session boundary (a shared `OperationCounter` passed to both the injected verbs and the mount) rather than of the injected verbs alone.
+The regex hardening swaps the in-process verification engine to RE2 uniformly across every backend's `search_text`/brute-force path; PostgreSQL additionally drops its anchor-sensitive whole-document `~` prune (which could differ from per-line matching) in favour of per-line RE2 verification, keeping REGEX results identical across backends at the contract floor.

@@ -22,6 +22,7 @@ dependencies = [
     "alembic>=1.13.0",
     "blake3>=1.0.8",
     "diskcache>=5.6.3",
+    "google-re2>=1.1.20251105",
     "opentelemetry-api>=1.40.0",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.13.1",
@@ -40,7 +41,7 @@ s3 = ["aiobotocore>=2.15.0"]
 # Execution providers (code-mode sandboxes). Optional — the VFS layer runs standalone;
 # providers resolve lazily by name (see vfs.execution.registry) and a missing extra raises
 # an actionable install hint. `codemode` is the umbrella over every sandbox.
-monty = ["pydantic-monty>=0.0.1"]
+monty = ["pydantic-monty>=0.0.18"]
 just-bash = ["just-bash>=0.2.1"]
 codemode = ["ai-vfs[monty,just-bash]"]
 

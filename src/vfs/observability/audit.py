@@ -146,6 +146,39 @@ async def audit_move(
     await audit(meta_store, event, audit_log_enabled=audit_log_enabled)
 
 
+async def audit_execute(
+    meta_store,
+    *,
+    namespace_id: str,
+    principal_id: str,
+    path: str,
+    provider: str,
+    success: bool,
+    error_type: str | None = None,
+    audit_log_enabled: bool,
+) -> None:
+    """Record a sandboxed execute invocation as a single audit event.
+
+    Distinct from — and in addition to — the per-operation audit events of any
+    state-changing file operations the executed code performs. ``path`` is the
+    invocation cwd; ``detail`` carries the provider and the outcome (plus the
+    ``error_type`` on failure).
+    """
+    detail: dict = {"provider": provider, "outcome": "success" if success else "failure"}
+    if not success and error_type is not None:
+        detail["error_type"] = error_type
+    event = AuditEvent(
+        event_id=str(ULID()),
+        timestamp=_now(),
+        namespace_id=namespace_id,
+        principal_id=principal_id,
+        operation="execute",
+        path=path,
+        detail=detail,
+    )
+    await audit(meta_store, event, audit_log_enabled=audit_log_enabled)
+
+
 async def audit_permission_change(
     meta_store,
     *,

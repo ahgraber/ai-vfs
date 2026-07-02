@@ -39,6 +39,7 @@ from vfs.errors import (
     PermissionDeniedError,
     ReadBudgetExceededError,
     ReindexRequiredError,
+    ResourceLimitExceededError,
     VersionCollisionError,
 )
 from vfs.protocols.execution import ExecutionCapabilities, ExecutionResult, ResourceLimits
@@ -349,6 +350,67 @@ class TestExecuteGrantedAllowsFakeProvider:
         assert result.error_type is None
 
 
+class TestExecuteAudited:
+    """An execute invocation is audited once, distinct from inner file-op events.
+
+    Covers observability delta AuditLogStateChanges/ExecuteAudited and
+    ExecuteFailureAudited (invocation-level audit of the sandbox run).
+    """
+
+    @pytest.mark.asyncio
+    async def test_execute_success_is_audited(self, env):
+        vfs, ns, admin, agent = env
+        await vfs.grant(admin.id, agent.id, ns.id, "/", {"read", "write", "delete", "execute"})
+        vfs._config.audit_log_enabled = True
+
+        events: list = []
+        original = vfs._meta.append_audit_event
+
+        async def _spy(event):
+            events.append(event)
+            return await original(event)
+
+        vfs._meta.append_audit_event = _spy
+        provider = FakeProvider(result=ExecutionResult(success=True, output="done"))
+        from vfs.execution import registry
+
+        with patch.object(registry, "resolve_execution_provider", return_value=provider):
+            await vfs.execute("noop", ns.id, agent.id, "fake", cwd="/", resource_limits=ResourceLimits())
+
+        execute_events = [e for e in events if e.operation == "execute"]
+        assert len(execute_events) == 1
+        assert execute_events[0].path == "/"
+        assert execute_events[0].detail["provider"] == "fake"
+        assert execute_events[0].detail["outcome"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_execute_failure_is_audited_with_error_type(self, env):
+        vfs, ns, admin, agent = env
+        await vfs.grant(admin.id, agent.id, ns.id, "/", {"read", "write", "delete", "execute"})
+        vfs._config.audit_log_enabled = True
+
+        events: list = []
+        original = vfs._meta.append_audit_event
+
+        async def _spy(event):
+            events.append(event)
+            return await original(event)
+
+        vfs._meta.append_audit_event = _spy
+        # Provider raises a NotFoundError post-dispatch → Tier-2 translation to not_found.
+        provider = FakeProvider(raise_exc=NotFoundError("missing"))
+        from vfs.execution import registry
+
+        with patch.object(registry, "resolve_execution_provider", return_value=provider):
+            result = await vfs.execute("noop", ns.id, agent.id, "fake", cwd="/", resource_limits=ResourceLimits())
+
+        assert result.success is False and result.error_type == "not_found"
+        execute_events = [e for e in events if e.operation == "execute"]
+        assert len(execute_events) == 1
+        assert execute_events[0].detail["outcome"] == "failure"
+        assert execute_events[0].detail["error_type"] == "not_found"
+
+
 # ---------------------------------------------------------------------------
 # ExecutionProviderRegistry/UnknownProviderRejected
 # ---------------------------------------------------------------------------
@@ -475,6 +537,7 @@ _TRANSLATION_TABLE = [
     (ConflictError("MARKER_cas"), "conflict"),
     (VersionCollisionError("MARKER_collision"), "conflict"),
     (OperationBudgetExceededError("MARKER_opbudget"), "budget_exceeded"),
+    (ResourceLimitExceededError("MARKER_reslimit"), "budget_exceeded"),
     (ReadBudgetExceededError("MARKER_readbgt"), "search_unavailable"),
     (ReindexRequiredError("MARKER_reindex"), "search_unavailable"),
     (IndexUnavailableError("MARKER_idxdown"), "search_unavailable"),

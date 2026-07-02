@@ -256,7 +256,7 @@ async def _op_head(
     decoded = _decode_raw(raw, resource_limits.max_read_bytes, resolved)
     if isinstance(decoded, dict):
         return decoded
-    sliced = decoded.split("\n")[:n]
+    sliced = decoded.split("\n")[:n] if n > 0 else []
     return {"lines": sliced, "error": None}
 
 
@@ -327,11 +327,14 @@ async def _op_ls(
     counter.check_and_increment()
     resolved = resolve_path(session.pwd(), path)
 
-    # Recursive listing to discover all descendant paths for directory synthesis.
-    all_file_metas = await session.list(resolved, recursive=True)
-
-    # Normalize prefix so suffix stripping always works (e.g. "/" → length 1).
+    # Scope the listing to the directory prefix (trailing slash) so a bare
+    # "/proj" does not bleed into sibling prefixes like "/projector/…" — a
+    # ``LIKE '/proj%'`` scan would over-match. The slashed prefix also drives the
+    # suffix stripping below (e.g. "/" → length 1).
     prefix = resolved if resolved.endswith("/") else resolved + "/"
+
+    # Recursive listing to discover all descendant paths for directory synthesis.
+    all_file_metas = await session.list(prefix, recursive=True)
 
     file_entries: list[dict] = []
     dir_entries: dict[str, dict] = {}  # dir_path → entry; insertion-ordered dedup
@@ -382,14 +385,16 @@ async def _op_grep(
     """
     counter.check_and_increment()
     resolved = resolve_path(session.pwd(), path)
-    results = await session.search(pattern, resolved, SearchType.REGEX)
+    # Scope the search to the directory prefix (trailing slash) so a bare "/proj"
+    # does not bleed into sibling prefixes like "/projector/…".
+    prefix = resolved if resolved.endswith("/") else resolved + "/"
+    results = await session.search(pattern, prefix, SearchType.REGEX)
     items = [
         {"path": r.path, "line_number": r.line_number, "match_context": r.match_context, "score": r.score}
         for r in results
     ]
     if not recursive:
         # Filter to depth-1: no additional "/" segment after the scope prefix.
-        prefix = resolved if resolved.endswith("/") else resolved + "/"
         items = [item for item in items if "/" not in item["path"][len(prefix) :]]
     items, truncated = _truncated(items, max_result_items)
     return {"results": items, "truncated": truncated}
@@ -443,21 +448,39 @@ async def _op_glob(
 async def _op_write(
     session: Session,
     counter: OperationCounter,
+    resource_limits: ResourceLimits,
     path: str,
     content: bytes,
 ) -> Any:
     """write: write ``content`` to ``path``.
 
-    Returns a plain marshalable dict ``{"version_number": int, "size": int}``
-    rather than the raw ``VersionMeta`` pydantic model.  Returning the model
-    directly causes Monty to raise ``TypeError: Cannot convert VersionMeta to
-    Monty value`` even when the sandbox discards the return value — and the
-    write side-effect has already committed at that point.
+    Returns a plain marshalable dict ``{"version_number": int, "size": int,
+    "error": None}`` rather than the raw ``VersionMeta`` pydantic model.  Returning
+    the model directly causes Monty to raise ``TypeError: Cannot convert VersionMeta
+    to Monty value`` even when the sandbox discards the return value — and the write
+    side-effect has already committed at that point.
+
+    Refuses with a structured ``oversized_write`` error (``version_number`` ``None``,
+    nothing written) when ``content`` exceeds ``resource_limits.max_write_bytes`` —
+    the injected-verb counterpart of the native-mount write cap, so sandboxed code
+    cannot bypass ``max_write_bytes`` by calling the injected ``write``.
     """
     counter.check_and_increment()
+    if resource_limits.max_write_bytes is not None and len(content) > resource_limits.max_write_bytes:
+        _log.debug(
+            "write: oversized (%d bytes > %d limit) for %s", len(content), resource_limits.max_write_bytes, path
+        )
+        return {
+            "version_number": None,
+            "size": 0,
+            "error": {
+                "code": "oversized_write",
+                "message": f"Write exceeds max_write_bytes limit ({resource_limits.max_write_bytes} bytes)",
+            },
+        }
     resolved = resolve_path(session.pwd(), path)
     version_meta = await session.write(resolved, content)
-    return {"version_number": version_meta.version_number, "size": version_meta.size}
+    return {"version_number": version_meta.version_number, "size": version_meta.size, "error": None}
 
 
 async def _op_read(session: Session, path: str, *, version_number: int | None = None) -> bytes:
@@ -486,11 +509,9 @@ async def _op_delete(session: Session, path: str) -> Any:
 def fs_operations_for(
     session: Session,
     resource_limits: ResourceLimits,
+    counter: OperationCounter | None = None,
 ) -> FsOperations:
     """Construct a session-bound :class:`FsOperations` with budget enforcement.
-
-    All returned callables share a single :class:`OperationCounter` scoped to
-    this factory call; separate calls produce independent counters.
 
     Parameters
     ----------
@@ -499,8 +520,14 @@ def fs_operations_for(
     resource_limits:
         Governs ``max_operations`` (shell-op budget), ``max_read_bytes`` (per-read
         content cap), and ``max_result_items`` (truncation cap for ls/grep/find).
+    counter:
+        Shared :class:`OperationCounter` to charge each operation against.  When
+        ``None`` a fresh counter scoped to this factory call is created.  Pass the
+        same counter to :class:`~vfs.execution.fs_port.SessionFsPort` so the
+        injected verbs and the native-mount file operations draw from one budget.
     """
-    counter = OperationCounter(resource_limits.max_operations)
+    if counter is None:
+        counter = OperationCounter(resource_limits.max_operations)
     mi = resource_limits.max_result_items
 
     return FsOperations(
@@ -513,7 +540,7 @@ def fs_operations_for(
         grep=lambda pattern, path, **kw: _op_grep(session, counter, mi, pattern, path, **kw),
         find=lambda path, **kw: _op_find(session, counter, mi, path, **kw),
         glob=lambda pattern: _op_glob(session, counter, mi, pattern),
-        write=lambda path, content: _op_write(session, counter, path, content),
+        write=lambda path, content: _op_write(session, counter, resource_limits, path, content),
         read=lambda path, **kw: _op_read(session, path, **kw),
         stat=lambda path: _op_stat(session, path),
         delete=lambda path: _op_delete(session, path),

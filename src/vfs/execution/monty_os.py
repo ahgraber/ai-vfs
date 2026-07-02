@@ -153,16 +153,15 @@ class MontyVfsOS(AbstractOS):
         """
         handle = MontyFileHandle(str(path), mode)
         action = handle.mode[0]
-        empty = b"" if handle.binary else ""
         if action == "r":
             if not self._await(self._fs.exists(str(path))):
                 raise FileNotFoundError(f"[Errno 2] No such file or directory: {str(path)!r}")
         elif action == "w":
+            # 'w' truncates/creates at open time (POSIX open semantics).
             self._await(self._fs.write(str(path), b""))
         else:  # 'a' — create if missing, leave existing content untouched
             if not self._await(self._fs.exists(str(path))):
                 self._await(self._fs.write(str(path), b""))
-        _ = empty
         return handle
 
     # --- mutating directory / namespace ops -----------------------------------

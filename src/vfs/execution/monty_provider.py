@@ -31,8 +31,12 @@ ResourceLimits field mapping (verified against pydantic-monty 0.0.18)
 +-----------------------+-------------------+
 
 Unmapped (unenforced at the provider level):
-- max_operations  → enforced by OperationCounter in fs_operations_for
-- max_read_bytes  → enforced by FsOperations cat/head/tail wrappers
+- max_operations  → enforced by the shared OperationCounter across both the
+  FsOperations verbs and the SessionFsPort native mount
+- max_read_bytes  → enforced by the FsOperations cat/head/tail wrappers and by
+  the SessionFsPort mount's read (open()/pathlib go through the mount)
+- max_write_bytes → enforced by the FsOperations write wrapper and by the
+  SessionFsPort mount's write
 - max_result_items→ enforced by FsOperations grep/find/ls wrappers
 """
 
@@ -175,7 +179,7 @@ class MontyExecutionProvider:
         """Return Monty provider capabilities."""
         from vfs.protocols.execution import ExecutionCapabilities
 
-        return ExecutionCapabilities(supports_async=True, language="python", tier="monty")
+        return ExecutionCapabilities(supports_async=True, language="python", tier="monty", enforces_memory_limit=True)
 
     def reset(self) -> None:
         """No-op: MontyExecutionProvider is stateless per-execution."""
@@ -186,22 +190,26 @@ class MontyExecutionProvider:
 # component) so the token remains informative but leaks no module structure.
 _MODULE_PATH_RE = re.compile(r"\bvfs\.[\w.]+")
 
+# Matches absolute host-path-like sequences — POSIX ``/a/b``, ``~/a``, or Windows
+# ``C:\a`` — anchored at a non-word boundary so quoted (``'/etc/x'``), mid-token
+# (``at=/etc/x``), and drive-letter paths are caught, not only whitespace-leading
+# ones.  Replaced by ``<path>`` so no host filesystem detail leaks.
+_HOST_PATH_RE = re.compile(r"(?<!\w)(?:[A-Za-z]:\\|~/|/)[\w.\-][\w./\\-]*")
+
 
 def _safe_error_message(exc: MontyError, inner: Exception | None) -> str:
     """Build a safe, host-path-free error message from a MontyError.
 
     Uses ``str(exc)`` (which Monty formats as ``"ExcType: message"``) but:
-    1. Strips whitespace-delimited tokens that look like absolute host paths
-       (start with ``/`` or ``~/``).
+    1. Replaces anything that looks like an absolute host path (POSIX, ``~/``, or
+       Windows drive path) with ``<path>``, wherever it appears in the string.
     2. Replaces dotted internal module paths (``vfs.models.VersionMeta``) with
        the bare class name only (``VersionMeta``), so adapter-internal names do
        not leak into the sandbox-visible error message.
     """
     raw = str(exc) if inner is None else f"{type(inner).__name__}: {inner}"
-    # Strip tokens that look like absolute host paths.
-    parts = raw.split()
-    clean_parts = [p for p in parts if not p.startswith("/") and not p.startswith("~/")]
-    msg = " ".join(clean_parts) if clean_parts else "Sandbox execution error"
+    msg = _HOST_PATH_RE.sub("<path>", raw)
+    msg = " ".join(msg.split()) or "Sandbox execution error"
     # Replace dotted internal module paths with their bare class name.
     msg = _MODULE_PATH_RE.sub(lambda m: m.group(0).rsplit(".", 1)[-1], msg)
     return msg

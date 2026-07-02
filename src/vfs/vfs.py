@@ -23,6 +23,7 @@ from vfs.errors import (
     PermissionDeniedError,
     ReadBudgetExceededError,
     ReindexRequiredError,
+    ResourceLimitExceededError,
     SearchTypeUnsupportedError,
     VersionCollisionError,
 )
@@ -42,6 +43,7 @@ from vfs.observability.audit import (
     audit,
     audit_copy,
     audit_delete,
+    audit_execute,
     audit_move,
     audit_permission_change,
     audit_rollback,
@@ -794,18 +796,6 @@ class VFS:
           - ``FULLTEXT``: raises :class:`~vfs.errors.SearchTypeUnsupportedError` — no
             brute-force equivalent exists for unranked full-text search.
 
-        Dispatch rules
-        --------------
-        - ``GLOB`` / ``FIND``: always served by :class:`~vfs.search.default.DefaultSearchProvider`
-          from metadata (no blob reads).
-        - ``REGEX`` / ``FULLTEXT``: routed to :meth:`~vfs.protocols.metadata.MetadataStore.native_text_search`
-          when the active store exposes it (SQLite FTS5, PostgreSQL pg_trgm + tsvector).
-          When absent:
-
-          - ``REGEX``: falls back to the ``DefaultSearchProvider`` brute-force path via
-            the guarded reader (budget-bounded; may raise ``ReadBudgetExceededError``).
-          - ``FULLTEXT``: raises :class:`~vfs.errors.SearchTypeUnsupportedError`.
-
         Tension with delta spec MongoRegexDeferred scenario
         ---------------------------------------------------
         The delta spec ``MongoRegexDeferred`` scenario states that both regex *and* fulltext
@@ -953,7 +943,7 @@ class VFS:
         ``ExecutionResult(success=False, ...)``; no raw traceback, host path, or
         adapter-internal detail appears in ``error_message``.
         """
-        from vfs.execution.fs_ops import fs_operations_for
+        from vfs.execution.fs_ops import OperationCounter, fs_operations_for
         from vfs.execution.fs_port import SessionFsPort
         from vfs.execution.registry import resolve_execution_provider
         from vfs.protocols.execution import ExecutionResult, ResourceLimits
@@ -987,65 +977,102 @@ class VFS:
         # session.cd enforces read permission on cwd; permission denied here is a
         # caller-side error, so let it propagate (Tier 1 boundary).
         await session.cd(cwd)
-        fs_ops = fs_operations_for(session, effective_limits)
-        fs_port = SessionFsPort(session)
+        # One budget shared by the injected verbs and the native-mount FS-port, so
+        # native file I/O (the primary sandbox surface) is counted and size-capped
+        # just like the injected verbs — not left ungoverned.
+        counter = OperationCounter(effective_limits.max_operations)
+        fs_ops = fs_operations_for(session, effective_limits, counter)
+        fs_port = SessionFsPort(session, effective_limits, counter)
 
-        # --- Tier 2: wrap provider dispatch; translate all execution-time exceptions ---
-        try:
-            result = await asyncio.wait_for(
-                provider.execute(code, fs_ops, fs_port, effective_limits),
-                timeout=effective_timeout,
+        # --- Tier 2: dispatch inside the execute span; translate all execution-time
+        # exceptions to a structured result, then audit + record the invocation once
+        # (success or failure).  The span parents the inner file-operation spans, so
+        # the invocation and its inner operations form one trace.
+        t0 = time.monotonic()
+        with vfs_span(
+            "execute",
+            {"vfs.namespace": namespace_id, "vfs.path": cwd, "vfs.principal_id": principal_id},
+            otel_enabled=self._config.otel_enabled,
+        ):
+            try:
+                result = await asyncio.wait_for(
+                    provider.execute(code, fs_ops, fs_port, effective_limits),
+                    timeout=effective_timeout,
+                )
+            except asyncio.TimeoutError:
+                result = ExecutionResult(success=False, error_type="timeout", error_message="Execution timed out")
+            except PermissionDeniedError:
+                result = ExecutionResult(
+                    success=False,
+                    error_type="permission_denied",
+                    error_message="Access denied to path",
+                )
+            except NotFoundError:
+                result = ExecutionResult(success=False, error_type="not_found", error_message="File not found")
+            except ConflictError:
+                result = ExecutionResult(
+                    success=False,
+                    error_type="conflict",
+                    error_message="Version conflict; re-read and retry",
+                )
+            except VersionCollisionError:
+                result = ExecutionResult(
+                    success=False,
+                    error_type="conflict",
+                    error_message="Concurrent write; retry",
+                )
+            except OperationBudgetExceededError:
+                result = ExecutionResult(
+                    success=False,
+                    error_type="budget_exceeded",
+                    error_message="Operation limit reached",
+                )
+            except ResourceLimitExceededError:
+                result = ExecutionResult(
+                    success=False,
+                    error_type="budget_exceeded",
+                    error_message="Resource size limit exceeded",
+                )
+            except ReadBudgetExceededError:
+                result = ExecutionResult(
+                    success=False,
+                    error_type="search_unavailable",
+                    error_message="Search read budget exhausted; reindex",
+                )
+            except ReindexRequiredError:
+                result = ExecutionResult(
+                    success=False,
+                    error_type="search_unavailable",
+                    error_message="Index cold; run vfs.reindex()",
+                )
+            except IndexUnavailableError:
+                result = ExecutionResult(
+                    success=False,
+                    error_type="search_unavailable",
+                    error_message="Search index unavailable",
+                )
+            except Exception:  # noqa: BLE001
+                _log.exception("Unexpected error during vfs.execute for principal %s", principal_id)
+                result = ExecutionResult(success=False, error_type="internal_error", error_message="Execution error")
+
+            # Invocation-level audit + metrics, distinct from the per-operation audit
+            # events of any state-changing file operations the executed code performed.
+            await audit_execute(
+                self._meta,
+                namespace_id=namespace_id,
+                principal_id=principal_id,
+                path=cwd,
+                provider=provider_name,
+                success=result.success,
+                error_type=result.error_type,
+                audit_log_enabled=self._config.audit_log_enabled,
             )
-        except asyncio.TimeoutError:
-            return ExecutionResult(success=False, error_type="timeout", error_message="Execution timed out")
-        except PermissionDeniedError:
-            return ExecutionResult(
-                success=False,
-                error_type="permission_denied",
-                error_message="Access denied to path",
+            record_op(
+                "execute",
+                (time.monotonic() - t0) * 1000,
+                {"vfs.namespace": namespace_id},
+                otel_enabled=self._config.otel_enabled,
             )
-        except NotFoundError:
-            return ExecutionResult(success=False, error_type="not_found", error_message="File not found")
-        except ConflictError:
-            return ExecutionResult(
-                success=False,
-                error_type="conflict",
-                error_message="Version conflict; re-read and retry",
-            )
-        except VersionCollisionError:
-            return ExecutionResult(
-                success=False,
-                error_type="conflict",
-                error_message="Concurrent write; retry",
-            )
-        except OperationBudgetExceededError:
-            return ExecutionResult(
-                success=False,
-                error_type="budget_exceeded",
-                error_message="Operation limit reached",
-            )
-        except ReadBudgetExceededError:
-            return ExecutionResult(
-                success=False,
-                error_type="search_unavailable",
-                error_message="Search read budget exhausted; reindex",
-            )
-        except ReindexRequiredError:
-            return ExecutionResult(
-                success=False,
-                error_type="search_unavailable",
-                error_message="Index cold; run vfs.reindex()",
-            )
-        except IndexUnavailableError:
-            return ExecutionResult(
-                success=False,
-                error_type="search_unavailable",
-                error_message="Search index unavailable",
-            )
-        except Exception:  # noqa: BLE001
-            _log.exception("Unexpected error during vfs.execute for principal %s", principal_id)
-            return ExecutionResult(success=False, error_type="internal_error", error_message="Execution error")
-        else:
             return result
 
     # --- Native search (straggler path) ---

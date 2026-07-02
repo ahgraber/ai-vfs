@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import fnmatch
 from pathlib import PurePosixPath
-import re
 
 from vfs.models import FileMeta, SearchArtifact, SearchResult, SearchType
 from vfs.protocols.search import FindPredicates, SearchMetaEntry, SearchRequest, SearchResponse
+from vfs.search._regex import RegexCompileError, compile_line_regex
 
 
 class DefaultSearchProvider:
@@ -115,7 +115,10 @@ class DefaultSearchProvider:
         entries: list[SearchMetaEntry],
         request: SearchRequest,
     ) -> list[SearchResult]:
-        compiled = re.compile(pattern)
+        try:
+            compiled = compile_line_regex(pattern)
+        except RegexCompileError:
+            return []
         results = []
         for entry in entries:
             if not entry.path.startswith(scope):

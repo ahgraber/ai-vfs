@@ -59,6 +59,10 @@ Richer typing (mime / content classification) is out of scope.
 The system SHALL support regex pattern matching against file content,
 returning matching paths with context (matched line and line number).
 
+Patterns SHALL be matched line-by-line with a **linear-time** engine (RE2), so `^`/`$` anchor to line bounds and no pattern can exhibit catastrophic (super-linear) backtracking — regex content search is reachable by untrusted sandboxed code via `grep`, so an adversarial pattern MUST NOT be able to wedge the host event loop.
+Consequently, patterns using features RE2 does not implement (backreferences, lookaround) SHALL be treated as unusable and yield an empty result set rather than raising or falling back to a backtracking engine.
+This engine SHALL be used uniformly across every backend's in-process verification, so REGEX results are identical across backends (no backend applies a whole-document anchor-sensitive prune that could differ from per-line matching).
+
 #### Scenario: GrepMatchesContent
 
 - **GIVEN** file /src/main.py contains "# TODO: fix this" on line 3
@@ -70,6 +74,12 @@ returning matching paths with context (matched line and line number).
 - **GIVEN** no files in scope contain the pattern
 - **WHEN** a principal searches with regex "NONEXISTENT"
 - **THEN** an empty result list is returned
+
+#### Scenario: RegexIsLinearTime
+
+- **GIVEN** an adversarial catastrophic-backtracking pattern such as `(a+)+$` and content that does not match it
+- **WHEN** a principal (or sandboxed `grep`) searches with that pattern
+- **THEN** the search completes in linear time without blocking, returning no match — it does not hang
 
 ### Requirement: PluggableSearchProviders
 

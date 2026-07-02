@@ -6,25 +6,23 @@
 
 The system SHALL define an `ExecutionProvider` protocol with `execute`, `capabilities`, and
 `reset` methods.
-`execute(code, fs_ops, resource_limits)` SHALL be an `async def` accepting a code string,
-an `FsOperations` instance, and a `ResourceLimits` value, and SHALL return an `ExecutionResult`.
+`execute(code, fs_ops, fs_port, resource_limits)` SHALL be an `async def` accepting a code
+string, an `FsOperations` instance (the injected shell verbs), an `FsPort` instance (the
+session-backed filesystem a provider mounts as the sandbox's native filesystem), and a
+`ResourceLimits` value, and SHALL return an `ExecutionResult`.
 (End-to-end timeout is enforced by `vfs.execute` via `asyncio.wait_for`; providers may use
 `resource_limits.timeout_seconds` as a secondary inner limit.)
 `capabilities()` SHALL return an `ExecutionCapabilities` value describing the provider's language,
-tier, and whether it supports async execution.
+tier, whether it supports async execution, and whether it enforces the in-sandbox memory limit.
 `reset()` SHALL return `None` and perform any provider-level state reset.
 
-`ExecutionResult` SHALL be a frozen dataclass with fields `success: bool`, `output: Any`,
-`error_type: str | None`, and `error_message: str | None`.
-`ExecutionCapabilities` SHALL be a frozen dataclass with fields `supports_async: bool`,
-`language: str`, and `tier: str`.
-`ResourceLimits` SHALL be a dataclass with fields `timeout_seconds: float`,
-`max_memory_bytes: int | None`, `max_operations: int`, `max_read_bytes: int | None`, and
-`max_result_items: int | None`, with defaults `timeout_seconds=30.0` and `max_operations=1000`.
-`max_read_bytes` caps the content size returned by a single `cat`/`head`/`tail`/read call;
-an oversized file yields a structured error rather than causing a host OOM.
-`max_result_items` caps the number of items returned by `grep`/`find`/`ls`; truncation is
-flagged on the result object.
+`ExecutionResult` SHALL be a frozen dataclass with fields `success: bool`, `output: Any`, `error_type: str | None`, and `error_message: str | None`.
+`ExecutionCapabilities` SHALL be a frozen dataclass with fields `supports_async: bool`, `language: str`, `tier: str`, and `enforces_memory_limit: bool` (default `False`).
+`enforces_memory_limit` reports whether the provider honours `max_memory_bytes` inside the sandbox; the remaining limits are enforced uniformly regardless of provider, so memory is the only provider-variable guarantee callers must feature-detect.
+`ResourceLimits` SHALL be a dataclass with fields `timeout_seconds: float`, `max_memory_bytes: int | None`, `max_operations: int`, `max_read_bytes: int | None`, `max_write_bytes: int | None`, and `max_result_items: int | None`, with defaults `timeout_seconds=30.0` and `max_operations=1000`.
+`max_read_bytes` caps the content size returned by a single direct read (`cat`/`head`/`tail` or a native-mount read), and `max_write_bytes` caps the payload accepted by a single write (both the injected `write` verb and a native-mount write); an oversized read/write is refused (a structured error for the injected verbs, or `ResourceLimitExceededError` for the native-mount surface) rather than causing a host OOM.
+`max_result_items` caps the number of items returned by `grep`/`find`/`ls`; truncation is flagged on the result object.
+The operation budget (`max_operations`) and the `max_read_bytes`/`max_write_bytes` caps SHALL be enforced across BOTH the injected `FsOperations` verbs AND the `FsPort` native mount via a single shared counter, so native `open`/`pathlib` file I/O is governed identically to the injected verbs.
 
 #### Scenario: ExecutionResultFields
 
@@ -44,12 +42,19 @@ flagged on the result object.
 - **WHEN** the fields are inspected
 - **THEN** `timeout_seconds` is `30.0` and `max_operations` is `1000`
 
+#### Scenario: CapabilitiesExposeMemoryEnforcement
+
+- **GIVEN** a memory-capping provider (Monty) and a non-capping provider (just-bash)
+- **WHEN** `capabilities()` is inspected on each
+- **THEN** `enforces_memory_limit` is `True` for the capping provider and `False` for the non-capping one
+
 ### Requirement: FsPortContract
 
 The system SHALL define an **FS-port**: an async, path-based filesystem interface, backed by a `Session`, exposing whole-file `read`, `write`, `list`, `stat`, `exists`, and `delete`, plus `mkdir` as a no-op over implicit directories.
 Every FS-port operation SHALL route through the bound `Session`, so the principal's permissions are enforced and state-changing operations are audited exactly as for direct VFS calls.
 The FS-port SHALL NOT expose the host operating system's filesystem.
 A filesystem operation that has no VFS equivalent — symbolic links, permission-mode changes, modification-time changes — SHALL raise an unsupported-operation error rather than silently succeed.
+When constructed with a `ResourceLimits` and a shared operation counter (as `vfs.execute` does for a sandboxed run), the FS-port SHALL charge each operation against the counter and SHALL refuse a read whose target exceeds `max_read_bytes` (checked via `stat` before the blob is fetched) or a write whose payload exceeds `max_write_bytes`, raising `ResourceLimitExceededError` — so a sandbox using the native mount is governed identically to the injected verbs.
 
 #### Scenario: FsPortReadWriteRouteThroughSession
 
@@ -76,6 +81,12 @@ A filesystem operation that has no VFS equivalent — symbolic links, permission
 - **GIVEN** an FS-port
 - **WHEN** a symlink, mode-change, or mtime-change operation is requested
 - **THEN** an unsupported-operation error is raised (the operation is not silently accepted)
+
+#### Scenario: FsPortEnforcesResourceLimits
+
+- **GIVEN** an FS-port constructed with `ResourceLimits(max_read_bytes=N)` and a shared counter
+- **WHEN** a read targets a file larger than `N` bytes
+- **THEN** `ResourceLimitExceededError` is raised before the blob is fetched, and the operation is charged against the shared budget
 
 ### Requirement: FsOperationsFactory
 
@@ -224,9 +235,9 @@ The `execute` permission gates entry at a scope; per-operation permissions gate 
 
 ### Requirement: VfsExecuteErrorTranslation
 
-`vfs.execute` SHALL translate all VFS exceptions to structured `ExecutionResult` failures.
-No raw traceback, host path, or adapter-internal detail SHALL appear in `error_message`.
-The translation table is:
+`vfs.execute` SHALL translate exceptions raised after provider dispatch begins into a structured
+`ExecutionResult(success=False, error_type=...)` per the following table; no raw traceback, host
+path, or adapter-internal detail SHALL appear in `error_message`.
 
 | Source                         | `error_type`           |
 | ------------------------------ | ---------------------- |
@@ -236,10 +247,15 @@ The translation table is:
 | `ConflictError`                | `"conflict"`           |
 | `VersionCollisionError`        | `"conflict"`           |
 | `OperationBudgetExceededError` | `"budget_exceeded"`    |
+| `ResourceLimitExceededError`   | `"budget_exceeded"`    |
 | `ReadBudgetExceededError`      | `"search_unavailable"` |
 | `ReindexRequiredError`         | `"search_unavailable"` |
 | `IndexUnavailableError`        | `"search_unavailable"` |
 | Unexpected `Exception`         | `"internal_error"`     |
+
+A provider MAY additionally return a provider-specific `error_type` for an outcome that is not a
+VFS error — e.g. the just-bash provider returns `error_type="nonzero_exit"` when a script runs to
+completion but exits non-zero.
 
 `vfs.execute` wraps provider dispatch in `asyncio.wait_for(..., timeout=resource_limits.timeout_seconds)`;
 on expiry the provider task is cancelled and `ExecutionResult(success=False, error_type="timeout")` is returned.
@@ -260,6 +276,12 @@ on expiry the provider task is cancelled and `ExecutionResult(success=False, err
 
 - **GIVEN** the sandbox exhausts its `max_operations` budget
 - **WHEN** `OperationBudgetExceededError` propagates to `vfs.execute`
+- **THEN** `ExecutionResult(success=False, error_type="budget_exceeded")` is returned
+
+#### Scenario: ResourceLimitExceededTranslated
+
+- **GIVEN** a sandbox native read/write that exceeds `max_read_bytes`/`max_write_bytes`
+- **WHEN** `ResourceLimitExceededError` propagates to `vfs.execute`
 - **THEN** `ExecutionResult(success=False, error_type="budget_exceeded")` is returned
 
 #### Scenario: SearchUnavailableTranslated
@@ -378,6 +400,7 @@ A VFS error raised inside a bridged callback (e.g. `PermissionDeniedError`, `Not
 The system SHALL provide a just-bash execution provider that runs bash over the governed VFS by injecting an FS-port-backed filesystem, so that bash builtins (`cat`, `ls`, pipes, redirection) operate on VFS files with the principal's permissions enforced.
 The provider SHALL replace the `grep`, `find`, and `glob` builtins so they resolve to the VFS search index — parity with the Monty search verbs — rather than brute-force file enumeration.
 Filesystem operations with no VFS equivalent SHALL raise unsupported, consistent with the FS-port.
+When a script runs to completion but exits non-zero, the provider SHALL return `ExecutionResult(success=False, error_type="nonzero_exit")` carrying the script's stderr in `error_message` (and stdout in `output`), so a failing command is not reported as a success.
 
 #### Scenario: BashCatReadsVfsFile
 
@@ -403,6 +426,12 @@ Filesystem operations with no VFS equivalent SHALL raise unsupported, consistent
 - **GIVEN** the principal lacks read permission on a path
 - **WHEN** sandboxed bash runs `cat` on that path
 - **THEN** the read is denied; the bash provider does not bypass access control
+
+#### Scenario: BashNonZeroExitReportsFailure
+
+- **GIVEN** the principal has execute permission
+- **WHEN** sandboxed bash runs a script that writes to stderr and exits non-zero
+- **THEN** `ExecutionResult(success=False, error_type="nonzero_exit")` is returned with the stderr in `error_message`
 
 ### Requirement: ExecutionProviderRegistry
 

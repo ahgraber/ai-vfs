@@ -57,6 +57,19 @@ class OperationBudgetExceededError(VFSError):
     """
 
 
+class ResourceLimitExceededError(VFSError):
+    """A single content read or write exceeded its ``ResourceLimits`` size cap.
+
+    Raised by ``SessionFsPort`` when a native-mount read exceeds
+    ``ResourceLimits.max_read_bytes`` or a write exceeds ``max_write_bytes``.
+    Unlike the injected ``cat``/``head``/``tail`` verbs — which return a
+    structured ``oversized_read`` result — the whole-file FS-port read/write
+    surface must raise, since its contract returns raw ``bytes``/version numbers.
+    The size check for reads is performed via ``stat`` before the blob is
+    fetched, so an oversized file never lands in host memory.
+    """
+
+
 class UnsupportedOperationError(VFSError):
     """A filesystem operation with no VFS equivalent was requested.
 
