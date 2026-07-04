@@ -1,0 +1,5 @@
+# Frontend deps and the built SPA (rebuild with `bun run build`).
+frontend/node_modules/
+backend/static/
+# TypeScript incremental build cache.
+frontend/*.tsbuildinfo
