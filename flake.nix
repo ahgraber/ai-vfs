@@ -43,17 +43,11 @@
           # /tmp, which the OS reaps after ~3 days (leaving the VM "running" but unreachable), so
           # the wrapper checks the socket itself, not just `podman machine` state. The docker CLI
           # client (pkgs.docker, client-only on darwin — no daemon pulled in) is wrapped the same
-          # way, pointed at the podman socket. Colima stays installed as a manual alternative but
-          # is no longer auto-wired.
-          containerPackages =
-            [
-              pkgs.docker-compose # primary compose provider for `podman compose`
-              pkgs.podman-compose # Docker-free compose fallback
-            ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.colima # manual fallback VM (dockerd in Lima); no longer auto-wired
-              pkgs.qemu # colima's default VM backend
-            ];
+          # way, pointed at the podman socket.
+          containerPackages = [
+            pkgs.docker-compose # primary compose provider for `podman compose`
+            pkgs.podman-compose # Docker-free compose fallback
+          ];
 
           # Real engine binaries, referenced by absolute store path from the shims below so the
           # shims are the only `podman`/`docker` on the devshell PATH (no collision, and the shim
