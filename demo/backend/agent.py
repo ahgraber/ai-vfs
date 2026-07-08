@@ -9,13 +9,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.capabilities import Instrumentation
+from pydantic_ai.capabilities import Instrumentation, ProcessHistory
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from vfs import VFS, ResourceLimits, Session
 from vfs.models import SearchType
+
+from .history import build_compactor
 
 # Sandbox budget for a single code-mode run.
 EXEC_LIMITS = ResourceLimits(
@@ -24,6 +26,9 @@ EXEC_LIMITS = ResourceLimits(
     max_read_bytes=1_000_000,
     max_result_items=500,
 )
+
+#: Lines returned by an unbounded `read_file`; longer files are truncated to this window.
+READ_DEFAULT_LINES = 200
 
 
 @dataclass
@@ -46,15 +51,21 @@ def _fmt_exec(result) -> str:
 
 
 def _render_lines(text: str, start: int | None, end: int | None) -> str:
-    """Return the whole file, or a 1-based inclusive line span with line-number prefixes.
+    """Render a file for reading: a numbered span, or a capped default window.
 
-    With neither bound set the text is returned unchanged. With either bound set the
-    selected lines are prefixed with their 1-based line numbers (``cat -n`` style) so the
-    model can request follow-up spans by number. Bounds are clamped to the file's extent.
+    With `start`/`end` (1-based, inclusive) the selected lines are prefixed with their line
+    numbers (``cat -n`` style), clamped to the file's extent, so the model can request
+    follow-up spans by number. With neither bound the read defaults to the first
+    ``READ_DEFAULT_LINES`` lines: a file within that many lines is returned unchanged; a
+    longer file is truncated to the window, numbered, and followed by a footer giving the
+    total line count and how to page on.
     """
-    if start is None and end is None:
-        return text
     lines = text.splitlines()
+    if start is None and end is None:
+        if len(lines) <= READ_DEFAULT_LINES:
+            return text
+        window = "\n".join(f"{n}\t{lines[n - 1]}" for n in range(1, READ_DEFAULT_LINES + 1))
+        return f"{window}\n\n-- showing lines 1-{READ_DEFAULT_LINES} of {len(lines)}; pass start/end to read more --"
     lo = max(1, start if start is not None else 1)
     hi = min(len(lines), end if end is not None else len(lines))
     if lo > hi:
@@ -90,7 +101,7 @@ async def run_bash(ctx: RunContext[AgentDeps], code: str) -> str:
 
 # --- files set ---
 async def read_file(ctx: RunContext[AgentDeps], path: str, start: int | None = None, end: int | None = None) -> str:
-    """Read a file by absolute path. Pass `start`/`end` (1-based, inclusive) to read only that line span; spanned lines are returned with line-number prefixes. Omit both to read the whole file. Prefer reading chunks to preserve context."""
+    """Read a file by absolute path. Windowed reads are standard practice: omit `start`/`end` to read the first 200 lines (a longer file is truncated to that window with a footer giving the total line count and how to continue); pass `start`/`end` (1-based, inclusive) to read a specific line span. Windowed and spanned output carries line-number prefixes, so request the next window by number. Prefer paging through windows to reading whole files, to preserve context."""
     text = (await _session(ctx.deps).read(path)).decode("utf-8", errors="replace")
     return _render_lines(text, start, end)
 
@@ -151,14 +162,32 @@ def build_model(model_name: str, base_url: str, api_key: str, api_style: str) ->
     return OpenAIChatModel(model_name, provider=provider)
 
 
-def build_agent(model: Model, enabled_sets: set[str]) -> Agent[AgentDeps, str]:
+def build_agent(
+    model: Model,
+    enabled_sets: set[str],
+    *,
+    context_window_tokens: int = 32_768,
+    compact_fraction: float = 0.6,
+) -> Agent[AgentDeps, str]:
     """Register only the tool sets `enabled_sets` selected on a fresh agent.
 
     The `Instrumentation` capability emits an OpenTelemetry span per agent run,
     model call, and tool call. It uses the global tracer provider, so if tracing
     is wired (see `tracing.py`) the spans reach MLflow; otherwise it is a no-op.
+
+    The `ProcessHistory` capability bounds the model's context (see `history.py`):
+    once a pending request is estimated to exceed `context_window_tokens *
+    compact_fraction`, the oldest messages are summarized with `model` and recent
+    messages kept verbatim. It fires before every model request, so it covers both
+    long conversations and long single turns.
     """
-    agent = Agent(model, deps_type=AgentDeps, instructions=INSTRUCTIONS, capabilities=[Instrumentation()])
+    compactor = build_compactor(model, token_budget=int(context_window_tokens * compact_fraction))
+    agent = Agent(
+        model,
+        deps_type=AgentDeps,
+        instructions=INSTRUCTIONS,
+        capabilities=[Instrumentation(), ProcessHistory(compactor)],
+    )
     if "code" in enabled_sets:
         for tool in CODE_TOOLS:
             agent.tool(tool)

@@ -19,6 +19,7 @@ import uvicorn
 from .agent import build_agent, build_model, registered_tool_names
 from .app import create_app
 from .config import Settings
+from .model_info import resolve_context_window
 from .vfs_setup import build_world, teardown_world
 
 # The built SPA lives next to the backend package; served only if it exists.
@@ -45,7 +46,23 @@ async def serve(settings: Settings) -> None:
             print(f"mlflow tracing disabled: {exc!r}")
 
     model = build_model(settings.model_name, settings.openai_base_url, settings.openai_api_key, settings.api_style)
-    agent = build_agent(model, settings.enabled_sets)
+
+    # Learn the real context window from the endpoint (omlx exposes it as `max_model_len`);
+    # AIVFS_CONTEXT_TOKENS is the fallback for endpoints that don't. Off the loop: the probe
+    # is a blocking HTTP call, and there is no live connection to starve at startup.
+    context_window, window_source = await asyncio.to_thread(
+        resolve_context_window,
+        settings.openai_base_url,
+        settings.model_name,
+        settings.openai_api_key,
+        fallback=settings.context_window_tokens,
+    )
+    agent = build_agent(
+        model,
+        settings.enabled_sets,
+        context_window_tokens=context_window,
+        compact_fraction=settings.compact_fraction,
+    )
 
     app = create_app(
         world,
@@ -58,6 +75,7 @@ async def serve(settings: Settings) -> None:
 
     print(f"repo root : {repo_root}")
     print(f"model     : {settings.model_name} via {settings.openai_base_url} ({settings.api_style})")
+    print(f"context   : {context_window} tokens ({window_source}); compact at {settings.compact_fraction:.0%}")
     print(f"tools     : {registered_tool_names(settings.enabled_sets)}")
     print(f"spa       : {'served from ' + str(STATIC_DIR) if STATIC_DIR.is_dir() else '(not built; API only)'}")
     if tracing:

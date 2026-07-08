@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 type TreeResp = { prefix: string; paths: string[] }
 type Version = { version_number: number; size: number }
@@ -38,6 +38,7 @@ export function VfsInspector() {
   const [file, setFile] = useState<FileResp | null>(null)
   const [diff, setDiff] = useState<DiffResp | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const fileInput = useRef<HTMLInputElement>(null)
 
   const refreshTree = useCallback(async () => {
     try {
@@ -60,6 +61,26 @@ export function VfsInspector() {
     setFile(await getJSON<FileResp>(`/api/vfs/file?path=${encodeURIComponent(path)}`))
   }, [])
 
+  const uploadFile = useCallback(
+    async (picked: File) => {
+      try {
+        const form = new FormData()
+        form.append("file", picked)
+        const resp = await fetch("/api/vfs/upload", { method: "POST", body: form })
+        if (!resp.ok) throw new Error(`upload -> ${resp.status}`)
+        const body = (await resp.json()) as { path: string; derived_paths?: string[]; extract_error?: string }
+        // Surface a failed text extraction while still showing the stored original.
+        setError(body.extract_error ? `stored ${body.path}, but text extraction failed: ${body.extract_error}` : null)
+        await refreshTree()
+        // Jump to the first extracted text sidecar when there is one, else the raw upload.
+        await openFile(body.derived_paths?.[0] ?? body.path)
+      } catch (e) {
+        setError(String(e))
+      }
+    },
+    [refreshTree, openFile],
+  )
+
   const showDiff = useCallback(async () => {
     if (!selected) return
     setDiff(await getJSON<DiffResp>(`/api/vfs/diff?path=${encodeURIComponent(selected)}`))
@@ -69,9 +90,22 @@ export function VfsInspector() {
     <div className="inspector">
       <div className="inspector-head">
         <h2>VFS</h2>
+        <button type="button" className="ghost" onClick={() => fileInput.current?.click()}>
+          upload
+        </button>
         <button type="button" className="ghost" onClick={refreshTree}>
           refresh
         </button>
+        <input
+          ref={fileInput}
+          type="file"
+          hidden
+          onChange={(e) => {
+            const picked = e.target.files?.[0]
+            if (picked) uploadFile(picked)
+            e.target.value = "" // let the same file be re-picked
+          }}
+        />
       </div>
       {error ? <p className="inspector-error">{error}</p> : null}
       <ul className="tree">
