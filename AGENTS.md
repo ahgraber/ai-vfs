@@ -125,9 +125,11 @@ For multi-step tasks, state a brief plan defining the step task and associated v
 
 ## Testing
 
-- Run tests via `uv run pytest tests/`.
-- For parallel execution, use `pytest-xdist`: `uv run pytest -n auto -m "not isolate" tests/`.
-- Tests marked `isolate` (subprocess lifecycle with `pytest-isolate`) are incompatible with xdist; run them separately: `uv run pytest -m isolate tests/`.
+- Run tests via `uv run pytest`.
+  The `testpaths` config covers both roots — `tests/` (the library) and `demo/tests/` (the demo).
+  Pass an explicit path only to scope a run; a bare `pytest` runs everything.
+- For parallel execution, use `pytest-xdist`: `uv run pytest -n auto -m "not isolate"`.
+- Tests marked `isolate` (subprocess lifecycle with `pytest-isolate`) are incompatible with xdist; run them separately: `uv run pytest -m isolate`.
 - Do not use `pytest-run-parallel` — it is a thread-safety stress tester (runs the same test N times in N threads), not a test suite parallelizer.
 
 ### Resource leak detection with pyleak

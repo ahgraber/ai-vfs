@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="omlx", alias="OPENAI_API_KEY")
     api_style: str = Field(default="chat", alias="AIVFS_API_STYLE")  # "chat" | "responses"
     tool_sets: str = Field(default="all", alias="AIVFS_TOOLS")  # "code" | "files" | "all" (comma-ok)
+
+    # History compaction. The local model's context window is not discoverable, so it is
+    # configured; `compact_fraction` of it is the budget past which older messages are
+    # summarized (see history.py).
+    context_window_tokens: int = Field(default=32_768, gt=0, alias="AIVFS_CONTEXT_TOKENS")
+    compact_fraction: float = Field(default=0.6, alias="AIVFS_COMPACT_FRACTION")
     host: str = Field(default="127.0.0.1", alias="AIVFS_HOST")
     port: int = Field(default=7171, alias="AIVFS_PORT")
     repo_root: pathlib.Path | None = Field(default=None, alias="AIVFS_REPO_ROOT")
@@ -39,6 +45,13 @@ class Settings(BaseSettings):
     def _valid_style(cls, v: str) -> str:
         if v not in ("chat", "responses"):
             raise ValueError(f"AIVFS_API_STYLE must be 'chat' or 'responses', got {v!r}")
+        return v
+
+    @field_validator("compact_fraction")
+    @classmethod
+    def _valid_fraction(cls, v: float) -> float:
+        if not 0.0 < v <= 1.0:
+            raise ValueError(f"AIVFS_COMPACT_FRACTION must be in (0, 1], got {v}")
         return v
 
     @property

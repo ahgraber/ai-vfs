@@ -16,14 +16,18 @@ import pathlib
 from pydantic_ai import Agent
 from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.staticfiles import StaticFiles
 
-from vfs import VFS
+from vfs import VFS, Session
 
 from .agent import AgentDeps, registered_tool_names
+from .extract import resolve_extractor
 from .introspect import diff as vfs_diff, read_file as vfs_read_file, tree as vfs_tree
 from .vfs_setup import DemoWorld
+
+# Cap upload size at the boundary; this is a local demo, not a service.
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 def create_app(
@@ -88,6 +92,41 @@ def create_app(
         newer: int | None = Query(default=None),
     ) -> dict:
         return await vfs_diff(vfs, world.namespace_id, world.admin_id, path, older=older, newer=newer)
+
+    @app.post("/api/vfs/upload")
+    async def upload(file: UploadFile) -> dict:
+        # A user action, so it writes as `admin`; the agent still sees it via its
+        # `/` read grant. Content is stored as opaque bytes regardless of type —
+        # search indexing and text tools decode UTF-8 downstream, so binary lands
+        # as a stored-but-unsearchable blob rather than an error here.
+        content = await file.read()
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"file exceeds {MAX_UPLOAD_BYTES} bytes")
+        name = pathlib.PurePosixPath(file.filename or "upload.bin").name  # strip any client path
+        if not name:
+            raise HTTPException(status_code=400, detail="missing filename")
+        vfs_path = f"/uploads/{name}"
+        session = Session(vfs, world.namespace_id, world.admin_id)
+        meta = await session.write(vfs_path, content)
+        result = {"path": vfs_path, "version_number": meta.version_number, "size": meta.size}
+
+        # For registered binary types, write searchable/readable text sidecars next to
+        # the original (foo.pdf -> foo.pdf.md; book.xlsx -> book.xlsx.<sheet>.csv per
+        # sheet). The original is already stored, so extraction is best-effort: any
+        # failure degrades to "original only" rather than losing the upload.
+        try:
+            extractor = resolve_extractor(pathlib.PurePosixPath(name).suffix)
+            if extractor is not None:
+                derived_paths: list[str] = []
+                for artifact in await extractor.extract(content):
+                    derived_path = vfs_path + artifact.suffix
+                    await session.write(derived_path, artifact.text.encode("utf-8"))
+                    derived_paths.append(derived_path)
+                if derived_paths:
+                    result["derived_paths"] = derived_paths
+        except Exception as exc:  # noqa: BLE001 - best-effort extraction must not fail a stored upload
+            result["extract_error"] = f"{type(exc).__name__}: {exc}"
+        return result
 
     # Mount the built SPA last so it catches only what the API routes above didn't.
     if static_dir is not None and static_dir.is_dir():

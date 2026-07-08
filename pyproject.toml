@@ -50,8 +50,11 @@ codemode = ["ai-vfs[monty,just-bash]"]
 # not exposed to user-facing install api
 # e.g., cannot do `uv add aifs[dev]`
 dev = [
+    "defusedxml>=0.7.1",
     "fastapi>=0.138.0",
+    "liteparse>=2.4.0",
     "mlflow>=3.6.0,<3.14.0",
+    "openpyxl>=3.1.5",
     "opentelemetry-exporter-otlp-proto-http>=1.40.0",
     "pydantic-ai>=2.0",
     "uv-ship>=0.3.0",
@@ -154,7 +157,7 @@ norecursedirs = [
 ]
 python_files = [ "test_*.py", "*_test.py", "tests.py" ]
 pythonpath = [ "src", "." ]
-testpaths = [ "tests" ]
+testpaths = [ "tests", "demo/tests" ]
 # log_cli = true
 markers = [
     "isolate: run test in isolated subprocess (requires pytest-isolate)",
