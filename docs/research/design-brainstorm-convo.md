@@ -15,14 +15,10 @@ Started from extensive prior research (memo, sandbox research, prior art survey)
 
 Read all materials in `research/`:
 
-- `memo.md` — synthesized the convergence on virtual filesystems as agent infrastructure
-- `sandboxed-execution-research-convo.md` — multi-turn research on in-process sandbox options
-- `in-process sandboxed execution for multitenant code.md` — 34-tool survey of sandbox approaches
-- `fsspec and tigerfs research.md` — integration patterns across 8 sandboxes
-- `bashkit-tigerfs-convo.md` — proof-of-concept for bashkit + TigerFS composition
-- `monty tigerfs readme.md` — Monty + TigerFS demo architecture
+- `vfs-memo.md` — synthesized the convergence on virtual filesystems as agent infrastructure
+- `vfs-landscape-and-fit.md` — consolidated prior-art, sandbox, integration, and backend-fit research (the multi-turn in-process sandbox research, the 34-tool sandbox survey, the fsspec/TigerFS integration patterns across the sandboxes, the 10-project landscape survey, and the storage/search + ZeroFS/FUSE fit analyses)
+- `tigerfs-sandbox-demos.md` — proof-of-concept for bashkit + TigerFS and Monty + TigerFS composition
 - `pages/*.md` — summaries of all inspiration sources (Mintlify, Anthropic, Cloudflare, Vercel, AIGNE, yarnnn, AGFS, etc.)
-- `project-landscape-survey.md` — survey of 10 prior art / dependency projects
 
 Also researched turbopuffer's S3-based concurrency model (conditional writes, CAS on metadata files).
 

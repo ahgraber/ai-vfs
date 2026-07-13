@@ -1,10 +1,16 @@
-# bashkit + TigerFS: Can They Compose?
+# TigerFS + sandbox demos: bashkit and Monty
 
-_A conversation exploring whether everruns/bashkit can use TigerFS as its virtual filesystem, with a pydantic-ai demo and architectural analysis._
+Two proof-of-concept explorations of the same question — can an in-process sandbox be given a Postgres-backed filesystem via TigerFS?
+— run against two different sandboxes.
+Both land on the same shape of answer (a thin Python bridge translating the sandbox's file callbacks into POSIX I/O on the TigerFS mount), but differ in how directly bashkit and Monty can compose with it.
 
 ---
 
-## Initial request
+## Part 1: bashkit + TigerFS
+
+_A conversation exploring whether everruns/bashkit can use TigerFS as its virtual filesystem, with a pydantic-ai demo and architectural analysis._
+
+### Initial request
 
 **User:** i want to give everruns/bashkit a filesystem using the new postgres-backed filesystem called tigerfs. can you build a demo showing whether it is possible?
 use pydantic-ai as the agent framework and assume openrouter as the model api provider.
@@ -12,23 +18,12 @@ use pydantic-ai as the agent framework and assume openrouter as the model api pr
 provide the minimal example that proves the demo. do not write overly defensive or hedging code.
 KISS.
 
----
+### Research findings
 
-## Research findings
+This demo wires together two tools whose full fact sheets live in [`vfs-landscape-and-fit.md`](vfs-landscape-and-fit.md) — **bashkit** (§1.2) and **TigerFS** (§1.1).
+The two facts the demo turns on: bashkit's `FileSystem` trait lives in-process (a Rust `HashMap`), and TigerFS is a kernel-level FUSE/NFS daemon mounting a PostgreSQL database — different layers, which is the crux of the architectural finding below.
 
-Research confirmed:
-
-- **bashkit** (`everruns/bashkit`) is a Rust crate providing a virtual Bash interpreter with an in-process `FileSystem` trait backed by a `HashMap` — no OS syscalls, no kernel involvement.
-  Python bindings (`bashkit-python`) expose `BashTool` with first-class pydantic-ai integration via `bashkit.pydantic_ai.create_bash_tool()`.
-
-- **TigerFS** (by Tiger Data / Timescale) is a FUSE/NFS daemon that mounts a PostgreSQL database as a directory.
-  Every file is a real Postgres row.
-  Writes are ACID transactions.
-  It works at the kernel VFS layer.
-
----
-
-## Architectural finding
+### Architectural finding
 
 **Direct composition is not possible.**
 
@@ -50,16 +45,12 @@ bashkit (Rust in-process)          TigerFS (OS-level)
 **What does work:** a sync bridge. bashkit is the fast ephemeral scratch space for one agent turn; Postgres (via asyncpg, the same DB TigerFS uses) is the durable per-user store.
 On save/restore, the VFS state is checkpointed as JSON rows.
 
----
-
-## Use case clarification
+### Use case clarification
 
 **User:** "TigerFS is a FUSE/NFS OS-level mount" — I guess maybe we should explore this further.
 My intended use case is to use tigerfs as a virtual filesystem for a chatgpt-style webapp. instead of allocating virtual machines to each user, my hope was to provide something similar to bashkit + tigerFS for a cloud-native proxy for a virtual machine, container, or local sandbox. the ultimate goal was something similar to the power and expressiveness of claude code, but running as a webapp with multiple concurrent users.
 
----
-
-## Architecture for the webapp use case
+### Architecture for the webapp use case
 
 For a multi-tenant Claude Code-style webapp:
 
@@ -80,9 +71,7 @@ The agent gets three tools:
 **The real tradeoff:** bashkit cannot run arbitrary binaries or do network I/O — it's a bash interpreter, not a full container.
 That's the gap from Claude Code to evaluate.
 
----
-
-## Demo code
+### Demo code
 
 ```python
 """
@@ -317,9 +306,7 @@ if __name__ == "__main__":
     asyncio.run(run_demo())
 ```
 
----
-
-## Running it
+### Running it
 
 ```bash
 # dry-run (no credentials needed)
@@ -333,9 +320,7 @@ python demo.py
 
 Dependencies: `pip install pydantic-ai-slim[openai] bashkit asyncpg`
 
----
-
-## Summary
+### Summary
 
 |                    | bashkit                     | TigerFS                 |
 | ------------------ | --------------------------- | ----------------------- |
@@ -346,3 +331,162 @@ Dependencies: `pip install pydantic-ai-slim[openai] bashkit asyncpg`
 | Direct composition | —                           | —                       |
 
 **Verdict:** not directly composable, but the sync bridge via asyncpg gives you the webapp architecture you described — many concurrent users, no per-user VMs or containers, durable state between turns, and human/agent interop through the same Postgres database TigerFS exposes as a filesystem.
+
+---
+
+## Part 2: Monty + TigerFS
+
+A proof-of-concept showing that **pydantic Monty** (sandboxed Python interpreter
+written in Rust) can be given a **postgres-backed filesystem** via
+**TigerFS**, orchestrated by a **pydantic-ai** agent using **OpenRouter** as
+the model provider.
+
+### The short answer: yes, it works — and the fit is clean
+
+Monty's design already anticipates this:
+
+> "Completely block access to the host environment: filesystem, env variables
+> and network access are all implemented via **external function calls the
+> developer can control**."
+
+TigerFS exposes a standard POSIX filesystem backed by PostgreSQL (ACID transactions, version history, concurrent access).
+You bridge the two with a thin Python wrapper that implements `read_file`, `write_file`, and `list_dir`, then pass those as Monty's `external_functions`.
+The sandbox never touches the host; every file operation goes:
+
+```text
+Monty code
+  └─▶ external_functions dict  (your Python bridge)
+        └─▶ standard open() / pathlib calls on /mnt/db/...
+              └─▶ FUSE/NFS  ──▶  TigerFS daemon  ──▶  PostgreSQL
+```
+
+Unlike bashkit's `FileSystem` trait (Part 1 above), Monty has no filesystem abstraction of its own to reconcile with TigerFS's FUSE layer — it has _no_ filesystem access by design, so every path goes through the developer-supplied bridge anyway.
+That's why Monty composes with TigerFS more directly than bashkit does.
+
+(Full fact sheets: [`vfs-landscape-and-fit.md`](vfs-landscape-and-fit.md) §1.3 (Monty) and §1.1 (TigerFS).)
+
+### Architecture
+
+```text
+┌──────────────────────────────────────┐
+│  pydantic-ai Agent  (OpenRouter)     │
+│  model: any OpenRouter model string  │
+└───────────────┬──────────────────────┘
+                │  run_code(code) tool call
+┌───────────────▼──────────────────────┐
+│  Monty sandbox  (Rust bytecode VM)   │
+│  • zero host access by default       │
+│  • read_file / write_file / list_dir │
+│    provided as external_functions    │
+└───────────────┬──────────────────────┘
+                │  Python callbacks
+┌───────────────▼──────────────────────┐
+│  TigerFSBridge  (thin Python class)  │
+│  resolves sandbox paths to mount     │
+│  prevents path-traversal escapes     │
+└───────────────┬──────────────────────┘
+                │  POSIX I/O on /mnt/db
+┌───────────────▼──────────────────────┐
+│  TigerFS FUSE/NFS mount              │
+│  tigerfs mount postgres://... /mnt/db│
+└───────────────┬──────────────────────┘
+                │
+┌───────────────▼──────────────────────┐
+│  PostgreSQL                          │
+│  • ACID writes  • version history    │
+│  • concurrent agent access           │
+└──────────────────────────────────────┘
+```
+
+### Requirements
+
+| Package                         | Install                                       |
+| ------------------------------- | --------------------------------------------- |
+| `pydantic-monty`                | `pip install pydantic-monty`                  |
+| `pydantic-ai`                   | `pip install pydantic-ai`                     |
+| `openai` (OpenAI-compat client) | `pip install openai`                          |
+| TigerFS CLI                     | `curl -fsSL https://install.tigerfs.io \| sh` |
+
+### Running the demo
+
+#### 1 — no DB, no API key (demo mode, in-memory fallback)
+
+```bash
+pip install pydantic-monty pydantic-ai openai
+python monty_tigerfs_demo.py
+```
+
+The standalone Monty ↔ filesystem demo runs immediately using an in-memory dict instead of a real postgres mount.
+The agent section is skipped if `OPENROUTER_API_KEY` is not set.
+
+#### 2 — with TigerFS (real Postgres-backed FS)
+
+```bash
+# mount
+tigerfs mount postgres://localhost/agentdb /mnt/db
+
+# run
+TIGERFS_MOUNT=/mnt/db DEMO_MODE=0 python monty_tigerfs_demo.py
+```
+
+#### 3 — full stack (TigerFS + OpenRouter agent)
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+export TIGERFS_MOUNT=/mnt/db
+export DEMO_MODE=0
+python monty_tigerfs_demo.py
+```
+
+### What the demo exercises
+
+| Step              | What happens                                                                    |
+| ----------------- | ------------------------------------------------------------------------------- |
+| Write from Monty  | Sandbox calls `write_file(path, content)` → TigerFS → Postgres row insert       |
+| Read back         | Sandbox calls `read_file(path)` → TigerFS → Postgres row select                 |
+| Directory listing | `list_dir(path)` → TigerFS → Postgres query                                     |
+| Atomic increment  | Write → read → write → read in a single Monty execution shows state persistence |
+| Agent loop        | pydantic-ai agent asks Monty to write a report, read it back, list the dir      |
+
+### Key design notes
+
+#### Path safety
+
+`TigerFSBridge._resolve()` uses `Path.resolve()` plus
+`.relative_to(mount)` to prevent sandbox code from escaping via `../` tricks.
+
+#### Choosing the model
+
+The demo uses `"anthropic/claude-3.5-sonnet"` via OpenRouter.
+You can swap in any OpenRouter model string, e.g.:
+
+```python
+model_name = "openai/gpt-4o"
+model_name = "google/gemini-2.0-flash"
+model_name = "deepseek/deepseek-r1"
+```
+
+#### Monty limitations (as of v0.0.8)
+
+- No `class` definitions
+- No `match` statements
+- No `with` / context managers
+- No standard library (`os`, `pathlib`, etc.) — but you don't need them;
+  the bridge functions are the only FS interface Monty gets
+
+#### Why TigerFS beats alternatives for agents
+
+| Option       | Problem                                           |
+| ------------ | ------------------------------------------------- |
+| Local files  | No ACID, no concurrent access, no version history |
+| Git          | Requires pull/push/merge; not real-time           |
+| S3           | No transactions; eventual consistency             |
+| Raw Postgres | Agents need schema knowledge; no file-like API    |
+| **TigerFS**  | POSIX API + ACID + history + concurrent agents ✓  |
+
+### Conclusion
+
+The integration is clean because both Monty and TigerFS are designed around the same principle: **explicit, auditable access**.
+Monty forces all filesystem access through developer-supplied callbacks.
+TigerFS makes every callback a postgres transaction.
+The bridge between them is ~30 lines of Python.
