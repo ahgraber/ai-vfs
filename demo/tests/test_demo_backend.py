@@ -14,7 +14,18 @@ import json
 import pathlib
 import zipfile
 
-from demo.backend.agent import READ_DEFAULT_LINES, _render_hits, _render_lines, build_agent
+from demo.backend.agent import (
+    READ_DEFAULT_LINES,
+    AgentDeps,
+    _collapse_listing,
+    _render_hits,
+    _render_lines,
+    build_agent,
+    find_files,
+    list_dir,
+    search_content,
+    undo,
+)
 from demo.backend.app import MAX_UPLOAD_BYTES, create_app
 import demo.backend.extract as extract_mod
 from demo.backend.extract import (
@@ -30,8 +41,10 @@ from demo.backend.model_info import resolve_context_window
 from demo.backend.vfs_setup import build_world, teardown_world
 import httpx
 from httpx import ASGITransport, AsyncClient
+from pydantic_ai import RunContext
 from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart, UserPromptPart
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage
 import pytest
 import pytest_asyncio
 
@@ -74,16 +87,26 @@ _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _OOXML = "http://schemas.openxmlformats.org/"
 
 
-def _zip(parts: dict[str, str]) -> bytes:
-    """Zip a mapping of archive-name -> XML string into an OOXML package."""
+_FIXED_ZIP_DATE = (1980, 1, 1, 0, 0, 0)
+
+
+def _zip(parts: dict[str, str], *, date_time: tuple[int, int, int, int, int, int] = _FIXED_ZIP_DATE) -> bytes:
+    """Zip a mapping of archive-name -> XML string into an OOXML package.
+
+    Each entry is stamped with an explicit `date_time` rather than the process clock, so
+    the builder never raises `struct.error` if another test leaves the clock before
+    zipfile's 1980 DOS-date floor.
+    """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, body in parts.items():
-            archive.writestr(name, body)
+            info = zipfile.ZipInfo(name, date_time=date_time)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, body)
     return buffer.getvalue()
 
 
-def _docx(text: str) -> bytes:
+def _docx(text: str, *, date_time: tuple[int, int, int, int, int, int] = _FIXED_ZIP_DATE) -> bytes:
     """A minimal but structurally valid .docx with one paragraph of `text`."""
     return _zip(
         {
@@ -97,11 +120,12 @@ def _docx(text: str) -> bytes:
             'Target="word/document.xml"/></Relationships>',
             "word/document.xml": f'<?xml version="1.0"?><w:document xmlns:w="{_OOXML}wordprocessingml/2006/main">'
             f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>",
-        }
+        },
+        date_time=date_time,
     )
 
 
-def _pptx(text: str) -> bytes:
+def _pptx(text: str, *, date_time: tuple[int, int, int, int, int, int] = _FIXED_ZIP_DATE) -> bytes:
     """A .pptx package with a single slide part holding `text` (enough for the stdlib strip)."""
     return _zip(
         {
@@ -109,11 +133,12 @@ def _pptx(text: str) -> bytes:
             f'xmlns:a="{_OOXML}drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody>'
             f"<a:p><a:r><a:t>{text}</a:t></a:r></a:p>"
             "</p:txBody></p:sp></p:spTree></p:cSld></p:sld>",
-        }
+        },
+        date_time=date_time,
     )
 
 
-def _xlsx_with_formulas() -> bytes:
+def _xlsx_with_formulas(*, date_time: tuple[int, int, int, int, int, int] = _FIXED_ZIP_DATE) -> bytes:
     """A one-sheet ("Data") .xlsx: a cached formula (=B1*2 -> 200) and an uncached one (=B1+1)."""
     main = f"{_OOXML}spreadsheetml/2006/main"
     rel = f"{_OOXML}officeDocument/2006/relationships"
@@ -144,7 +169,8 @@ def _xlsx_with_formulas() -> bytes:
             "xl/sharedStrings.xml": f'<?xml version="1.0"?><sst xmlns="{main}" count="1" uniqueCount="1">'
             "<si><t>Item</t></si></sst>",
             "xl/worksheets/sheet1.xml": f'<?xml version="1.0"?><worksheet xmlns="{main}"><sheetData>{rows}</sheetData></worksheet>',
-        }
+        },
+        date_time=date_time,
     )
 
 
@@ -298,6 +324,16 @@ def test_render_hits_empty_reports_no_matches():
     assert _render_hits([]) == "(no matches)"
 
 
+def test_collapse_listing_folds_subdirs_and_dedupes():
+    paths = ["/NORTH-STAR.md", "/README.md", "/specs/auth/spec.md", "/specs/search/spec.md"]
+    # Root: files as basenames, one entry per immediate subdir with a trailing slash.
+    assert _collapse_listing(paths, "/") == ["NORTH-STAR.md", "README.md", "specs/"]
+    # A nested prefix collapses to its own one level, deduped across deeper files.
+    assert _collapse_listing(paths, "/specs") == ["auth/", "search/"]
+    # A leaf directory shows its files.
+    assert _collapse_listing(paths, "/specs/auth") == ["spec.md"]
+
+
 @pytest_asyncio.fixture
 async def client_and_world():
     world = await build_world(REPO_ROOT)
@@ -309,6 +345,73 @@ async def client_and_world():
     async with AsyncClient(transport=transport, base_url="http://demo.test") as client:
         yield client, world
     await teardown_world(world)
+
+
+@pytest_asyncio.fixture
+async def world():
+    w = await build_world(REPO_ROOT)
+    yield w
+    await teardown_world(w)
+
+
+def _ctx(world) -> RunContext[AgentDeps]:
+    """A RunContext whose deps carry the world's VFS, scoped to the agent principal."""
+    deps = AgentDeps(vfs=world.vfs, namespace_id=world.namespace_id, principal_id=world.agent_id)
+    return RunContext(deps=deps, model=TestModel(), usage=RunUsage())
+
+
+@pytest.mark.asyncio
+async def test_list_dir_shows_one_level_like_ls(world):
+    ctx = _ctx(world)
+    entries = (await list_dir(ctx, "/")).splitlines()
+    assert "NORTH-STAR.md" in entries  # a file at root, as a bare name
+    assert "specs/" in entries  # the subdirectory, surfaced with a trailing slash
+    assert not any(e.rstrip("/").find("/") >= 0 for e in entries)  # nothing is a full path
+
+
+@pytest.mark.asyncio
+async def test_list_dir_recursive_returns_full_paths(world):
+    ctx = _ctx(world)
+    paths = (await list_dir(ctx, "/", recursive=True)).splitlines()
+    assert "/NORTH-STAR.md" in paths
+    assert any(p.startswith("/specs/") and p.endswith("/spec.md") for p in paths)
+
+
+@pytest.mark.asyncio
+async def test_search_content_greps_file_contents(world):
+    session = Session(world.vfs, world.namespace_id, world.agent_id)
+    await session.write("/notes.txt", b"alpha\nbravo zulu\ncharlie\n")
+    out = await search_content(_ctx(world), "bravo")
+    assert "/notes.txt:2:" in out and "bravo zulu" in out
+
+
+@pytest.mark.asyncio
+async def test_find_files_matches_basename_at_any_depth(world):
+    lines = (await find_files(_ctx(world), "spec.md")).splitlines()
+    assert lines and all(p.endswith("/spec.md") for p in lines)
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_previous_version_then_toggles(world):
+    session = Session(world.vfs, world.namespace_id, world.agent_id)
+    await session.write("/doc.txt", b"v1 content")
+    await session.write("/doc.txt", b"v2 content")
+    ctx = _ctx(world)
+
+    msg = await undo(ctx, "/doc.txt")
+    assert "undid /doc.txt" in msg
+    assert await session.read("/doc.txt") == b"v1 content"
+
+    # A second undo appends again, toggling back to the later content (redo).
+    await undo(ctx, "/doc.txt")
+    assert await session.read("/doc.txt") == b"v2 content"
+
+
+@pytest.mark.asyncio
+async def test_undo_reports_nothing_when_single_version(world):
+    session = Session(world.vfs, world.namespace_id, world.agent_id)
+    await session.write("/once.txt", b"only")
+    assert "nothing to undo" in await undo(_ctx(world), "/once.txt")
 
 
 @pytest.mark.asyncio
@@ -421,6 +524,14 @@ async def test_upload_xlsx_writes_one_csv_sidecar_per_sheet_with_cached_values(c
 def test_strip_ooxml_text_reads_docx_and_pptx_runs():
     assert _strip_ooxml_text(_docx("Hello from DOCX")) == "Hello from DOCX"
     assert _strip_ooxml_text(_pptx("Hello from PPTX")) == "Hello from PPTX"
+
+
+@pytest.mark.parametrize("date_time", [(1980, 1, 1, 0, 0, 0), (2026, 7, 18, 12, 0, 0)])
+def test_ooxml_fixtures_stamp_explicit_date_and_ignore_the_clock(date_time):
+    # The builder stamps a fixed date_time, so it round-trips at zipfile's 1980 DOS floor
+    # and at a present-day date alike, and never consults the process clock (a pre-1980
+    # clock would otherwise make zipfile.writestr raise struct.error).
+    assert _strip_ooxml_text(_docx("clock immune", date_time=date_time)) == "clock immune"
 
 
 @pytest.mark.asyncio
