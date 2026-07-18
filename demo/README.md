@@ -43,7 +43,10 @@ Registered types:
 | `.docx`, `.pptx` | `OfficeTextExtractor` | `foo.docx.txt`                    | liteparse when the `soffice` (LibreOffice) binary is present — it converts via LibreOffice, preserving tables; otherwise a stdlib zip+XML text strip. |
 | `.xlsx`, `.xlsm` | `XlsxExtractor`       | `book.xlsx.<sheet>.csv` per sheet | [openpyxl](https://pypi.org/project/openpyxl/), one CSV per worksheet.                                                                                |
 
-**Spreadsheet values** — `XlsxExtractor` reads with `data_only=True`, so a cell shows the value **cached** by the app that last saved the file. openpyxl has no formula engine, so a formula whose result was never cached (e.g. a programmatically generated workbook) reads as an empty cell rather than being recomputed.
+**Sidecars are lossy, point-in-time projections.**
+Extraction runs once, at upload: a sidecar is a text snapshot of the binary, not a live view.
+The original is never re-extracted and there is no round-trip back to the binary format, so editing a sidecar diverges from the untouched original.
+Extraction also loses information at ingest — e.g. `XlsxExtractor` reads with `data_only=True`, so a cell shows the value **cached** by the app that last saved the file; openpyxl has no formula engine, so a formula whose result was never cached (e.g. a programmatically generated workbook) reads as an empty cell rather than being recomputed.
 Read-time recalculation would require routing through a calc engine (LibreOffice when `soffice` is present); it is deliberately not done here.
 
 Extraction runs at ingest, not inside `vfs.write`, so the VFS contract is untouched.
