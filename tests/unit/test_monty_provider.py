@@ -529,6 +529,7 @@ undefined_name  # NameError: this is the actual terminating error
 # ---------------------------------------------------------------------------
 
 
+@skip_no_monty
 class TestSafeErrorMessageStripsModulePaths:
     """_safe_error_message must strip dotted internal module paths like vfs.models.VersionMeta."""
 

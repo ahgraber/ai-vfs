@@ -126,6 +126,7 @@ prerelease = "if-necessary-or-explicit"
 [tool.pytest.ini_options]
 addopts = '''
     -ra
+    -m 'not isolate'
     --strict-markers
     --ignore=docs/conf.py
     --ignore=setup.py
