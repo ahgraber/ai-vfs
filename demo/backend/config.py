@@ -23,7 +23,8 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(default="http://localhost:11434/v1", alias="OPENAI_BASE_URL")
     openai_api_key: str = Field(default="omlx", alias="OPENAI_API_KEY")
     api_style: str = Field(default="chat", alias="AIVFS_API_STYLE")  # "chat" | "responses"
-    tool_sets: str = Field(default="all", alias="AIVFS_TOOLS")  # "code" | "files" | "all" (comma-ok)
+    # "files" | "codemode" | "bash" | "python" | "all" (comma-ok); "all" == "codemode,bash".
+    tool_sets: str = Field(default="all", alias="AIVFS_TOOLS")
 
     # History compaction. The local model's context window is not discoverable, so it is
     # configured; `compact_fraction` of it is the budget past which older messages are
@@ -56,14 +57,21 @@ class Settings(BaseSettings):
 
     @property
     def enabled_sets(self) -> set[str]:
-        """Normalize AIVFS_TOOLS to a set of {'code', 'files'}."""
+        """Normalize AIVFS_TOOLS to a set of tool-surface flags.
+
+        Flags: `files` (native file tools), `codemode` (`run_code`), `bash` (`run_bash`),
+        `python` (deprecated `run_python`). `all` expands to `{codemode, bash}` and may be
+        combined (e.g. `all,python`). `files` + `codemode` together is allowed but the file
+        tools are exposed only through `run_code` (see `build_agent`).
+        """
+        valid = {"files", "codemode", "bash", "python"}
         sets = {s.strip() for s in self.tool_sets.split(",") if s.strip()}
-        if "all" in sets:
-            return {"code", "files"}
-        unknown = sets - {"code", "files"}
+        base = {"codemode", "bash"} if "all" in sets else set()
+        rest = sets - {"all"}
+        unknown = rest - valid
         if unknown:
-            raise ValueError(f"AIVFS_TOOLS entries must be code|files|all, got {sorted(unknown)}")
-        return sets
+            raise ValueError(f"AIVFS_TOOLS entries must be one of {sorted(valid)} or all, got {sorted(unknown)}")
+        return base | rest
 
     def resolve_repo_root(self) -> pathlib.Path:
         """Locate the repo root that holds `.specs/` — explicit override, else search upward."""

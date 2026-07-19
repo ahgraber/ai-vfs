@@ -9,6 +9,7 @@ and the v6 protocol contract in CI.
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import pathlib
@@ -23,10 +24,12 @@ from demo.backend.agent import (
     build_agent,
     find_files,
     list_dir,
+    registered_tool_names,
     search_content,
     undo,
 )
 from demo.backend.app import MAX_UPLOAD_BYTES, create_app
+from demo.backend.config import Settings
 import demo.backend.extract as extract_mod
 from demo.backend.extract import (
     ContentExtractor,
@@ -42,7 +45,8 @@ from demo.backend.vfs_setup import build_world, teardown_world
 import httpx
 from httpx import ASGITransport, AsyncClient
 from pydantic_ai import RunContext
-from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart, UserPromptPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart, UserPromptPart
+from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 import pytest
@@ -52,6 +56,9 @@ from vfs import Session
 from vfs.models import SearchResult
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+HAS_HARNESS = importlib.util.find_spec("pydantic_ai_harness") is not None
+skip_no_harness = pytest.mark.skipif(not HAS_HARNESS, reason="pydantic-ai-harness (codemode extra) not installed")
 
 FILE_TEXT = "alpha\nbravo\ncharlie\ndelta\n"
 
@@ -324,6 +331,27 @@ def test_render_hits_empty_reports_no_matches():
     assert _render_hits([]) == "(no matches)"
 
 
+def test_enabled_sets_all_expands_to_codemode_and_bash(monkeypatch):
+    monkeypatch.setenv("AIVFS_TOOLS", "all")
+    assert Settings().enabled_sets == {"codemode", "bash"}
+
+
+def test_enabled_sets_all_unions_with_extra_flags(monkeypatch):
+    monkeypatch.setenv("AIVFS_TOOLS", "all,python")
+    assert Settings().enabled_sets == {"codemode", "bash", "python"}
+
+
+def test_enabled_sets_passes_explicit_flags_through(monkeypatch):
+    monkeypatch.setenv("AIVFS_TOOLS", "files,bash")
+    assert Settings().enabled_sets == {"files", "bash"}
+
+
+def test_enabled_sets_rejects_unknown_flag(monkeypatch):
+    monkeypatch.setenv("AIVFS_TOOLS", "code")  # the old bundled name is no longer valid
+    with pytest.raises(ValueError, match="AIVFS_TOOLS"):
+        _ = Settings().enabled_sets
+
+
 def test_collapse_listing_folds_subdirs_and_dedupes():
     paths = ["/NORTH-STAR.md", "/README.md", "/specs/auth/spec.md", "/specs/search/spec.md"]
     # Root: files as basenames, one entry per immediate subdir with a trailing slash.
@@ -412,6 +440,38 @@ async def test_undo_reports_nothing_when_single_version(world):
     session = Session(world.vfs, world.namespace_id, world.agent_id)
     await session.write("/once.txt", b"only")
     assert "nothing to undo" in await undo(_ctx(world), "/once.txt")
+
+
+@skip_no_harness
+@pytest.mark.asyncio
+async def test_code_mode_runs_a_program_that_calls_tools_against_the_vfs(world):
+    # Code mode exposes the file tools as async sandbox functions. The harness runs Monty
+    # synchronously on the event loop, so tool access must go through awaited tool dispatch
+    # (not an `os` mount, which would deadlock the loop). This drives read_file + write_file
+    # from inside one `run_code` program and checks the mutation reached the VFS.
+    session = Session(world.vfs, world.namespace_id, world.agent_id)
+    await session.write("/note.txt", b"hello world")
+
+    code = (
+        "c = await read_file(path='/note.txt')\n"
+        "await write_file(path='/note.txt', content=c.upper())\n"
+        "await read_file(path='/note.txt')\n"
+    )
+    calls = {"i": 0}
+
+    def model_fn(messages, info):
+        calls["i"] += 1
+        if calls["i"] == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name="run_code", args={"code": code})])
+        return ModelResponse(parts=[TextPart("done")])
+
+    agent = build_agent(FunctionModel(model_fn), {"codemode"})
+    deps = AgentDeps(vfs=world.vfs, namespace_id=world.namespace_id, principal_id=world.agent_id)
+    result = await agent.run("uppercase /note.txt", deps=deps)
+
+    assert result.output == "done"
+    assert (await session.read("/note.txt")).decode() == "HELLO WORLD"
+    assert "run_code" in registered_tool_names({"codemode"})
 
 
 @pytest.mark.asyncio

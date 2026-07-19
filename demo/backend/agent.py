@@ -7,9 +7,11 @@ deliberately no host-filesystem tool.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import warnings
 
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.capabilities import Instrumentation, ProcessHistory
+from pydantic_ai.capabilities import AgentCapability, Instrumentation, ProcessHistory
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -18,6 +20,8 @@ from vfs import VFS, ResourceLimits, Session
 from vfs.models import SearchType
 
 from .history import build_compactor
+
+_log = logging.getLogger(__name__)
 
 # Sandbox budget for a single code-mode run.
 EXEC_LIMITS = ResourceLimits(
@@ -84,23 +88,15 @@ def _render_hits(results) -> str:
 
 # --- code set ---
 async def run_python(ctx: RunContext[AgentDeps], code: str) -> str:
-    """Run Python in a sandbox (Monty, a *subset* of Python — not a full interpreter).
+    """Run a Python snippet in the Monty sandbox. Deprecated — prefer `run_code`, which runs the same sandbox but also exposes the other tools as callable functions; kept working for now.
 
-    Importable stdlib modules: `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib` — and nothing else. There are no third-party packages and no other stdlib (no `csv`, `collections`, `itertools`, `random`, `time`, `numpy`, `pandas`, ...); no `class` definitions and no `import *`. Parse CSV or other formats by hand with `str.split` and slicing.
-
-    File I/O is wired: `open`, `pathlib`, and `os` read and write the same files the other tools see (there is no network). Prefer this for multi-step file work — read, transform, and write in one shot with loops and logic, instead of many separate tool calls.
-
-    The value of the *last expression* is returned, REPL-style; you do not need to `print` it. Each run is time- and resource-limited (~15s, capped operations and read size), so keep snippets small and avoid unbounded loops or very large reads.
-
-    Example:
-        import json
-        data = json.loads(open("/config.json").read())
-        [k for k, v in data.items() if v]   # last expression -> returned
+    Monty is a *subset* of Python — not a full interpreter. Importable stdlib modules: `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib` — and nothing else; no third-party packages, no `class` definitions, no `import *`. File I/O via `open`/`pathlib`/`os` reads and writes the same files the other tools see (no network). The value of the *last expression* is returned; you do not need to `print` it. Each run is time- and resource-limited (~15s, capped operations and read size).
     """
+    warnings.warn("run_python is deprecated; use run_code (code mode).", DeprecationWarning, stacklevel=2)
     result = await ctx.deps.vfs.execute(
         code, ctx.deps.namespace_id, ctx.deps.principal_id, "monty", resource_limits=EXEC_LIMITS
     )
-    return _fmt_exec(result)
+    return f"[deprecated: prefer run_code] {_fmt_exec(result)}"
 
 
 async def run_bash(ctx: RunContext[AgentDeps], code: str) -> str:
@@ -197,13 +193,18 @@ async def delete_file(ctx: RunContext[AgentDeps], path: str) -> str:
     return f"deleted {path} (tombstone v{version.version_number})"
 
 
-CODE_TOOLS = [run_python, run_bash]
 FILE_TOOLS = [read_file, write_file, list_dir, search_content, find_files, undo, delete_file]
+
+#: File tools exposed as callable functions inside code mode's `run_code`. Access is via async
+#: tool dispatch, not an `os` mount: the harness runs Monty synchronously on the event loop, so a
+#: filesystem mount that bridged back to that same loop would deadlock. Awaited tool-functions are
+#: the harness's async-native channel and route through the governed VFS unchanged.
+CODEMODE_TOOLS = FILE_TOOLS
 
 INSTRUCTIONS = (
     "You are a helpful assistant operating entirely inside a virtual filesystem. "
     "Be concise. Use your tools to read, search, run code against, and edit the files. "
-    "For multi-step file work, prefer writing one `run_python` snippet over many separate tool calls. "
+    "For multi-step file work, prefer writing one `run_code` program over many separate tool calls. "
     "At the end of a turn, briefly narrate which tools you used; if a tool errored, "
     "say which tool and what the error was."
 )
@@ -235,24 +236,60 @@ def build_agent(
     compact_fraction`, the oldest messages are summarized with `model` and recent
     messages kept verbatim. It fires before every model request, so it covers both
     long conversations and long single turns.
+
+    Tool-surface flags in `enabled_sets` (see `Settings.enabled_sets`):
+
+    - `codemode`: a `CodeMode` capability adds a single `run_code` tool wrapping `CODEMODE_TOOLS`
+      as callable functions the model invokes with `await` inside one Python program.
+    - `files`: the file tools as ordinary (native) tool calls. With `codemode` also on they are
+      exposed only through `run_code` (code mode wins), and a warning is logged.
+    - `bash`: `run_bash` (just-bash shell). `python`: the deprecated `run_python` (Monty) tool.
     """
     compactor = build_compactor(model, token_budget=int(context_window_tokens * compact_fraction))
+    capabilities: list[AgentCapability] = [Instrumentation(), ProcessHistory(compactor)]
+    code_mode = "codemode" in enabled_sets
+    if code_mode and "files" in enabled_sets:
+        _log.warning(
+            "AIVFS_TOOLS enables both 'files' and 'codemode'; the file tools are exposed as "
+            "run_code functions (code mode wins), not as native tools."
+        )
+    if code_mode:
+        from pydantic_ai_harness import CodeMode
+
+        # TODO(codemode): code mode runs its own Monty REPL and bypasses vfs.execute, so the
+        # EXEC_LIMITS budget (timeout, max operations, read/result caps) that guards
+        # run_python/run_bash is NOT enforced for run_code. Re-impose an equivalent per-run limit.
+        capabilities.append(CodeMode(tools=[t.__name__ for t in CODEMODE_TOOLS]))
     agent = Agent(
         model,
         deps_type=AgentDeps,
         instructions=INSTRUCTIONS,
-        capabilities=[Instrumentation(), ProcessHistory(compactor)],
+        capabilities=capabilities,
     )
-    if "code" in enabled_sets:
-        for tool in CODE_TOOLS:
-            agent.tool(tool)
-    if "files" in enabled_sets:
+    # File tools register when files are on, or when code mode needs them present to wrap.
+    if "files" in enabled_sets or code_mode:
         for tool in FILE_TOOLS:
             agent.tool(tool)
+    if "bash" in enabled_sets:
+        agent.tool(run_bash)
+    if "python" in enabled_sets:
+        agent.tool(run_python)
     return agent
 
 
 def registered_tool_names(enabled_sets: set[str]) -> list[str]:
-    """Return the tool names that `build_agent` would register for `enabled_sets`."""
-    tools = (CODE_TOOLS if "code" in enabled_sets else []) + (FILE_TOOLS if "files" in enabled_sets else [])
-    return sorted(t.__name__ for t in tools)
+    """Return the top-level tool names `build_agent` exposes for `enabled_sets`.
+
+    Under `codemode` the file tools become `run_code` sandbox functions, so they are not
+    listed as top-level tools.
+    """
+    names: list[str] = []
+    if "codemode" in enabled_sets:
+        names.append("run_code")
+    elif "files" in enabled_sets:
+        names += [t.__name__ for t in FILE_TOOLS]
+    if "bash" in enabled_sets:
+        names.append("run_bash")
+    if "python" in enabled_sets:
+        names.append("run_python")
+    return sorted(set(names))
