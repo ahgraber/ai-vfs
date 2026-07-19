@@ -43,7 +43,7 @@ s3 = ["aiobotocore>=2.15.0"]
 # an actionable install hint. `codemode` is the umbrella over every sandbox.
 monty = ["pydantic-monty>=0.0.18"]
 just-bash = ["just-bash>=0.2.1"]
-codemode = ["ai-vfs[monty,just-bash]"]
+codemode = ["ai-vfs[monty,just-bash]", "pydantic-ai-harness[code-mode]>=0.7.0"]
 
 [dependency-groups]
 # for local development groups;
@@ -56,7 +56,7 @@ dev = [
     "mlflow>=3.6.0,<3.14.0",
     "openpyxl>=3.1.5",
     "opentelemetry-exporter-otlp-proto-http>=1.40.0",
-    "pydantic-ai>=2.0",
+    "pydantic-ai>=2.1",
     "uv-ship>=0.3.0",
     "uvicorn>=0.49.0",
 ]
